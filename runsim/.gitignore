@@ -1,0 +1,8 @@
+runsim
+dishes
+nolibc_tcp
+debugger
+*.o
+*.dat
+*.cpio.gz
+bzImage
