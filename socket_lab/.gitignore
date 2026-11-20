@@ -1,0 +1,13 @@
+socket_demo
+get_page
+dserver
+dclient
+sstream_server
+sstream_client
+
+mysocket
+*.sock
+*.swp
+*.swo
+
+.DS_Store
