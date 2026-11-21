@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/ipc.h>
 #include <sys/msg.h>
 #include <sys/types.h>
@@ -15,10 +16,12 @@
 #define MAX_NAME 32
 #define MAX_TEXT 255
 #define MAX_CLIENTS 64
+#define MAX_PENDING 128
 #define ARBITER_TYPE 1L
 #define REPLY_BASE 100000L
 #define HEARTBEAT_TIMEOUT 10
 #define HEARTBEAT_INTERVAL 4
+#define OFFLINE_TTL 60
 
 enum msg_cmd {
     CMD_REGISTER = 1,
@@ -26,7 +29,8 @@ enum msg_cmd {
     CMD_LOOKUP = 3,
     CMD_LOGOUT = 4,
     CMD_CHAT = 5,
-    CMD_REPLY = 6
+    CMD_REPLY = 6,
+    CMD_STORE = 7
 };
 
 struct qmsg {
@@ -36,6 +40,7 @@ struct qmsg {
     long reply_type;
     long target_id;
     char name[MAX_NAME];
+    char sender_name[MAX_NAME];
     char text[MAX_TEXT];
 };
 
@@ -47,6 +52,14 @@ struct client_entry {
     long reply_type;
     char name[MAX_NAME];
     time_t last_seen;
+};
+
+struct pending_msg {
+    int used;
+    char from[MAX_NAME];
+    char to[MAX_NAME];
+    char text[MAX_TEXT];
+    time_t created_at;
 };
 
 static volatile sig_atomic_t running = 1;
@@ -68,6 +81,72 @@ static void drain_type(int msqid, long mtype) {
     }
 }
 
+static void store_pending(struct pending_msg *pending, const char *from, const char *to, const char *text) {
+    int slot = -1;
+    int oldest = 0;
+
+    for (int i = 0; i < MAX_PENDING; i++) {
+        if (!pending[i].used) {
+            slot = i;
+            break;
+        }
+        if (pending[i].created_at < pending[oldest].created_at) {
+            oldest = i;
+        }
+    }
+
+    if (slot < 0) {
+        slot = oldest;
+    }
+
+    pending[slot].used = 1;
+    snprintf(pending[slot].from, sizeof(pending[slot].from), "%.*s", MAX_NAME - 1, from);
+    snprintf(pending[slot].to, sizeof(pending[slot].to), "%.*s", MAX_NAME - 1, to);
+    snprintf(pending[slot].text, sizeof(pending[slot].text), "%.*s", MAX_TEXT - 1, text);
+    pending[slot].created_at = time(NULL);
+}
+
+static void salvage_messages(int msqid, long mtype, const char *target_name, struct pending_msg *pending) {
+    struct qmsg tmp;
+    while (msgrcv(msqid, &tmp, MSG_SIZE, mtype, IPC_NOWAIT) >= 0) {
+        if (tmp.cmd == CMD_CHAT) {
+            tmp.sender_name[MAX_NAME - 1] = '\0';
+            tmp.text[MAX_TEXT - 1] = '\0';
+            store_pending(pending, tmp.sender_name, target_name, tmp.text);
+        }
+    }
+}
+
+static void expire_pending(struct pending_msg *pending, time_t now) {
+    for (int i = 0; i < MAX_PENDING; i++) {
+        if (pending[i].used && (now - pending[i].created_at) > OFFLINE_TTL) {
+            pending[i].used = 0;
+        }
+    }
+}
+
+static void deliver_pending(int msqid, struct pending_msg *pending, const char *name, long target_id) {
+    int delivered = 0;
+    for (int i = 0; i < MAX_PENDING; i++) {
+        if (pending[i].used && strcmp(pending[i].to, name) == 0) {
+            struct qmsg chat;
+            memset(&chat, 0, sizeof(chat));
+            chat.mtype = target_id;
+            chat.cmd = CMD_CHAT;
+            snprintf(chat.sender_name, sizeof(chat.sender_name), "%.*s", MAX_NAME - 1, pending[i].from);
+            snprintf(chat.text, sizeof(chat.text), "%.*s", MAX_TEXT - 1, pending[i].text);
+            if (msgsnd(msqid, &chat, MSG_SIZE, 0) == 0) {
+                pending[i].used = 0;
+                delivered++;
+            }
+        }
+    }
+    if (delivered > 0) {
+        printf("[arbiter] delivered %d stored msg(s) to %s\n", delivered, name);
+        fflush(stdout);
+    }
+}
+
 static int send_reply(int msqid, long reply_type, long target_id, const char *text) {
     struct qmsg rep;
     memset(&rep, 0, sizeof(rep));
@@ -75,26 +154,30 @@ static int send_reply(int msqid, long reply_type, long target_id, const char *te
     rep.cmd = CMD_REPLY;
     rep.target_id = target_id;
     if (text != NULL) {
-        snprintf(rep.text, sizeof(rep.text), "%s", text);
+        snprintf(rep.text, sizeof(rep.text), "%.*s", MAX_TEXT - 1, text);
     }
     return msgsnd(msqid, &rep, MSG_SIZE, 0);
 }
 
 static int run_arbiter(int msqid) {
     struct client_entry clients[MAX_CLIENTS];
+    struct pending_msg pending[MAX_PENDING];
     memset(clients, 0, sizeof(clients));
+    memset(pending, 0, sizeof(pending));
     long next_id = 2;
 
-    printf("[arbiter] started (msqid=%d)\n", msqid);
+    printf("[arbiter] started (msqid=%d, ttl=%ds)\n", msqid, OFFLINE_TTL);
     fflush(stdout);
 
     while (running) {
         time_t now = time(NULL);
+        expire_pending(pending, now);
+
         for (int i = 0; i < MAX_CLIENTS; i++) {
             if (clients[i].active && (now - clients[i].last_seen) > HEARTBEAT_TIMEOUT) {
                 printf("[arbiter] timeout: %s (id=%ld)\n", clients[i].name, clients[i].id);
                 fflush(stdout);
-                drain_type(msqid, clients[i].id);
+                salvage_messages(msqid, clients[i].id, clients[i].name, pending);
                 drain_type(msqid, clients[i].reply_type);
                 clients[i].active = 0;
             }
@@ -132,11 +215,12 @@ static int run_arbiter(int msqid) {
                 clients[free_idx].active = 1;
                 clients[free_idx].id = next_id++;
                 clients[free_idx].reply_type = msg.reply_type;
-                snprintf(clients[free_idx].name, sizeof(clients[free_idx].name), "%s", msg.name);
+                snprintf(clients[free_idx].name, sizeof(clients[free_idx].name), "%.*s", MAX_NAME - 1, msg.name);
                 clients[free_idx].last_seen = time(NULL);
                 send_reply(msqid, msg.reply_type, clients[free_idx].id, "ok");
                 printf("[arbiter] registered: %s (id=%ld)\n", clients[free_idx].name, clients[free_idx].id);
                 fflush(stdout);
+                deliver_pending(msqid, pending, clients[free_idx].name, clients[free_idx].id);
             }
         } else if (msg.cmd == CMD_HEARTBEAT) {
             for (int i = 0; i < MAX_CLIENTS; i++) {
@@ -157,13 +241,26 @@ static int run_arbiter(int msqid) {
                     }
                 }
             }
-            send_reply(msqid, msg.reply_type, found_id, found_id > 0 ? "ok" : "not found");
+            send_reply(msqid, msg.reply_type, found_id, found_id > 0 ? "ok" : "offline");
+        } else if (msg.cmd == CMD_STORE) {
+            for (int i = 0; i < MAX_CLIENTS; i++) {
+                if (clients[i].active && clients[i].id == msg.sender_id) {
+                    clients[i].last_seen = time(NULL);
+                    break;
+                }
+            }
+            msg.sender_name[MAX_NAME - 1] = '\0';
+            msg.name[MAX_NAME - 1] = '\0';
+            msg.text[MAX_TEXT - 1] = '\0';
+            store_pending(pending, msg.sender_name, msg.name, msg.text);
+            printf("[arbiter] stored offline msg: %s -> %s\n", msg.sender_name, msg.name);
+            fflush(stdout);
         } else if (msg.cmd == CMD_LOGOUT) {
             for (int i = 0; i < MAX_CLIENTS; i++) {
                 if (clients[i].active && clients[i].id == msg.sender_id) {
                     printf("[arbiter] logout: %s (id=%ld)\n", clients[i].name, clients[i].id);
                     fflush(stdout);
-                    drain_type(msqid, clients[i].id);
+                    salvage_messages(msqid, clients[i].id, clients[i].name, pending);
                     drain_type(msqid, clients[i].reply_type);
                     clients[i].active = 0;
                     break;
@@ -194,9 +291,9 @@ static void *recv_worker(void *arg) {
         ssize_t n = msgrcv(g_msqid, &msg, MSG_SIZE, my_id, IPC_NOWAIT);
         if (n >= 0) {
             if (msg.cmd == CMD_CHAT) {
-                msg.name[MAX_NAME - 1] = '\0';
+                msg.sender_name[MAX_NAME - 1] = '\0';
                 msg.text[MAX_TEXT - 1] = '\0';
-                printf("\n[%s]: %s\n", msg.name, msg.text);
+                printf("\n[%s]: %s\n", msg.sender_name, msg.text);
                 fflush(stdout);
             }
         } else {
@@ -320,7 +417,7 @@ static int run_client(int msqid) {
             req.mtype = ARBITER_TYPE;
             req.cmd = CMD_REGISTER;
             req.reply_type = g_reply_type;
-            snprintf(req.name, sizeof(req.name), "%s", name);
+            snprintf(req.name, sizeof(req.name), "%.*s", MAX_NAME - 1, name);
 
             if (msgsnd(msqid, &req, MSG_SIZE, 0) < 0) {
                 perror("msgsnd");
@@ -336,7 +433,7 @@ static int run_client(int msqid) {
             if (rep.target_id > 0) {
                 pthread_mutex_lock(&g_mtx);
                 g_my_id = rep.target_id;
-                snprintf(g_my_name, sizeof(g_my_name), "%s", name);
+                snprintf(g_my_name, sizeof(g_my_name), "%.*s", MAX_NAME - 1, name);
                 pthread_mutex_unlock(&g_mtx);
                 printf("registered as %s (id=%ld)\n", name, rep.target_id);
             } else {
@@ -350,7 +447,7 @@ static int run_client(int msqid) {
             pthread_mutex_lock(&g_mtx);
             long cur_id = g_my_id;
             char cur_name[MAX_NAME];
-            snprintf(cur_name, sizeof(cur_name), "%s", g_my_name);
+            snprintf(cur_name, sizeof(cur_name), "%.*s", MAX_NAME - 1, g_my_name);
             pthread_mutex_unlock(&g_mtx);
 
             if (cur_id <= 0) {
@@ -368,7 +465,7 @@ static int run_client(int msqid) {
             req.cmd = CMD_LOOKUP;
             req.sender_id = cur_id;
             req.reply_type = g_reply_type;
-            snprintf(req.name, sizeof(req.name), "%s", target_name);
+            snprintf(req.name, sizeof(req.name), "%.*s", MAX_NAME - 1, target_name);
 
             if (msgsnd(msqid, &req, MSG_SIZE, 0) < 0) {
                 perror("msgsnd");
@@ -381,22 +478,34 @@ static int run_client(int msqid) {
                 break;
             }
 
-            if (rep.target_id <= 0) {
-                printf("user %s not found\n", target_name);
-                continue;
-            }
+            if (rep.target_id > 0) {
+                struct qmsg chat;
+                memset(&chat, 0, sizeof(chat));
+                chat.mtype = rep.target_id;
+                chat.cmd = CMD_CHAT;
+                chat.sender_id = cur_id;
+                snprintf(chat.sender_name, sizeof(chat.sender_name), "%.*s", MAX_NAME - 1, cur_name);
+                snprintf(chat.text, sizeof(chat.text), "%.*s", MAX_TEXT - 1, text);
 
-            struct qmsg chat;
-            memset(&chat, 0, sizeof(chat));
-            chat.mtype = rep.target_id;
-            chat.cmd = CMD_CHAT;
-            chat.sender_id = cur_id;
-            snprintf(chat.name, sizeof(chat.name), "%s", cur_name);
-            snprintf(chat.text, sizeof(chat.text), "%s", text);
+                if (msgsnd(msqid, &chat, MSG_SIZE, 0) < 0) {
+                    perror("msgsnd");
+                    break;
+                }
+            } else {
+                struct qmsg st;
+                memset(&st, 0, sizeof(st));
+                st.mtype = ARBITER_TYPE;
+                st.cmd = CMD_STORE;
+                st.sender_id = cur_id;
+                snprintf(st.name, sizeof(st.name), "%.*s", MAX_NAME - 1, target_name);
+                snprintf(st.sender_name, sizeof(st.sender_name), "%.*s", MAX_NAME - 1, cur_name);
+                snprintf(st.text, sizeof(st.text), "%.*s", MAX_TEXT - 1, text);
 
-            if (msgsnd(msqid, &chat, MSG_SIZE, 0) < 0) {
-                perror("msgsnd");
-                break;
+                if (msgsnd(msqid, &st, MSG_SIZE, 0) < 0) {
+                    perror("msgsnd");
+                    break;
+                }
+                printf("user %s is offline, message queued (%ds TTL)\n", target_name, OFFLINE_TTL);
             }
             continue;
         }
@@ -412,7 +521,7 @@ static int run_client(int msqid) {
 }
 
 int main(int argc, char *argv[]) {
-    if (argc != 2 || (strcmp(argv[1], "arbiter") != 0 && strcmp(argv[1], "client") != 0)) {
+    if (argc != 2 || (strcasecmp(argv[1], "arbiter") != 0 && strcasecmp(argv[1], "client") != 0)) {
         fprintf(stderr, "Usage: %s <arbiter|client>\n", argv[0]);
         return 1;
     }
@@ -429,11 +538,15 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    int is_arbiter = (strcmp(argv[1], "arbiter") == 0);
+    int is_arbiter = (strcasecmp(argv[1], "arbiter") == 0);
     int flags = is_arbiter ? (0666 | IPC_CREAT) : 0666;
     int msqid = msgget(key, flags);
     if (msqid < 0) {
-        perror("msgget");
+        if (!is_arbiter && errno == ENOENT) {
+            fprintf(stderr, "Arbiter is not running. Start '%s arbiter' first.\n", argv[0]);
+        } else {
+            perror("msgget");
+        }
         return 1;
     }
 
