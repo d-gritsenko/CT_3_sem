@@ -23,6 +23,16 @@
 #define HEARTBEAT_INTERVAL 4
 #define OFFLINE_TTL 60
 
+#define CLR_RESET   "\033[0m"
+#define CLR_BOLD    "\033[1m"
+#define CLR_DIM     "\033[2m"
+#define CLR_RED     "\033[31m"
+#define CLR_GREEN   "\033[32m"
+#define CLR_YELLOW  "\033[33m"
+#define CLR_BLUE    "\033[34m"
+#define CLR_MAGENTA "\033[35m"
+#define CLR_CYAN    "\033[36m"
+
 enum msg_cmd {
     CMD_REGISTER = 1,
     CMD_HEARTBEAT = 2,
@@ -69,10 +79,63 @@ static long g_my_id = 0;
 static long g_reply_type = 0;
 static char g_my_name[MAX_NAME];
 static pthread_mutex_t g_mtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_io_mtx = PTHREAD_MUTEX_INITIALIZER;
 
 static void on_signal(int sig) {
     (void)sig;
     running = 0;
+}
+
+static void get_timestamp(char *buf, size_t size) {
+    time_t now = time(NULL);
+    struct tm tm_now;
+    localtime_r(&now, &tm_now);
+    strftime(buf, size, "%H:%M:%S", &tm_now);
+}
+
+static void print_prompt_unlocked(const char *name) {
+    if (name != NULL && name[0] != '\0') {
+        printf(CLR_BOLD CLR_GREEN "[%s]" CLR_RESET CLR_DIM " > " CLR_RESET, name);
+    } else {
+        printf(CLR_DIM "[guest] > " CLR_RESET);
+    }
+    fflush(stdout);
+}
+
+static void print_prompt(void) {
+    char cur_name[MAX_NAME];
+    pthread_mutex_lock(&g_mtx);
+    snprintf(cur_name, sizeof(cur_name), "%.*s", MAX_NAME - 1, g_my_name);
+    pthread_mutex_unlock(&g_mtx);
+
+    pthread_mutex_lock(&g_io_mtx);
+    print_prompt_unlocked(cur_name);
+    pthread_mutex_unlock(&g_io_mtx);
+}
+
+static void print_client_banner(void) {
+    pthread_mutex_lock(&g_io_mtx);
+    printf(CLR_CYAN "╔══════════════════════════════════════════════╗\n");
+    printf("║" CLR_BOLD "           System V Queue Messenger           " CLR_RESET CLR_CYAN "║\n");
+    printf("╠══════════════════════════════════════════════╣\n");
+    printf("║  " CLR_GREEN "#<name>" CLR_RESET "        — register                   " CLR_CYAN "║\n");
+    printf("║  " CLR_GREEN "<name>#<text>" CLR_RESET "  — send message               " CLR_CYAN "║\n");
+    printf("║  " CLR_YELLOW "##" CLR_RESET "             — logout                     " CLR_CYAN "║\n");
+    printf("║  " CLR_DIM "Ctrl+D" CLR_RESET "         — exit                       " CLR_CYAN "║\n");
+    printf("╚══════════════════════════════════════════════╝\n" CLR_RESET);
+    fflush(stdout);
+    pthread_mutex_unlock(&g_io_mtx);
+}
+
+static void print_arbiter_banner(int msqid) {
+    printf(CLR_MAGENTA "╔══════════════════════════════════════════════╗\n");
+    printf("║" CLR_BOLD "            Queue Messenger Arbiter           " CLR_RESET CLR_MAGENTA "║\n");
+    printf("╚══════════════════════════════════════════════╝\n" CLR_RESET);
+    char ts[16];
+    get_timestamp(ts, sizeof(ts));
+    printf(CLR_DIM "[%s] " CLR_RESET CLR_GREEN "started" CLR_RESET " (msqid=%d, heartbeat=%ds, offline_ttl=%ds)\n",
+           ts, msqid, HEARTBEAT_TIMEOUT, OFFLINE_TTL);
+    fflush(stdout);
 }
 
 static void drain_type(int msqid, long mtype) {
@@ -142,7 +205,10 @@ static void deliver_pending(int msqid, struct pending_msg *pending, const char *
         }
     }
     if (delivered > 0) {
-        printf("[arbiter] delivered %d stored msg(s) to %s\n", delivered, name);
+        char ts[16];
+        get_timestamp(ts, sizeof(ts));
+        printf(CLR_DIM "[%s] " CLR_RESET CLR_CYAN "-> delivered %d stored msg(s) to %s\n" CLR_RESET,
+               ts, delivered, name);
         fflush(stdout);
     }
 }
@@ -166,8 +232,7 @@ static int run_arbiter(int msqid) {
     memset(pending, 0, sizeof(pending));
     long next_id = 2;
 
-    printf("[arbiter] started (msqid=%d, ttl=%ds)\n", msqid, OFFLINE_TTL);
-    fflush(stdout);
+    print_arbiter_banner(msqid);
 
     while (running) {
         time_t now = time(NULL);
@@ -175,7 +240,10 @@ static int run_arbiter(int msqid) {
 
         for (int i = 0; i < MAX_CLIENTS; i++) {
             if (clients[i].active && (now - clients[i].last_seen) > HEARTBEAT_TIMEOUT) {
-                printf("[arbiter] timeout: %s (id=%ld)\n", clients[i].name, clients[i].id);
+                char ts[16];
+                get_timestamp(ts, sizeof(ts));
+                printf(CLR_DIM "[%s] " CLR_RESET CLR_RED "- timeout: %s (id=%ld)\n" CLR_RESET,
+                       ts, clients[i].name, clients[i].id);
                 fflush(stdout);
                 salvage_messages(msqid, clients[i].id, clients[i].name, pending);
                 drain_type(msqid, clients[i].reply_type);
@@ -218,7 +286,11 @@ static int run_arbiter(int msqid) {
                 snprintf(clients[free_idx].name, sizeof(clients[free_idx].name), "%.*s", MAX_NAME - 1, msg.name);
                 clients[free_idx].last_seen = time(NULL);
                 send_reply(msqid, msg.reply_type, clients[free_idx].id, "ok");
-                printf("[arbiter] registered: %s (id=%ld)\n", clients[free_idx].name, clients[free_idx].id);
+
+                char ts[16];
+                get_timestamp(ts, sizeof(ts));
+                printf(CLR_DIM "[%s] " CLR_RESET CLR_GREEN "+ registered: %s (id=%ld)\n" CLR_RESET,
+                       ts, clients[free_idx].name, clients[free_idx].id);
                 fflush(stdout);
                 deliver_pending(msqid, pending, clients[free_idx].name, clients[free_idx].id);
             }
@@ -253,12 +325,19 @@ static int run_arbiter(int msqid) {
             msg.name[MAX_NAME - 1] = '\0';
             msg.text[MAX_TEXT - 1] = '\0';
             store_pending(pending, msg.sender_name, msg.name, msg.text);
-            printf("[arbiter] stored offline msg: %s -> %s\n", msg.sender_name, msg.name);
+
+            char ts[16];
+            get_timestamp(ts, sizeof(ts));
+            printf(CLR_DIM "[%s] " CLR_RESET CLR_YELLOW "~ stored offline: %s -> %s\n" CLR_RESET,
+                   ts, msg.sender_name, msg.name);
             fflush(stdout);
         } else if (msg.cmd == CMD_LOGOUT) {
             for (int i = 0; i < MAX_CLIENTS; i++) {
                 if (clients[i].active && clients[i].id == msg.sender_id) {
-                    printf("[arbiter] logout: %s (id=%ld)\n", clients[i].name, clients[i].id);
+                    char ts[16];
+                    get_timestamp(ts, sizeof(ts));
+                    printf(CLR_DIM "[%s] " CLR_RESET CLR_YELLOW "- logout: %s (id=%ld)\n" CLR_RESET,
+                           ts, clients[i].name, clients[i].id);
                     fflush(stdout);
                     salvage_messages(msqid, clients[i].id, clients[i].name, pending);
                     drain_type(msqid, clients[i].reply_type);
@@ -270,7 +349,9 @@ static int run_arbiter(int msqid) {
     }
 
     msgctl(msqid, IPC_RMID, NULL);
-    printf("\n[arbiter] stopped, queue removed\n");
+    char ts[16];
+    get_timestamp(ts, sizeof(ts));
+    printf("\n" CLR_DIM "[%s] " CLR_RESET CLR_RED "stopped, queue removed\n" CLR_RESET, ts);
     return 0;
 }
 
@@ -279,8 +360,10 @@ static void *recv_worker(void *arg) {
     struct qmsg msg;
 
     while (running) {
+        char cur_name[MAX_NAME];
         pthread_mutex_lock(&g_mtx);
         long my_id = g_my_id;
+        snprintf(cur_name, sizeof(cur_name), "%.*s", MAX_NAME - 1, g_my_name);
         pthread_mutex_unlock(&g_mtx);
 
         if (my_id <= 0) {
@@ -293,8 +376,14 @@ static void *recv_worker(void *arg) {
             if (msg.cmd == CMD_CHAT) {
                 msg.sender_name[MAX_NAME - 1] = '\0';
                 msg.text[MAX_TEXT - 1] = '\0';
-                printf("\n[%s]: %s\n", msg.sender_name, msg.text);
-                fflush(stdout);
+                char ts[16];
+                get_timestamp(ts, sizeof(ts));
+
+                pthread_mutex_lock(&g_io_mtx);
+                printf("\r\033[K" CLR_DIM "[%s] " CLR_RESET CLR_BOLD CLR_CYAN "%s" CLR_RESET ": %s\n",
+                       ts, msg.sender_name, msg.text);
+                print_prompt_unlocked(cur_name);
+                pthread_mutex_unlock(&g_io_mtx);
             }
         } else {
             if (errno == ENOMSG) {
@@ -302,6 +391,10 @@ static void *recv_worker(void *arg) {
             } else if (errno == EINTR) {
                 continue;
             } else {
+                pthread_mutex_lock(&g_io_mtx);
+                printf("\r\033[K" CLR_RED "Connection lost (arbiter stopped).\n" CLR_RESET);
+                fflush(stdout);
+                pthread_mutex_unlock(&g_io_mtx);
                 running = 0;
                 break;
             }
@@ -362,6 +455,7 @@ static void send_logout(void) {
 static int run_client(int msqid) {
     g_msqid = msqid;
     g_reply_type = REPLY_BASE + (long)getpid();
+    int interactive = isatty(STDIN_FILENO);
 
     pthread_t t_recv;
     pthread_t t_hb;
@@ -376,10 +470,14 @@ static int run_client(int msqid) {
         return 1;
     }
 
+    print_client_banner();
+    print_prompt();
+
     char line[MAX_NAME + MAX_TEXT + 4];
     while (running && fgets(line, sizeof(line), stdin) != NULL) {
         line[strcspn(line, "\n")] = '\0';
         if (line[0] == '\0') {
+            print_prompt();
             continue;
         }
 
@@ -390,10 +488,15 @@ static int run_client(int msqid) {
 
             if (cur_id > 0) {
                 send_logout();
-                printf("logged out\n");
+                pthread_mutex_lock(&g_io_mtx);
+                printf(CLR_YELLOW "* Logged out\n" CLR_RESET);
+                pthread_mutex_unlock(&g_io_mtx);
             } else {
-                printf("not registered\n");
+                pthread_mutex_lock(&g_io_mtx);
+                printf(CLR_RED "! Not registered\n" CLR_RESET);
+                pthread_mutex_unlock(&g_io_mtx);
             }
+            print_prompt();
             continue;
         }
 
@@ -404,11 +507,17 @@ static int run_client(int msqid) {
             pthread_mutex_unlock(&g_mtx);
 
             if (cur_id > 0) {
-                printf("already registered, use ## first\n");
+                pthread_mutex_lock(&g_io_mtx);
+                printf(CLR_RED "! Already registered, use ## first\n" CLR_RESET);
+                pthread_mutex_unlock(&g_io_mtx);
+                print_prompt();
                 continue;
             }
             if (name[0] == '\0' || strchr(name, '#') != NULL || strlen(name) >= MAX_NAME) {
-                printf("invalid name\n");
+                pthread_mutex_lock(&g_io_mtx);
+                printf(CLR_RED "! Invalid name\n" CLR_RESET);
+                pthread_mutex_unlock(&g_io_mtx);
+                print_prompt();
                 continue;
             }
 
@@ -435,10 +544,16 @@ static int run_client(int msqid) {
                 g_my_id = rep.target_id;
                 snprintf(g_my_name, sizeof(g_my_name), "%.*s", MAX_NAME - 1, name);
                 pthread_mutex_unlock(&g_mtx);
-                printf("registered as %s (id=%ld)\n", name, rep.target_id);
+
+                pthread_mutex_lock(&g_io_mtx);
+                printf(CLR_GREEN "* Registered as %s (id=%ld)\n" CLR_RESET, name, rep.target_id);
+                pthread_mutex_unlock(&g_io_mtx);
             } else {
-                printf("registration failed: %s\n", rep.text);
+                pthread_mutex_lock(&g_io_mtx);
+                printf(CLR_RED "! Registration failed: %s\n" CLR_RESET, rep.text);
+                pthread_mutex_unlock(&g_io_mtx);
             }
+            print_prompt();
             continue;
         }
 
@@ -451,7 +566,10 @@ static int run_client(int msqid) {
             pthread_mutex_unlock(&g_mtx);
 
             if (cur_id <= 0) {
-                printf("register first with #<name>\n");
+                pthread_mutex_lock(&g_io_mtx);
+                printf(CLR_RED "! Register first with #<name>\n" CLR_RESET);
+                pthread_mutex_unlock(&g_io_mtx);
+                print_prompt();
                 continue;
             }
 
@@ -478,6 +596,9 @@ static int run_client(int msqid) {
                 break;
             }
 
+            char ts[16];
+            get_timestamp(ts, sizeof(ts));
+
             if (rep.target_id > 0) {
                 struct qmsg chat;
                 memset(&chat, 0, sizeof(chat));
@@ -491,6 +612,14 @@ static int run_client(int msqid) {
                     perror("msgsnd");
                     break;
                 }
+
+                pthread_mutex_lock(&g_io_mtx);
+                if (interactive) {
+                    printf("\033[1A\r\033[K");
+                }
+                printf(CLR_DIM "[%s] " CLR_RESET CLR_GREEN "you -> %s" CLR_RESET ": %s\n",
+                       ts, target_name, text);
+                pthread_mutex_unlock(&g_io_mtx);
             } else {
                 struct qmsg st;
                 memset(&st, 0, sizeof(st));
@@ -505,18 +634,30 @@ static int run_client(int msqid) {
                     perror("msgsnd");
                     break;
                 }
-                printf("user %s is offline, message queued (%ds TTL)\n", target_name, OFFLINE_TTL);
+
+                pthread_mutex_lock(&g_io_mtx);
+                if (interactive) {
+                    printf("\033[1A\r\033[K");
+                }
+                printf(CLR_DIM "[%s] " CLR_RESET CLR_YELLOW "you -> %s (offline, queued %ds)" CLR_RESET ": %s\n",
+                       ts, target_name, OFFLINE_TTL, text);
+                pthread_mutex_unlock(&g_io_mtx);
             }
+            print_prompt();
             continue;
         }
 
-        printf("format: #<name> | <name>#<message> | ##\n");
+        pthread_mutex_lock(&g_io_mtx);
+        printf(CLR_YELLOW "! Format: #<name> | <name>#<message> | ##\n" CLR_RESET);
+        pthread_mutex_unlock(&g_io_mtx);
+        print_prompt();
     }
 
     send_logout();
     running = 0;
     pthread_join(t_recv, NULL);
     pthread_join(t_hb, NULL);
+    printf("\n");
     return 0;
 }
 
