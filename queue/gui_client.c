@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/ipc.h>
 #include <sys/msg.h>
 #include <sys/types.h>
@@ -582,6 +583,10 @@ static void on_send_clicked(GtkWidget *widget, gpointer data) {
     }
     if (strcmp(target, cur_name) == 0) {
         ui_append_line("err", "Cannot send message to yourself.", NULL);
+        return;
+    }
+    if (strcasecmp(target, "arbiter") == 0) {
+        ui_append_line("err", "Cannot send message to arbiter.", NULL);
         return;
     }
 

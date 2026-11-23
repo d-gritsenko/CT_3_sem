@@ -363,6 +363,8 @@ static int run_arbiter(int msqid) {
 
             if (msg.name[0] == '\0') {
                 send_reply(msqid, msg.reply_type, -1, "invalid name");
+            } else if (strcasecmp(msg.name, "arbiter") == 0) {
+                send_reply(msqid, msg.reply_type, -1, "reserved name");
             } else if (match_idx >= 0) {
                 if (clients[match_idx].active) {
                     send_reply(msqid, msg.reply_type, -1, "name already taken");
@@ -803,6 +805,13 @@ static int run_client(int msqid) {
             if (strcmp(target_name, cur_name) == 0) {
                 pthread_mutex_lock(&g_io_mtx);
                 printf(CLR_RED "! Cannot send message to yourself\n" CLR_RESET);
+                pthread_mutex_unlock(&g_io_mtx);
+                print_prompt();
+                continue;
+            }            
+            if (strcasecmp(target_name, "arbiter") == 0) {
+                pthread_mutex_lock(&g_io_mtx);
+                printf(CLR_RED "! Cannot send message to arbiter\n" CLR_RESET);
                 pthread_mutex_unlock(&g_io_mtx);
                 print_prompt();
                 continue;
