@@ -129,15 +129,15 @@ static void ui_set_connected_state(int connected, const char *name, long id) {
     if (connected) {
         char status[128];
         char title[128];
-        snprintf(status, sizeof(status), "Онлайн: %s (id=%ld)", name, id);
+        snprintf(status, sizeof(status), "Online: %s (id=%ld)", name, id);
         snprintf(title, sizeof(title), "Queue Messenger — %s", name);
         gtk_label_set_text(GTK_LABEL(w_status_lbl), status);
-        gtk_button_set_label(GTK_BUTTON(w_conn_btn), "Выйти");
+        gtk_button_set_label(GTK_BUTTON(w_conn_btn), "Logout");
         gtk_window_set_title(GTK_WINDOW(w_window), title);
         gtk_widget_grab_focus(w_target_entry);
     } else {
-        gtk_label_set_text(GTK_LABEL(w_status_lbl), "Не подключён");
-        gtk_button_set_label(GTK_BUTTON(w_conn_btn), "Войти");
+        gtk_label_set_text(GTK_LABEL(w_status_lbl), "Disconnected");
+        gtk_button_set_label(GTK_BUTTON(w_conn_btn), "Login");
         gtk_window_set_title(GTK_WINDOW(w_window), "Queue Messenger");
         gtk_widget_grab_focus(w_nick_entry);
     }
@@ -157,7 +157,7 @@ static gboolean ui_handle_event(gpointer user_data) {
         ui_append_line("incoming", prefix, ev->text);
     } else if (ev->kind == EV_ACK) {
         char line[MAX_NAME + 64];
-        snprintf(line, sizeof(line), "✓ доставлено %s (#%ld)", ev->sender, ev->msg_id);
+        snprintf(line, sizeof(line), "✓ delivered to %s (#%ld)", ev->sender, ev->msg_id);
         ui_append_line("ack", line, NULL);
     } else if (ev->kind == EV_LOST) {
         pthread_mutex_lock(&g_mtx);
@@ -167,7 +167,7 @@ static gboolean ui_handle_event(gpointer user_data) {
         ui_set_connected_state(0, "", 0);
         gtk_widget_set_sensitive(w_conn_btn, FALSE);
         gtk_widget_set_sensitive(w_nick_entry, FALSE);
-        ui_append_line("err", "Соединение потеряно (арбитр остановлен).", NULL);
+        ui_append_line("err", "Connection lost (arbiter stopped).", NULL);
     }
 
     free(ev);
@@ -290,13 +290,13 @@ static void on_connect_clicked(GtkWidget *widget, gpointer data) {
     if (cur_id > 0) {
         send_logout();
         ui_set_connected_state(0, "", 0);
-        ui_append_line("warn", "Вы вышли из чата.", NULL);
+        ui_append_line("warn", "Logged out.", NULL);
         return;
     }
 
     const char *name = gtk_entry_get_text(GTK_ENTRY(w_nick_entry));
     if (name == NULL || name[0] == '\0' || strchr(name, '#') != NULL || strlen(name) >= MAX_NAME) {
-        ui_append_line("err", "Некорректный ник (1..31 символ, без '#').", NULL);
+        ui_append_line("err", "Invalid name (1..31 chars, no '#').", NULL);
         return;
     }
 
@@ -308,13 +308,13 @@ static void on_connect_clicked(GtkWidget *widget, gpointer data) {
     snprintf(req.name, sizeof(req.name), "%.*s", MAX_NAME - 1, name);
 
     if (msgsnd(g_msqid, &req, MSG_SIZE, 0) < 0) {
-        ui_append_line("err", "Не удалось отправить запрос арбитру.", NULL);
+        ui_append_line("err", "Failed to send request to arbiter.", NULL);
         return;
     }
 
     struct qmsg rep;
     if (wait_reply(g_msqid, g_reply_type, &rep) < 0) {
-        ui_append_line("err", "Нет ответа от арбитра.", NULL);
+        ui_append_line("err", "No response from arbiter.", NULL);
         return;
     }
 
@@ -327,12 +327,12 @@ static void on_connect_clicked(GtkWidget *widget, gpointer data) {
 
         ui_set_connected_state(1, name, rep.target_id);
         char info[128];
-        snprintf(info, sizeof(info), "Подключено как %s (id=%ld).", name, rep.target_id);
+        snprintf(info, sizeof(info), "Registered as %s (id=%ld).", name, rep.target_id);
         ui_append_line("sys", info, NULL);
     } else {
         char info[MAX_TEXT + 64];
         rep.text[MAX_TEXT - 1] = '\0';
-        snprintf(info, sizeof(info), "Ошибка входа: %s", rep.text);
+        snprintf(info, sizeof(info), "Registration failed: %s", rep.text);
         ui_append_line("err", info, NULL);
     }
 }
@@ -348,7 +348,7 @@ static void on_send_clicked(GtkWidget *widget, gpointer data) {
     pthread_mutex_unlock(&g_mtx);
 
     if (cur_id <= 0) {
-        ui_append_line("err", "Сначала войдите под своим ником.", NULL);
+        ui_append_line("err", "Register first.", NULL);
         return;
     }
 
@@ -356,7 +356,7 @@ static void on_send_clicked(GtkWidget *widget, gpointer data) {
     const char *text = gtk_entry_get_text(GTK_ENTRY(w_msg_entry));
 
     if (target == NULL || target[0] == '\0' || strlen(target) >= MAX_NAME) {
-        ui_append_line("err", "Укажите корректного получателя.", NULL);
+        ui_append_line("err", "Enter a valid recipient.", NULL);
         gtk_widget_grab_focus(w_target_entry);
         return;
     }
@@ -373,13 +373,13 @@ static void on_send_clicked(GtkWidget *widget, gpointer data) {
     snprintf(req.name, sizeof(req.name), "%.*s", MAX_NAME - 1, target);
 
     if (msgsnd(g_msqid, &req, MSG_SIZE, 0) < 0) {
-        ui_append_line("err", "Ошибка отправки запроса арбитру.", NULL);
+        ui_append_line("err", "Failed to send request to arbiter.", NULL);
         return;
     }
 
     struct qmsg rep;
     if (wait_reply(g_msqid, g_reply_type, &rep) < 0) {
-        ui_append_line("err", "Нет ответа от арбитра.", NULL);
+        ui_append_line("err", "No response from arbiter.", NULL);
         return;
     }
 
@@ -396,12 +396,12 @@ static void on_send_clicked(GtkWidget *widget, gpointer data) {
         snprintf(chat.text, sizeof(chat.text), "%.*s", MAX_TEXT - 1, text);
 
         if (msgsnd(g_msqid, &chat, MSG_SIZE, 0) < 0) {
-            ui_append_line("err", "Не удалось отправить сообщение.", NULL);
+            ui_append_line("err", "Failed to send message.", NULL);
             return;
         }
 
         char prefix[MAX_NAME + 48];
-        snprintf(prefix, sizeof(prefix), "Вы -> %s (#%ld): ", target, msg_id);
+        snprintf(prefix, sizeof(prefix), "you -> %s (#%ld): ", target, msg_id);
         ui_append_line("outgoing", prefix, text);
     } else {
         struct qmsg st;
@@ -415,12 +415,12 @@ static void on_send_clicked(GtkWidget *widget, gpointer data) {
         snprintf(st.text, sizeof(st.text), "%.*s", MAX_TEXT - 1, text);
 
         if (msgsnd(g_msqid, &st, MSG_SIZE, 0) < 0) {
-            ui_append_line("err", "Не удалось сохранить офлайн-сообщение.", NULL);
+            ui_append_line("err", "Failed to store offline message.", NULL);
             return;
         }
 
         char prefix[MAX_NAME + 80];
-        snprintf(prefix, sizeof(prefix), "Вы -> %s (#%ld, офлайн, TTL %ds): ", target, msg_id, OFFLINE_TTL);
+        snprintf(prefix, sizeof(prefix), "you -> %s (#%ld, offline, queued %ds): ", target, msg_id, OFFLINE_TTL);
         ui_append_line("warn", prefix, text);
     }
 
@@ -477,14 +477,14 @@ static void build_ui(void) {
 
     GtkWidget *top_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     w_nick_entry = gtk_entry_new();
-    gtk_entry_set_placeholder_text(GTK_ENTRY(w_nick_entry), "Ваш никнейм");
+    gtk_entry_set_placeholder_text(GTK_ENTRY(w_nick_entry), "Username");
     gtk_entry_set_max_length(GTK_ENTRY(w_nick_entry), MAX_NAME - 1);
     g_signal_connect(w_nick_entry, "activate", G_CALLBACK(on_connect_clicked), NULL);
 
-    w_conn_btn = gtk_button_new_with_label("Войти");
+    w_conn_btn = gtk_button_new_with_label("Login");
     g_signal_connect(w_conn_btn, "clicked", G_CALLBACK(on_connect_clicked), NULL);
 
-    w_status_lbl = gtk_label_new("Не подключён");
+    w_status_lbl = gtk_label_new("Disconnected");
     gtk_widget_set_halign(w_status_lbl, GTK_ALIGN_END);
 
     gtk_box_pack_start(GTK_BOX(top_bar), w_nick_entry, FALSE, FALSE, 0);
@@ -518,16 +518,16 @@ static void build_ui(void) {
 
     GtkWidget *bottom_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     w_target_entry = gtk_entry_new();
-    gtk_entry_set_placeholder_text(GTK_ENTRY(w_target_entry), "Кому");
+    gtk_entry_set_placeholder_text(GTK_ENTRY(w_target_entry), "To");
     gtk_entry_set_max_length(GTK_ENTRY(w_target_entry), MAX_NAME - 1);
     gtk_entry_set_width_chars(GTK_ENTRY(w_target_entry), 14);
 
     w_msg_entry = gtk_entry_new();
-    gtk_entry_set_placeholder_text(GTK_ENTRY(w_msg_entry), "Сообщение...");
+    gtk_entry_set_placeholder_text(GTK_ENTRY(w_msg_entry), "Message...");
     gtk_entry_set_max_length(GTK_ENTRY(w_msg_entry), MAX_TEXT - 1);
     g_signal_connect(w_msg_entry, "activate", G_CALLBACK(on_send_clicked), NULL);
 
-    w_send_btn = gtk_button_new_with_label("Отправить");
+    w_send_btn = gtk_button_new_with_label("Send");
     g_signal_connect(w_send_btn, "clicked", G_CALLBACK(on_send_clicked), NULL);
 
     gtk_box_pack_start(GTK_BOX(bottom_bar), w_target_entry, FALSE, FALSE, 0);
@@ -555,7 +555,7 @@ int main(int argc, char *argv[]) {
             GTK_DIALOG_MODAL,
             GTK_MESSAGE_ERROR,
             GTK_BUTTONS_OK,
-            "Арбитр не запущен.\nСначала запустите './extraq arbiter' в терминале."
+            "Arbiter is not running.\nStart './extraq arbiter' in a terminal first."
         );
         gtk_dialog_run(GTK_DIALOG(dlg));
         gtk_widget_destroy(dlg);
