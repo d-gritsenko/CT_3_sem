@@ -6,3 +6,5 @@ core
 vgcore.*
 .vscode/
 *~
+chat_backlog.dat
+chat_backlog.dat.tmp
