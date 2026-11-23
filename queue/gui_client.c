@@ -255,7 +255,7 @@ static void ui_append_outgoing(long msg_id, const char *target, const char *body
     }
 
     gtk_text_buffer_get_end_iter(w_chat_buf, &end);
-    gtk_text_buffer_create_mark(w_chat_buf, m_end, &end, FALSE);
+    gtk_text_buffer_create_mark(w_chat_buf, m_end, &end, TRUE);
     gtk_text_buffer_insert(w_chat_buf, &end, "\n", -1);
 
     GtkTextMark *mark = gtk_text_buffer_get_insert(w_chat_buf);
