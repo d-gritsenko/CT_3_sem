@@ -22,7 +22,9 @@ enum msg_cmd {
     CMD_CHAT = 5,
     CMD_REPLY = 6,
     CMD_STORE = 7,
-    CMD_ACK = 8
+    CMD_ACK = 8,
+    CMD_WHO = 9,
+    CMD_RECONNECT = 10
 };
 
 struct qmsg {

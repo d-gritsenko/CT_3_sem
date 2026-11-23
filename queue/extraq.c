@@ -103,6 +103,7 @@ static void print_client_banner(void) {
     printf("║" CLR_BOLD "           System V Queue Messenger           " CLR_RESET CLR_CYAN "║\n");
     printf("╠══════════════════════════════════════════════╣\n");
     printf("║  " CLR_GREEN "#<name>" CLR_RESET "        — register                   " CLR_CYAN "║\n");
+    printf("║  " CLR_GREEN "@<name>" CLR_RESET "        — reconnect                  " CLR_CYAN "║\n");
     printf("║  " CLR_GREEN "<name>#<text>" CLR_RESET "  — send message               " CLR_CYAN "║\n");
     printf("║  " CLR_CYAN "? / /who" CLR_RESET "       — online users               " CLR_CYAN "║\n");
     printf("║  " CLR_YELLOW "##" CLR_RESET "             — logout                     " CLR_CYAN "║\n");
@@ -366,23 +367,8 @@ static int run_arbiter(int msqid) {
             } else if (strcasecmp(msg.name, "arbiter") == 0) {
                 send_reply(msqid, msg.reply_type, -1, "reserved name");
             } else if (match_idx >= 0) {
-                if (clients[match_idx].active) {
-                    send_reply(msqid, msg.reply_type, -1, "name already taken");
-                } else {
-                    clients[match_idx].active = 1;
-                    clients[match_idx].reply_type = msg.reply_type;
-                    clients[match_idx].last_seen = time(NULL);
-                    send_reply(msqid, msg.reply_type, clients[match_idx].id, "ok");
-
-                    char ts[16];
-                    get_timestamp(ts, sizeof(ts));
-                    printf(CLR_DIM "[%s] " CLR_RESET CLR_GREEN "+ reconnected: %s (id=%ld)\n" CLR_RESET,
-                           ts, clients[match_idx].name, clients[match_idx].id);
-                    fflush(stdout);
-                    if (deliver_pending(msqid, pending, clients[match_idx].name, clients[match_idx].id) > 0) {
-                        save_backlog(pending);
-                    }
-                }
+                send_reply(msqid, msg.reply_type, -1,
+                           clients[match_idx].active ? "name already taken" : "name already exists, use reconnect");
             } else {
                 int idx = (free_idx >= 0) ? free_idx : oldest_offline;
                 if (idx < 0) {
@@ -404,6 +390,36 @@ static int run_arbiter(int msqid) {
                     if (deliver_pending(msqid, pending, clients[idx].name, clients[idx].id) > 0) {
                         save_backlog(pending);
                     }
+                }
+            }
+        } else if (msg.cmd == CMD_RECONNECT) {
+            int match_idx = -1;
+            for (int i = 0; i < MAX_CLIENTS; i++) {
+                if (clients[i].used && strcmp(clients[i].name, msg.name) == 0) {
+                    match_idx = i;
+                    break;
+                }
+            }
+
+            if (msg.name[0] == '\0') {
+                send_reply(msqid, msg.reply_type, -1, "invalid name");
+            } else if (match_idx < 0) {
+                send_reply(msqid, msg.reply_type, -1, "user not found");
+            } else if (clients[match_idx].active) {
+                send_reply(msqid, msg.reply_type, -1, "already online");
+            } else {
+                clients[match_idx].active = 1;
+                clients[match_idx].reply_type = msg.reply_type;
+                clients[match_idx].last_seen = time(NULL);
+                send_reply(msqid, msg.reply_type, clients[match_idx].id, "ok");
+
+                char ts[16];
+                get_timestamp(ts, sizeof(ts));
+                printf(CLR_DIM "[%s] " CLR_RESET CLR_GREEN "+ reconnected: %s (id=%ld)\n" CLR_RESET,
+                       ts, clients[match_idx].name, clients[match_idx].id);
+                fflush(stdout);
+                if (deliver_pending(msqid, pending, clients[match_idx].name, clients[match_idx].id) > 0) {
+                    save_backlog(pending);
                 }
             }
         } else if (msg.cmd == CMD_HEARTBEAT) {
@@ -724,7 +740,8 @@ static int run_client(int msqid) {
             continue;
         }
 
-        if (line[0] == '#') {
+        if (line[0] == '#' || line[0] == '@') {
+            int is_reconnect = (line[0] == '@');
             const char *name = line + 1;
             pthread_mutex_lock(&g_mtx);
             long cur_id = g_my_id;
@@ -732,7 +749,7 @@ static int run_client(int msqid) {
 
             if (cur_id > 0) {
                 pthread_mutex_lock(&g_io_mtx);
-                printf(CLR_RED "! Already registered, use ## first\n" CLR_RESET);
+                printf(CLR_RED "! Already logged in, use ## first\n" CLR_RESET);
                 pthread_mutex_unlock(&g_io_mtx);
                 print_prompt();
                 continue;
@@ -748,7 +765,7 @@ static int run_client(int msqid) {
             struct qmsg req;
             memset(&req, 0, sizeof(req));
             req.mtype = ARBITER_TYPE;
-            req.cmd = CMD_REGISTER;
+            req.cmd = is_reconnect ? CMD_RECONNECT : CMD_REGISTER;
             req.reply_type = g_reply_type;
             snprintf(req.name, sizeof(req.name), "%.*s", MAX_NAME - 1, name);
 
@@ -771,11 +788,13 @@ static int run_client(int msqid) {
                 pthread_mutex_unlock(&g_mtx);
 
                 pthread_mutex_lock(&g_io_mtx);
-                printf(CLR_GREEN "* Registered as %s (id=%ld)\n" CLR_RESET, name, rep.target_id);
+                printf(CLR_GREEN "* %s as %s (id=%ld)\n" CLR_RESET,
+                       is_reconnect ? "Reconnected" : "Registered", name, rep.target_id);
                 pthread_mutex_unlock(&g_io_mtx);
             } else {
                 pthread_mutex_lock(&g_io_mtx);
-                printf(CLR_RED "! Registration failed: %s\n" CLR_RESET, rep.text);
+                printf(CLR_RED "! %s failed: %s\n" CLR_RESET,
+                       is_reconnect ? "Reconnect" : "Registration", rep.text);
                 pthread_mutex_unlock(&g_io_mtx);
             }
             print_prompt();
@@ -891,7 +910,7 @@ static int run_client(int msqid) {
         }
 
         pthread_mutex_lock(&g_io_mtx);
-        printf(CLR_YELLOW "! Format: #<name> | <name>#<message> | ? | ##\n" CLR_RESET);
+        printf(CLR_YELLOW "! Format: #<name> | @<name> | <name>#<message> | ? | ##\n" CLR_RESET);
         pthread_mutex_unlock(&g_io_mtx);
         print_prompt();
     }

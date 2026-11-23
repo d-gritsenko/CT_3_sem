@@ -40,9 +40,13 @@ static long g_next_msg_id = 1;
 static char g_my_name[MAX_NAME];
 static pthread_mutex_t g_mtx = PTHREAD_MUTEX_INITIALIZER;
 
+static int g_was_connected = 0;
+
 static GtkWidget *w_window = NULL;
 static GtkWidget *w_nick_entry = NULL;
-static GtkWidget *w_conn_btn = NULL;
+static GtkWidget *w_reg_btn = NULL;
+static GtkWidget *w_reconn_btn = NULL;
+static GtkWidget *w_logout_btn = NULL;
 static GtkWidget *w_status_lbl = NULL;
 static GtkWidget *w_chat_view = NULL;
 static GtkTextBuffer *w_chat_buf = NULL;
@@ -293,6 +297,9 @@ static void ui_mark_delivered(long msg_id) {
 
 static void ui_set_connected_state(int connected, const char *name, long id) {
     gtk_widget_set_sensitive(w_nick_entry, !connected);
+    gtk_widget_set_visible(w_reg_btn, !connected);
+    gtk_widget_set_visible(w_reconn_btn, !connected);
+    gtk_widget_set_visible(w_logout_btn, connected);
     gtk_widget_set_sensitive(w_target_entry, connected);
     gtk_widget_set_sensitive(w_msg_entry, connected);
     gtk_widget_set_sensitive(w_send_btn, connected);
@@ -304,12 +311,10 @@ static void ui_set_connected_state(int connected, const char *name, long id) {
         snprintf(status, sizeof(status), "Online: %s (id=%ld)", name, id);
         snprintf(title, sizeof(title), "Queue Messenger — %s", name);
         gtk_label_set_text(GTK_LABEL(w_status_lbl), status);
-        gtk_button_set_label(GTK_BUTTON(w_conn_btn), "Logout");
         gtk_window_set_title(GTK_WINDOW(w_window), title);
         gtk_widget_grab_focus(w_target_entry);
     } else {
         gtk_label_set_text(GTK_LABEL(w_status_lbl), "Disconnected");
-        gtk_button_set_label(GTK_BUTTON(w_conn_btn), "Login");
         gtk_window_set_title(GTK_WINDOW(w_window), "Queue Messenger");
         ui_update_users_list(0, "");
         gtk_widget_grab_focus(w_nick_entry);
@@ -338,7 +343,9 @@ static gboolean ui_handle_event(gpointer user_data) {
         g_my_name[0] = '\0';
         pthread_mutex_unlock(&g_mtx);
         ui_set_connected_state(0, "", 0);
-        gtk_widget_set_sensitive(w_conn_btn, FALSE);
+        gtk_widget_set_sensitive(w_reg_btn, FALSE);
+        gtk_widget_set_sensitive(w_reconn_btn, FALSE);
+        gtk_widget_set_sensitive(w_logout_btn, FALSE);
         gtk_widget_set_sensitive(w_nick_entry, FALSE);
         ui_append_line("err", "Connection lost (arbiter stopped).", NULL);
     }
@@ -495,18 +502,12 @@ static void *heartbeat_worker(void *arg) {
     return NULL;
 }
 
-static void on_connect_clicked(GtkWidget *widget, gpointer data) {
-    (void)widget;
-    (void)data;
-
+static void do_auth(int is_reconnect) {
     pthread_mutex_lock(&g_mtx);
     long cur_id = g_my_id;
     pthread_mutex_unlock(&g_mtx);
 
     if (cur_id > 0) {
-        send_logout();
-        ui_set_connected_state(0, "", 0);
-        ui_append_line("warn", "Logged out.", NULL);
         return;
     }
 
@@ -519,7 +520,7 @@ static void on_connect_clicked(GtkWidget *widget, gpointer data) {
     struct qmsg req;
     memset(&req, 0, sizeof(req));
     req.mtype = ARBITER_TYPE;
-    req.cmd = CMD_REGISTER;
+    req.cmd = is_reconnect ? CMD_RECONNECT : CMD_REGISTER;
     req.reply_type = g_reply_type;
     snprintf(req.name, sizeof(req.name), "%.*s", MAX_NAME - 1, name);
 
@@ -541,18 +542,47 @@ static void on_connect_clicked(GtkWidget *widget, gpointer data) {
         snprintf(g_my_name, sizeof(g_my_name), "%.*s", MAX_NAME - 1, name);
         pthread_mutex_unlock(&g_mtx);
 
+        g_was_connected = 1;
         ui_set_connected_state(1, name, rep.target_id);
         g_who_force = 1;
 
         char info[128];
-        snprintf(info, sizeof(info), "Registered as %s (id=%ld).", name, rep.target_id);
+        snprintf(info, sizeof(info), "%s as %s (id=%ld).",
+                 is_reconnect ? "Reconnected" : "Registered", name, rep.target_id);
         ui_append_line("sys", info, NULL);
     } else {
         char info[MAX_TEXT + 64];
         rep.text[MAX_TEXT - 1] = '\0';
-        snprintf(info, sizeof(info), "Registration failed: %s", rep.text);
+        snprintf(info, sizeof(info), "%s failed: %s",
+                 is_reconnect ? "Reconnect" : "Registration", rep.text);
         ui_append_line("err", info, NULL);
     }
+}
+
+static void on_register_clicked(GtkWidget *widget, gpointer data) {
+    (void)widget;
+    (void)data;
+    do_auth(0);
+}
+
+static void on_reconnect_clicked(GtkWidget *widget, gpointer data) {
+    (void)widget;
+    (void)data;
+    do_auth(1);
+}
+
+static void on_logout_clicked(GtkWidget *widget, gpointer data) {
+    (void)widget;
+    (void)data;
+    send_logout();
+    ui_set_connected_state(0, "", 0);
+    ui_append_line("warn", "Logged out.", NULL);
+}
+
+static void on_nick_activate(GtkWidget *widget, gpointer data) {
+    (void)widget;
+    (void)data;
+    do_auth(g_was_connected);
 }
 
 static void on_send_clicked(GtkWidget *widget, gpointer data) {
@@ -707,16 +737,24 @@ static void build_ui(void) {
     w_nick_entry = gtk_entry_new();
     gtk_entry_set_placeholder_text(GTK_ENTRY(w_nick_entry), "Username");
     gtk_entry_set_max_length(GTK_ENTRY(w_nick_entry), MAX_NAME - 1);
-    g_signal_connect(w_nick_entry, "activate", G_CALLBACK(on_connect_clicked), NULL);
+    g_signal_connect(w_nick_entry, "activate", G_CALLBACK(on_nick_activate), NULL);
 
-    w_conn_btn = gtk_button_new_with_label("Login");
-    g_signal_connect(w_conn_btn, "clicked", G_CALLBACK(on_connect_clicked), NULL);
+    w_reg_btn = gtk_button_new_with_label("Register");
+    g_signal_connect(w_reg_btn, "clicked", G_CALLBACK(on_register_clicked), NULL);
+
+    w_reconn_btn = gtk_button_new_with_label("Reconnect");
+    g_signal_connect(w_reconn_btn, "clicked", G_CALLBACK(on_reconnect_clicked), NULL);
+
+    w_logout_btn = gtk_button_new_with_label("Logout");
+    g_signal_connect(w_logout_btn, "clicked", G_CALLBACK(on_logout_clicked), NULL);
 
     w_status_lbl = gtk_label_new("Disconnected");
     gtk_widget_set_halign(w_status_lbl, GTK_ALIGN_END);
 
     gtk_box_pack_start(GTK_BOX(top_bar), w_nick_entry, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(top_bar), w_conn_btn, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(top_bar), w_reg_btn, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(top_bar), w_reconn_btn, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(top_bar), w_logout_btn, FALSE, FALSE, 0);
     gtk_box_pack_end(GTK_BOX(top_bar), w_status_lbl, TRUE, TRUE, 0);
     gtk_box_pack_start(GTK_BOX(root), top_bar, FALSE, FALSE, 0);
 
@@ -785,8 +823,8 @@ static void build_ui(void) {
     gtk_box_pack_start(GTK_BOX(bottom_bar), w_send_btn, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(root), bottom_bar, FALSE, FALSE, 0);
 
-    ui_set_connected_state(0, "", 0);
     gtk_widget_show_all(w_window);
+    ui_set_connected_state(0, "", 0);
 }
 
 int main(int argc, char *argv[]) {
