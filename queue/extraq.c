@@ -32,6 +32,7 @@
 #define CLR_CYAN    "\033[36m"
 
 struct client_entry {
+    int used;
     int active;
     long id;
     long reply_type;
@@ -103,6 +104,7 @@ static void print_client_banner(void) {
     printf("╠══════════════════════════════════════════════╣\n");
     printf("║  " CLR_GREEN "#<name>" CLR_RESET "        — register                   " CLR_CYAN "║\n");
     printf("║  " CLR_GREEN "<name>#<text>" CLR_RESET "  — send message               " CLR_CYAN "║\n");
+    printf("║  " CLR_CYAN "? / /who" CLR_RESET "       — online users               " CLR_CYAN "║\n");
     printf("║  " CLR_YELLOW "##" CLR_RESET "             — logout                     " CLR_CYAN "║\n");
     printf("║  " CLR_DIM "Ctrl+D" CLR_RESET "         — exit                       " CLR_CYAN "║\n");
     printf("╚══════════════════════════════════════════════╝\n" CLR_RESET);
@@ -341,35 +343,65 @@ static int run_arbiter(int msqid) {
         }
 
         if (msg.cmd == CMD_REGISTER) {
-            int exists = 0;
+            int match_idx = -1;
             int free_idx = -1;
+            int oldest_offline = -1;
+
             for (int i = 0; i < MAX_CLIENTS; i++) {
-                if (clients[i].active) {
-                    if (strcmp(clients[i].name, msg.name) == 0) {
-                        exists = 1;
-                    }
-                } else if (free_idx < 0) {
+                if (clients[i].used && strcmp(clients[i].name, msg.name) == 0) {
+                    match_idx = i;
+                    break;
+                }
+                if (!clients[i].used && free_idx < 0) {
                     free_idx = i;
+                } else if (clients[i].used && !clients[i].active) {
+                    if (oldest_offline < 0 || clients[i].last_seen < clients[oldest_offline].last_seen) {
+                        oldest_offline = i;
+                    }
                 }
             }
 
-            if (exists || free_idx < 0 || msg.name[0] == '\0') {
-                send_reply(msqid, msg.reply_type, -1, exists ? "name already taken" : "server full");
-            } else {
-                clients[free_idx].active = 1;
-                clients[free_idx].id = next_id++;
-                clients[free_idx].reply_type = msg.reply_type;
-                snprintf(clients[free_idx].name, sizeof(clients[free_idx].name), "%.*s", MAX_NAME - 1, msg.name);
-                clients[free_idx].last_seen = time(NULL);
-                send_reply(msqid, msg.reply_type, clients[free_idx].id, "ok");
+            if (msg.name[0] == '\0') {
+                send_reply(msqid, msg.reply_type, -1, "invalid name");
+            } else if (match_idx >= 0) {
+                if (clients[match_idx].active) {
+                    send_reply(msqid, msg.reply_type, -1, "name already taken");
+                } else {
+                    clients[match_idx].active = 1;
+                    clients[match_idx].reply_type = msg.reply_type;
+                    clients[match_idx].last_seen = time(NULL);
+                    send_reply(msqid, msg.reply_type, clients[match_idx].id, "ok");
 
-                char ts[16];
-                get_timestamp(ts, sizeof(ts));
-                printf(CLR_DIM "[%s] " CLR_RESET CLR_GREEN "+ registered: %s (id=%ld)\n" CLR_RESET,
-                       ts, clients[free_idx].name, clients[free_idx].id);
-                fflush(stdout);
-                if (deliver_pending(msqid, pending, clients[free_idx].name, clients[free_idx].id) > 0) {
-                    save_backlog(pending);
+                    char ts[16];
+                    get_timestamp(ts, sizeof(ts));
+                    printf(CLR_DIM "[%s] " CLR_RESET CLR_GREEN "+ reconnected: %s (id=%ld)\n" CLR_RESET,
+                           ts, clients[match_idx].name, clients[match_idx].id);
+                    fflush(stdout);
+                    if (deliver_pending(msqid, pending, clients[match_idx].name, clients[match_idx].id) > 0) {
+                        save_backlog(pending);
+                    }
+                }
+            } else {
+                int idx = (free_idx >= 0) ? free_idx : oldest_offline;
+                if (idx < 0) {
+                    send_reply(msqid, msg.reply_type, -1, "server full");
+                } else {
+                    clients[idx].used = 1;
+                    clients[idx].active = 1;
+                    clients[idx].id = next_id++;
+                    clients[idx].reply_type = msg.reply_type;
+                    snprintf(clients[idx].name, sizeof(clients[idx].name), "%.*s", MAX_NAME - 1, msg.name);
+                    clients[idx].last_seen = time(NULL);
+                    send_reply(msqid, msg.reply_type, clients[idx].id, "ok");
+
+                    char ts[16];
+                    get_timestamp(ts, sizeof(ts));
+                    printf(CLR_DIM "[%s] " CLR_RESET CLR_GREEN "+ registered: %s (id=%ld)\n" CLR_RESET,
+                           ts, clients[idx].name, clients[idx].id);
+                    fflush(stdout);
+                    if (deliver_pending(msqid, pending, clients[idx].name, clients[idx].id) > 0) {
+                        save_backlog(pending);
+                    }
                 }
             }
         } else if (msg.cmd == CMD_HEARTBEAT) {
@@ -392,6 +424,26 @@ static int run_arbiter(int msqid) {
                 }
             }
             send_reply(msqid, msg.reply_type, found_id, found_id > 0 ? "ok" : "offline");
+        } else if (msg.cmd == CMD_WHO) {
+            char list[MAX_TEXT];
+            size_t pos = 0;
+            long count = 0;
+            list[0] = '\0';
+
+            for (int i = 0; i < MAX_CLIENTS; i++) {
+                if (clients[i].active) {
+                    if (clients[i].id == msg.sender_id) {
+                        clients[i].last_seen = time(NULL);
+                    }
+                    int written = snprintf(list + pos, sizeof(list) - pos, "%s%s",
+                                           count > 0 ? ", " : "", clients[i].name);
+                    if (written > 0 && pos + (size_t)written < sizeof(list)) {
+                        pos += (size_t)written;
+                    }
+                    count++;
+                }
+            }
+            send_reply(msqid, msg.reply_type, count, list);
         } else if (msg.cmd == CMD_STORE) {
             for (int i = 0; i < MAX_CLIENTS; i++) {
                 if (clients[i].active && clients[i].id == msg.sender_id) {
@@ -592,7 +644,7 @@ static void send_logout(void) {
 
 static int run_client(int msqid) {
     g_msqid = msqid;
-    g_reply_type = REPLY_BASE + (long)getpid();
+    g_reply_type = REPLY_BASE + (long)getpid() * 2L;
     int interactive = isatty(STDIN_FILENO);
 
     pthread_t t_recv;
@@ -615,6 +667,38 @@ static int run_client(int msqid) {
     while (running && fgets(line, sizeof(line), stdin) != NULL) {
         line[strcspn(line, "\n")] = '\0';
         if (line[0] == '\0') {
+            print_prompt();
+            continue;
+        }
+
+        if (strcmp(line, "?") == 0 || strcasecmp(line, "/who") == 0) {
+            pthread_mutex_lock(&g_mtx);
+            long cur_id = g_my_id;
+            pthread_mutex_unlock(&g_mtx);
+
+            struct qmsg req;
+            memset(&req, 0, sizeof(req));
+            req.mtype = ARBITER_TYPE;
+            req.cmd = CMD_WHO;
+            req.sender_id = cur_id;
+            req.reply_type = g_reply_type;
+
+            if (msgsnd(msqid, &req, MSG_SIZE, 0) < 0) {
+                perror("msgsnd");
+                break;
+            }
+
+            struct qmsg rep;
+            if (msgrcv(msqid, &rep, MSG_SIZE, g_reply_type, 0) < 0) {
+                perror("msgrcv");
+                break;
+            }
+
+            rep.text[MAX_TEXT - 1] = '\0';
+            pthread_mutex_lock(&g_io_mtx);
+            printf(CLR_CYAN "* Online (%ld): %s\n" CLR_RESET,
+                   rep.target_id, rep.text[0] != '\0' ? rep.text : "none");
+            pthread_mutex_unlock(&g_io_mtx);
             print_prompt();
             continue;
         }
@@ -651,7 +735,7 @@ static int run_client(int msqid) {
                 print_prompt();
                 continue;
             }
-            if (name[0] == '\0' || strchr(name, '#') != NULL || strlen(name) >= MAX_NAME) {
+            if (name[0] == '\0' || strchr(name, '#') != NULL || strchr(name, ',') != NULL || strlen(name) >= MAX_NAME) {
                 pthread_mutex_lock(&g_io_mtx);
                 printf(CLR_RED "! Invalid name\n" CLR_RESET);
                 pthread_mutex_unlock(&g_io_mtx);
@@ -790,7 +874,7 @@ static int run_client(int msqid) {
         }
 
         pthread_mutex_lock(&g_io_mtx);
-        printf(CLR_YELLOW "! Format: #<name> | <name>#<message> | ##\n" CLR_RESET);
+        printf(CLR_YELLOW "! Format: #<name> | <name>#<message> | ? | ##\n" CLR_RESET);
         pthread_mutex_unlock(&g_io_mtx);
         print_prompt();
     }
