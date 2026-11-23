@@ -14,15 +14,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define MAX_NAME 32
-#define MAX_TEXT 255
-#define MAX_CLIENTS 64
-#define MAX_PENDING 128
-#define ARBITER_TYPE 1L
-#define REPLY_BASE 100000L
-#define HEARTBEAT_TIMEOUT 10
-#define HEARTBEAT_INTERVAL 4
-#define OFFLINE_TTL 60
+#include "protocol.h"
 
 #define BACKLOG_FILE "chat_backlog.dat"
 #define BACKLOG_TMP  "chat_backlog.dat.tmp"
@@ -38,31 +30,6 @@
 #define CLR_BLUE    "\033[34m"
 #define CLR_MAGENTA "\033[35m"
 #define CLR_CYAN    "\033[36m"
-
-enum msg_cmd {
-    CMD_REGISTER = 1,
-    CMD_HEARTBEAT = 2,
-    CMD_LOOKUP = 3,
-    CMD_LOGOUT = 4,
-    CMD_CHAT = 5,
-    CMD_REPLY = 6,
-    CMD_STORE = 7,
-    CMD_ACK = 8
-};
-
-struct qmsg {
-    long mtype;
-    int cmd;
-    long sender_id;
-    long reply_type;
-    long target_id;
-    long msg_id;
-    char name[MAX_NAME];
-    char sender_name[MAX_NAME];
-    char text[MAX_TEXT];
-};
-
-#define MSG_SIZE (sizeof(struct qmsg) - sizeof(long))
 
 struct client_entry {
     int active;
@@ -848,7 +815,7 @@ int main(int argc, char *argv[]) {
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 
-    key_t key = ftok(".", 'Q');
+    key_t key = ftok(QUEUE_KEY_PATH, QUEUE_KEY_PROJ);
     if (key == (key_t)-1) {
         perror("ftok");
         return 1;
