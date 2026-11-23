@@ -18,7 +18,8 @@
 enum ui_event_kind {
     EV_CHAT = 1,
     EV_ACK = 2,
-    EV_LOST = 3
+    EV_LOST = 3,
+    EV_WHO = 4
 };
 
 struct ui_event {
@@ -29,9 +30,11 @@ struct ui_event {
 };
 
 static volatile sig_atomic_t g_running = 1;
+static volatile sig_atomic_t g_who_force = 0;
 static int g_msqid = -1;
 static long g_my_id = 0;
 static long g_reply_type = 0;
+static long g_who_reply_type = 0;
 static long g_next_msg_id = 1;
 static char g_my_name[MAX_NAME];
 static pthread_mutex_t g_mtx = PTHREAD_MUTEX_INITIALIZER;
@@ -42,6 +45,8 @@ static GtkWidget *w_conn_btn = NULL;
 static GtkWidget *w_status_lbl = NULL;
 static GtkWidget *w_chat_view = NULL;
 static GtkTextBuffer *w_chat_buf = NULL;
+static GtkWidget *w_users_lbl = NULL;
+static GtkWidget *w_users_list = NULL;
 static GtkWidget *w_target_entry = NULL;
 static GtkWidget *w_msg_entry = NULL;
 static GtkWidget *w_send_btn = NULL;
@@ -53,8 +58,14 @@ static void get_timestamp(char *buf, size_t size) {
     strftime(buf, size, "%H:%M:%S", &tm_now);
 }
 
-static int wait_reply(int msqid, long reply_type, struct qmsg *rep) {
-    for (int i = 0; i < 200; i++) {
+static void drain_type(int msqid, long mtype) {
+    struct qmsg tmp;
+    while (msgrcv(msqid, &tmp, MSG_SIZE, mtype, IPC_NOWAIT) >= 0) {
+    }
+}
+
+static int wait_reply(int msqid, long reply_type, struct qmsg *rep, int max_tries) {
+    for (int i = 0; i < max_tries; i++) {
         ssize_t n = msgrcv(msqid, rep, MSG_SIZE, reply_type, IPC_NOWAIT);
         if (n >= 0) {
             return 0;
@@ -89,6 +100,92 @@ static void send_logout(void) {
     }
 }
 
+static void destroy_row_cb(GtkWidget *widget, gpointer data) {
+    (void)data;
+    gtk_widget_destroy(widget);
+}
+
+static void ui_update_users_list(long count, const char *list_text) {
+    if (w_users_list == NULL || w_users_lbl == NULL) {
+        return;
+    }
+
+    char header[64];
+    snprintf(header, sizeof(header), "Online (%ld)", count);
+    gtk_label_set_text(GTK_LABEL(w_users_lbl), header);
+
+    gtk_container_foreach(GTK_CONTAINER(w_users_list), destroy_row_cb, NULL);
+
+    if (list_text == NULL || list_text[0] == '\0') {
+        return;
+    }
+
+    char cur_name[MAX_NAME];
+    pthread_mutex_lock(&g_mtx);
+    snprintf(cur_name, sizeof(cur_name), "%.*s", MAX_NAME - 1, g_my_name);
+    pthread_mutex_unlock(&g_mtx);
+
+    char copy[MAX_TEXT];
+    snprintf(copy, sizeof(copy), "%.*s", MAX_TEXT - 1, list_text);
+
+    char *saveptr = NULL;
+    char *tok = strtok_r(copy, ",", &saveptr);
+    while (tok != NULL) {
+        while (*tok == ' ') {
+            tok++;
+        }
+        if (*tok != '\0') {
+            GtkWidget *row = gtk_list_box_row_new();
+            char label_text[MAX_NAME + 16];
+            if (cur_name[0] != '\0' && strcmp(tok, cur_name) == 0) {
+                snprintf(label_text, sizeof(label_text), "● %s (you)", tok);
+            } else {
+                snprintf(label_text, sizeof(label_text), "● %s", tok);
+            }
+
+            GtkWidget *lbl = gtk_label_new(label_text);
+            gtk_widget_set_halign(lbl, GTK_ALIGN_START);
+            gtk_widget_set_margin_top(lbl, 4);
+            gtk_widget_set_margin_bottom(lbl, 4);
+            gtk_widget_set_margin_start(lbl, 8);
+            gtk_widget_set_margin_end(lbl, 8);
+
+            gtk_container_add(GTK_CONTAINER(row), lbl);
+            g_object_set_data_full(G_OBJECT(row), "username", g_strdup(tok), g_free);
+            gtk_list_box_insert(GTK_LIST_BOX(w_users_list), row, -1);
+        }
+        tok = strtok_r(NULL, ",", &saveptr);
+    }
+
+    gtk_widget_show_all(w_users_list);
+}
+
+static void on_user_row_selected(GtkListBox *box, GtkListBoxRow *row, gpointer data) {
+    (void)box;
+    (void)data;
+    if (row == NULL || w_target_entry == NULL) {
+        return;
+    }
+
+    const char *uname = g_object_get_data(G_OBJECT(row), "username");
+    if (uname == NULL || uname[0] == '\0') {
+        return;
+    }
+
+    char cur_name[MAX_NAME];
+    pthread_mutex_lock(&g_mtx);
+    snprintf(cur_name, sizeof(cur_name), "%.*s", MAX_NAME - 1, g_my_name);
+    pthread_mutex_unlock(&g_mtx);
+
+    if (strcmp(uname, cur_name) == 0) {
+        gtk_list_box_unselect_row(box, row);
+        return;
+    }
+
+    gtk_entry_set_text(GTK_ENTRY(w_target_entry), uname);
+    gtk_widget_grab_focus(w_msg_entry);
+}
+
 static void ui_append_line(const char *tag_name, const char *prefix, const char *body) {
     if (w_chat_buf == NULL || w_chat_view == NULL) {
         return;
@@ -120,11 +217,85 @@ static void ui_append_line(const char *tag_name, const char *prefix, const char 
     gtk_text_view_scroll_to_mark(GTK_TEXT_VIEW(w_chat_view), mark, 0.0, TRUE, 0.0, 1.0);
 }
 
+static void ui_append_outgoing(long msg_id, const char *target, const char *body, int offline) {
+    if (w_chat_buf == NULL || w_chat_view == NULL) {
+        return;
+    }
+
+    char ts[16];
+    get_timestamp(ts, sizeof(ts));
+
+    GtkTextIter end;
+    gtk_text_buffer_get_end_iter(w_chat_buf, &end);
+
+    char ts_str[24];
+    snprintf(ts_str, sizeof(ts_str), "[%s] ", ts);
+    gtk_text_buffer_insert_with_tags_by_name(w_chat_buf, &end, ts_str, -1, "time", NULL);
+
+    char prefix[MAX_NAME + 16];
+    snprintf(prefix, sizeof(prefix), "you -> %s: ", target);
+    gtk_text_buffer_insert_with_tags_by_name(w_chat_buf, &end, prefix, -1, "outgoing", NULL);
+
+    if (body != NULL && body[0] != '\0') {
+        gtk_text_buffer_insert(w_chat_buf, &end, body, -1);
+    }
+
+    char m_start[32];
+    char m_end[32];
+    snprintf(m_start, sizeof(m_start), "ms_%ld", msg_id);
+    snprintf(m_end, sizeof(m_end), "me_%ld", msg_id);
+
+    gtk_text_buffer_get_end_iter(w_chat_buf, &end);
+    gtk_text_buffer_create_mark(w_chat_buf, m_start, &end, TRUE);
+
+    if (offline) {
+        gtk_text_buffer_insert_with_tags_by_name(w_chat_buf, &end, " ⏱", -1, "warn", NULL);
+    } else {
+        gtk_text_buffer_insert_with_tags_by_name(w_chat_buf, &end, " ✓", -1, "time", NULL);
+    }
+
+    gtk_text_buffer_get_end_iter(w_chat_buf, &end);
+    gtk_text_buffer_create_mark(w_chat_buf, m_end, &end, FALSE);
+    gtk_text_buffer_insert(w_chat_buf, &end, "\n", -1);
+
+    GtkTextMark *mark = gtk_text_buffer_get_insert(w_chat_buf);
+    gtk_text_buffer_get_end_iter(w_chat_buf, &end);
+    gtk_text_buffer_move_mark(w_chat_buf, mark, &end);
+    gtk_text_view_scroll_to_mark(GTK_TEXT_VIEW(w_chat_view), mark, 0.0, TRUE, 0.0, 1.0);
+}
+
+static void ui_mark_delivered(long msg_id) {
+    if (w_chat_buf == NULL) {
+        return;
+    }
+
+    char m_start[32];
+    char m_end[32];
+    snprintf(m_start, sizeof(m_start), "ms_%ld", msg_id);
+    snprintf(m_end, sizeof(m_end), "me_%ld", msg_id);
+
+    GtkTextMark *ms = gtk_text_buffer_get_mark(w_chat_buf, m_start);
+    GtkTextMark *me = gtk_text_buffer_get_mark(w_chat_buf, m_end);
+    if (ms == NULL || me == NULL) {
+        return;
+    }
+
+    GtkTextIter s;
+    GtkTextIter e;
+    gtk_text_buffer_get_iter_at_mark(w_chat_buf, &s, ms);
+    gtk_text_buffer_get_iter_at_mark(w_chat_buf, &e, me);
+    gtk_text_buffer_delete(w_chat_buf, &s, &e);
+    gtk_text_buffer_insert_with_tags_by_name(w_chat_buf, &s, " ✓✓", -1, "ack", NULL);
+    gtk_text_buffer_delete_mark(w_chat_buf, ms);
+    gtk_text_buffer_delete_mark(w_chat_buf, me);
+}
+
 static void ui_set_connected_state(int connected, const char *name, long id) {
     gtk_widget_set_sensitive(w_nick_entry, !connected);
     gtk_widget_set_sensitive(w_target_entry, connected);
     gtk_widget_set_sensitive(w_msg_entry, connected);
     gtk_widget_set_sensitive(w_send_btn, connected);
+    gtk_widget_set_sensitive(w_users_list, connected);
 
     if (connected) {
         char status[128];
@@ -139,6 +310,7 @@ static void ui_set_connected_state(int connected, const char *name, long id) {
         gtk_label_set_text(GTK_LABEL(w_status_lbl), "Disconnected");
         gtk_button_set_label(GTK_BUTTON(w_conn_btn), "Login");
         gtk_window_set_title(GTK_WINDOW(w_window), "Queue Messenger");
+        ui_update_users_list(0, "");
         gtk_widget_grab_focus(w_nick_entry);
     }
 }
@@ -156,9 +328,9 @@ static gboolean ui_handle_event(gpointer user_data) {
         snprintf(prefix, sizeof(prefix), "%s: ", ev->sender);
         ui_append_line("incoming", prefix, ev->text);
     } else if (ev->kind == EV_ACK) {
-        char line[MAX_NAME + 64];
-        snprintf(line, sizeof(line), "✓ delivered to %s (#%ld)", ev->sender, ev->msg_id);
-        ui_append_line("ack", line, NULL);
+        ui_mark_delivered(ev->msg_id);
+    } else if (ev->kind == EV_WHO) {
+        ui_update_users_list(ev->msg_id, ev->text);
     } else if (ev->kind == EV_LOST) {
         pthread_mutex_lock(&g_mtx);
         g_my_id = 0;
@@ -250,21 +422,29 @@ static void *recv_worker(void *arg) {
 static void *heartbeat_worker(void *arg) {
     (void)arg;
     struct qmsg hb;
-    int ticks = 0;
+    int hb_ticks = 0;
+    int who_ticks = 0;
+    long last_count = -1;
+    char last_list[MAX_TEXT];
+    last_list[0] = '\0';
 
     while (g_running) {
         usleep(100000);
-        ticks++;
-        if (ticks < HEARTBEAT_INTERVAL * 10) {
-            continue;
-        }
-        ticks = 0;
+        hb_ticks++;
+        who_ticks++;
 
         pthread_mutex_lock(&g_mtx);
         long my_id = g_my_id;
         pthread_mutex_unlock(&g_mtx);
 
-        if (my_id > 0) {
+        if (my_id <= 0) {
+            last_count = -1;
+            last_list[0] = '\0';
+            continue;
+        }
+
+        if (hb_ticks >= HEARTBEAT_INTERVAL * 10) {
+            hb_ticks = 0;
             memset(&hb, 0, sizeof(hb));
             hb.mtype = ARBITER_TYPE;
             hb.cmd = CMD_HEARTBEAT;
@@ -274,8 +454,43 @@ static void *heartbeat_worker(void *arg) {
                 break;
             }
         }
+
+        if (g_who_force || who_ticks >= 20) {
+            int forced = g_who_force;
+            g_who_force = 0;
+            who_ticks = 0;
+
+            drain_type(g_msqid, g_who_reply_type);
+
+            struct qmsg req;
+            memset(&req, 0, sizeof(req));
+            req.mtype = ARBITER_TYPE;
+            req.cmd = CMD_WHO;
+            req.sender_id = my_id;
+            req.reply_type = g_who_reply_type;
+
+            if (msgsnd(g_msqid, &req, MSG_SIZE, IPC_NOWAIT) == 0) {
+                struct qmsg rep;
+                if (wait_reply(g_msqid, g_who_reply_type, &rep, 50) == 0) {
+                    rep.text[MAX_TEXT - 1] = '\0';
+                    if (forced || rep.target_id != last_count || strcmp(rep.text, last_list) != 0) {
+                        last_count = rep.target_id;
+                        snprintf(last_list, sizeof(last_list), "%.*s", MAX_TEXT - 1, rep.text);
+
+                        struct ui_event *ev = calloc(1, sizeof(*ev));
+                        if (ev != NULL) {
+                            ev->kind = EV_WHO;
+                            ev->msg_id = rep.target_id;
+                            snprintf(ev->text, sizeof(ev->text), "%.*s", MAX_TEXT - 1, rep.text);
+                            g_idle_add(ui_handle_event, ev);
+                        }
+                    }
+                }
+            }
+        }
     }
 
+    drain_type(g_msqid, g_who_reply_type);
     return NULL;
 }
 
@@ -295,8 +510,8 @@ static void on_connect_clicked(GtkWidget *widget, gpointer data) {
     }
 
     const char *name = gtk_entry_get_text(GTK_ENTRY(w_nick_entry));
-    if (name == NULL || name[0] == '\0' || strchr(name, '#') != NULL || strlen(name) >= MAX_NAME) {
-        ui_append_line("err", "Invalid name (1..31 chars, no '#').", NULL);
+    if (name == NULL || name[0] == '\0' || strchr(name, '#') != NULL || strchr(name, ',') != NULL || strlen(name) >= MAX_NAME) {
+        ui_append_line("err", "Invalid name (1..31 chars, no '#' or ',').", NULL);
         return;
     }
 
@@ -313,7 +528,7 @@ static void on_connect_clicked(GtkWidget *widget, gpointer data) {
     }
 
     struct qmsg rep;
-    if (wait_reply(g_msqid, g_reply_type, &rep) < 0) {
+    if (wait_reply(g_msqid, g_reply_type, &rep, 200) < 0) {
         ui_append_line("err", "No response from arbiter.", NULL);
         return;
     }
@@ -326,6 +541,8 @@ static void on_connect_clicked(GtkWidget *widget, gpointer data) {
         pthread_mutex_unlock(&g_mtx);
 
         ui_set_connected_state(1, name, rep.target_id);
+        g_who_force = 1;
+
         char info[128];
         snprintf(info, sizeof(info), "Registered as %s (id=%ld).", name, rep.target_id);
         ui_append_line("sys", info, NULL);
@@ -363,6 +580,10 @@ static void on_send_clicked(GtkWidget *widget, gpointer data) {
     if (text == NULL || text[0] == '\0') {
         return;
     }
+    if (strcmp(target, cur_name) == 0) {
+        ui_append_line("err", "Cannot send message to yourself.", NULL);
+        return;
+    }
 
     struct qmsg req;
     memset(&req, 0, sizeof(req));
@@ -378,7 +599,7 @@ static void on_send_clicked(GtkWidget *widget, gpointer data) {
     }
 
     struct qmsg rep;
-    if (wait_reply(g_msqid, g_reply_type, &rep) < 0) {
+    if (wait_reply(g_msqid, g_reply_type, &rep, 200) < 0) {
         ui_append_line("err", "No response from arbiter.", NULL);
         return;
     }
@@ -400,9 +621,7 @@ static void on_send_clicked(GtkWidget *widget, gpointer data) {
             return;
         }
 
-        char prefix[MAX_NAME + 48];
-        snprintf(prefix, sizeof(prefix), "you -> %s (#%ld): ", target, msg_id);
-        ui_append_line("outgoing", prefix, text);
+        ui_append_outgoing(msg_id, target, text, 0);
     } else {
         struct qmsg st;
         memset(&st, 0, sizeof(st));
@@ -419,9 +638,7 @@ static void on_send_clicked(GtkWidget *widget, gpointer data) {
             return;
         }
 
-        char prefix[MAX_NAME + 80];
-        snprintf(prefix, sizeof(prefix), "you -> %s (#%ld, offline, queued %ds): ", target, msg_id, OFFLINE_TTL);
-        ui_append_line("warn", prefix, text);
+        ui_append_outgoing(msg_id, target, text, 1);
     }
 
     gtk_entry_set_text(GTK_ENTRY(w_msg_entry), "");
@@ -433,6 +650,8 @@ static void on_window_destroy(GtkWidget *widget, gpointer data) {
     (void)data;
     w_chat_buf = NULL;
     w_chat_view = NULL;
+    w_users_list = NULL;
+    w_users_lbl = NULL;
     send_logout();
     g_running = 0;
     gtk_main_quit();
@@ -448,7 +667,11 @@ static void apply_styles(void) {
         "button:hover { background-color: #b4befe; }"
         "button:disabled { background-color: #45475a; color: #7f849c; }"
         "textview text { background-color: #181825; color: #cdd6f4; font-family: monospace; font-size: 11pt; }"
-        "scrolledwindow { border: 1px solid #45475a; border-radius: 6px; }";
+        "scrolledwindow { border: 1px solid #45475a; border-radius: 6px; }"
+        "list { background-color: #181825; color: #a6e3a1; }"
+        "list row { padding: 2px 4px; }"
+        "list row:hover { background-color: #313244; }"
+        "list row:selected { background-color: #45475a; color: #ffffff; }";
 
     GtkCssProvider *provider = gtk_css_provider_new();
     gtk_css_provider_load_from_data(provider, css_data, -1, NULL);
@@ -465,7 +688,7 @@ static void build_ui(void) {
 
     w_window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_title(GTK_WINDOW(w_window), "Queue Messenger");
-    gtk_window_set_default_size(GTK_WINDOW(w_window), 620, 480);
+    gtk_window_set_default_size(GTK_WINDOW(w_window), 760, 480);
     g_signal_connect(w_window, "destroy", G_CALLBACK(on_window_destroy), NULL);
 
     GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
@@ -492,6 +715,8 @@ static void build_ui(void) {
     gtk_box_pack_end(GTK_BOX(top_bar), w_status_lbl, TRUE, TRUE, 0);
     gtk_box_pack_start(GTK_BOX(root), top_bar, FALSE, FALSE, 0);
 
+    GtkWidget *mid_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+
     GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
 
@@ -514,7 +739,27 @@ static void build_ui(void) {
     gtk_text_buffer_create_tag(w_chat_buf, "sys", "foreground", "#94e2d5", NULL);
 
     gtk_container_add(GTK_CONTAINER(scroll), w_chat_view);
-    gtk_box_pack_start(GTK_BOX(root), scroll, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(mid_box), scroll, TRUE, TRUE, 0);
+
+    GtkWidget *sidebar = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_widget_set_size_request(sidebar, 175, -1);
+
+    w_users_lbl = gtk_label_new("Online (0)");
+    gtk_widget_set_halign(w_users_lbl, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(sidebar), w_users_lbl, FALSE, FALSE, 0);
+
+    GtkWidget *users_scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(users_scroll), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+
+    w_users_list = gtk_list_box_new();
+    gtk_list_box_set_selection_mode(GTK_LIST_BOX(w_users_list), GTK_SELECTION_SINGLE);
+    g_signal_connect(w_users_list, "row-selected", G_CALLBACK(on_user_row_selected), NULL);
+
+    gtk_container_add(GTK_CONTAINER(users_scroll), w_users_list);
+    gtk_box_pack_start(GTK_BOX(sidebar), users_scroll, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(mid_box), sidebar, FALSE, FALSE, 0);
+
+    gtk_box_pack_start(GTK_BOX(root), mid_box, TRUE, TRUE, 0);
 
     GtkWidget *bottom_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     w_target_entry = gtk_entry_new();
@@ -562,7 +807,8 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    g_reply_type = REPLY_BASE + (long)getpid();
+    g_reply_type = REPLY_BASE + (long)getpid() * 2L;
+    g_who_reply_type = g_reply_type + 1L;
 
     build_ui();
 

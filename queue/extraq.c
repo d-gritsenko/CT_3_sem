@@ -800,6 +800,14 @@ static int run_client(int msqid) {
             const char *target_name = line;
             const char *text = sep + 1;
 
+            if (strcmp(target_name, cur_name) == 0) {
+                pthread_mutex_lock(&g_io_mtx);
+                printf(CLR_RED "! Cannot send message to yourself\n" CLR_RESET);
+                pthread_mutex_unlock(&g_io_mtx);
+                print_prompt();
+                continue;
+            }
+
             struct qmsg req;
             memset(&req, 0, sizeof(req));
             req.mtype = ARBITER_TYPE;
