@@ -1,15 +1,23 @@
 CC := gcc
 CFLAGS := -Wall -Wextra -pthread
+GTK_CFLAGS := $(shell pkg-config --cflags gtk+-3.0)
+GTK_LIBS := $(shell pkg-config --libs gtk+-3.0)
 
-SRCS := $(wildcard *.c)
-TARGETS := $(SRCS:.c=)
+CONSOLE_SRCS := $(filter-out gui_client.c,$(wildcard *.c))
+CONSOLE_TARGETS := $(CONSOLE_SRCS:.c=)
+GUI_TARGET := gui_client
 
-.PHONY: all clean
+.PHONY: all gui clean
 
-all: $(TARGETS)
+all: $(CONSOLE_TARGETS) $(GUI_TARGET)
 
-%: %.c
+$(CONSOLE_TARGETS): %: %.c protocol.h
 	$(CC) $(CFLAGS) $< -o $@
 
+$(GUI_TARGET): gui_client.c protocol.h
+	$(CC) $(CFLAGS) $(GTK_CFLAGS) $< -o $@ $(GTK_LIBS)
+
+gui: $(GUI_TARGET)
+
 clean:
-	rm -f $(TARGETS)
+	rm -f $(CONSOLE_TARGETS) $(GUI_TARGET)

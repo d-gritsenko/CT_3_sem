@@ -1,5 +1,6 @@
 2_Q
 extraq
+gui_client
 *.o
 *.out
 core
