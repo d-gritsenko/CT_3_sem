@@ -11,6 +11,7 @@
 #define MAX_NAME 32
 #define MAX_TEXT 255
 #define MAX_CLIENTS 64
+#define MAX_ROOMS 16
 #define MAX_PENDING 128
 #define ARBITER_TYPE 1L
 #define REPLY_BASE 100000L
@@ -28,7 +29,11 @@ enum msg_cmd {
     CMD_STORE = 7,
     CMD_ACK = 8,
     CMD_WHO = 9,
-    CMD_RECONNECT = 10
+    CMD_RECONNECT = 10,
+    CMD_ROOM_JOIN = 11,
+    CMD_ROOM_LEAVE = 12,
+    CMD_ROOM_MSG = 13,
+    CMD_ROOM_LIST = 14
 };
 
 struct qmsg {
