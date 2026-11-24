@@ -678,8 +678,8 @@ static void *recv_worker(void *arg) {
                 if (ev != NULL) {
                     ev->kind = EV_CHAT;
                     ev->msg_id = msg.msg_id;
-                    snprintf(ev->sender, sizeof(ev->sender), "%.*s", MAX_NAME - 1, msg.sender_name);
-                    snprintf(ev->text, sizeof(ev->text), "%.*s", MAX_TEXT - 1, msg.text);
+                    copy_utf8_safe(ev->sender, sizeof(ev->sender), msg.sender_name);
+                    copy_utf8_safe(ev->text, sizeof(ev->text), msg.text);
                     g_idle_add(ui_handle_event, ev);
                 }
             } else if (msg.cmd == CMD_ACK) {
@@ -810,8 +810,10 @@ static void do_auth(int is_reconnect) {
     req.reply_type = g_reply_type;
     snprintf(req.name, sizeof(req.name), "%.*s", MAX_NAME - 1, name);
 
-    if (msgsnd(g_msqid, &req, MSG_SIZE, 0) < 0) {
-        ui_append_sys("err", "Failed to send request to arbiter.");
+    if (msgsnd(g_msqid, &req, MSG_SIZE, IPC_NOWAIT) < 0) {
+        ui_append_sys("err", errno == EAGAIN
+            ? "Message queue is full, try again."
+            : "Failed to send request to arbiter.");
         return;
     }
 
@@ -920,8 +922,10 @@ static void on_send_clicked(GtkWidget *widget, gpointer data) {
     req.reply_type = g_reply_type;
     snprintf(req.name, sizeof(req.name), "%.*s", MAX_NAME - 1, target);
 
-    if (msgsnd(g_msqid, &req, MSG_SIZE, 0) < 0) {
-        ui_append_error("Failed to send request to arbiter.");
+    if (msgsnd(g_msqid, &req, MSG_SIZE, IPC_NOWAIT) < 0) {
+        ui_append_error(errno == EAGAIN
+            ? "Message queue is full, try again."
+            : "Failed to send request to arbiter.");
         return;
     }
 
@@ -954,10 +958,12 @@ static void on_send_clicked(GtkWidget *widget, gpointer data) {
         chat.sender_id = cur_id;
         chat.msg_id = msg_id;
         snprintf(chat.sender_name, sizeof(chat.sender_name), "%.*s", MAX_NAME - 1, cur_name);
-        snprintf(chat.text, sizeof(chat.text), "%.*s", MAX_TEXT - 1, text);
+        copy_utf8_safe(chat.text, sizeof(chat.text), text);
 
-        if (msgsnd(g_msqid, &chat, MSG_SIZE, 0) < 0) {
-            ui_append_error("Failed to send message.");
+        if (msgsnd(g_msqid, &chat, MSG_SIZE, IPC_NOWAIT) < 0) {
+            ui_append_error(errno == EAGAIN
+                ? "Message queue is full, try again."
+                : "Failed to send message.");
             return;
         }
 
@@ -971,10 +977,12 @@ static void on_send_clicked(GtkWidget *widget, gpointer data) {
         st.msg_id = msg_id;
         snprintf(st.name, sizeof(st.name), "%.*s", MAX_NAME - 1, target);
         snprintf(st.sender_name, sizeof(st.sender_name), "%.*s", MAX_NAME - 1, cur_name);
-        snprintf(st.text, sizeof(st.text), "%.*s", MAX_TEXT - 1, text);
+        copy_utf8_safe(st.text, sizeof(st.text), text);
 
-        if (msgsnd(g_msqid, &st, MSG_SIZE, 0) < 0) {
-            ui_append_error("Failed to store offline message.");
+        if (msgsnd(g_msqid, &st, MSG_SIZE, IPC_NOWAIT) < 0) {
+            ui_append_error(errno == EAGAIN
+                ? "Message queue is full, try again."
+                : "Failed to store offline message.");
             return;
         }
 

@@ -10,6 +10,8 @@
 #include <strings.h>
 #include <sys/ipc.h>
 #include <sys/msg.h>
+#include <fcntl.h>
+#include <sys/file.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
@@ -867,7 +869,7 @@ static int run_client(int msqid) {
                 chat.sender_id = cur_id;
                 chat.msg_id = msg_id;
                 snprintf(chat.sender_name, sizeof(chat.sender_name), "%.*s", MAX_NAME - 1, cur_name);
-                snprintf(chat.text, sizeof(chat.text), "%.*s", MAX_TEXT - 1, text);
+                copy_utf8_safe(chat.text, sizeof(chat.text), text);
 
                 if (msgsnd(msqid, &chat, MSG_SIZE, 0) < 0) {
                     perror("msgsnd");
@@ -890,7 +892,7 @@ static int run_client(int msqid) {
                 st.msg_id = msg_id;
                 snprintf(st.name, sizeof(st.name), "%.*s", MAX_NAME - 1, target_name);
                 snprintf(st.sender_name, sizeof(st.sender_name), "%.*s", MAX_NAME - 1, cur_name);
-                snprintf(st.text, sizeof(st.text), "%.*s", MAX_TEXT - 1, text);
+                copy_utf8_safe(st.text, sizeof(st.text), text);
 
                 if (msgsnd(msqid, &st, MSG_SIZE, 0) < 0) {
                     perror("msgsnd");
@@ -942,6 +944,24 @@ int main(int argc, char *argv[]) {
     }
 
     int is_arbiter = (strcasecmp(argv[1], "arbiter") == 0);
+    int lock_fd = -1;
+    if (is_arbiter) {
+        lock_fd = open(ARBITER_LOCK_PATH, O_CREAT | O_RDWR, 0666);
+        if (lock_fd < 0) {
+            perror("open lock file");
+            return 1;
+        }
+        if (flock(lock_fd, LOCK_EX | LOCK_NB) < 0) {
+            if (errno == EWOULDBLOCK) {
+                fprintf(stderr, CLR_RED "! Arbiter is already running.\n" CLR_RESET);
+            } else {
+                perror("flock");
+            }
+            close(lock_fd);
+            return 1;
+        }
+    }
+
     int flags = is_arbiter ? (0666 | IPC_CREAT) : 0666;
     int msqid = msgget(key, flags);
     if (msqid < 0) {
@@ -950,8 +970,18 @@ int main(int argc, char *argv[]) {
         } else {
             perror("msgget");
         }
+        if (lock_fd >= 0) {
+            flock(lock_fd, LOCK_UN);
+            close(lock_fd);
+        }
         return 1;
     }
 
-    return is_arbiter ? run_arbiter(msqid) : run_client(msqid);
+    int rc = is_arbiter ? run_arbiter(msqid) : run_client(msqid);
+    if (lock_fd >= 0) {
+        flock(lock_fd, LOCK_UN);
+        close(lock_fd);
+        unlink(ARBITER_LOCK_PATH);
+    }
+    return rc;
 }

@@ -1,7 +1,11 @@
+#include <stddef.h>
+#include <string.h>
+
 #ifndef PROTOCOL_H
 #define PROTOCOL_H
 
 #define QUEUE_KEY_PATH "/tmp"
+#define ARBITER_LOCK_PATH "/tmp/queue_arbiter.lock"
 #define QUEUE_KEY_PROJ 'Q'
 
 #define MAX_NAME 32
@@ -40,5 +44,31 @@ struct qmsg {
 };
 
 #define MSG_SIZE (sizeof(struct qmsg) - sizeof(long))
+
+static inline void copy_utf8_safe(char *dst, size_t dst_size, const char *src) {
+    if (dst == NULL || dst_size == 0) {
+        return;
+    }
+    if (src == NULL) {
+        dst[0] = '\0';
+        return;
+    }
+    size_t len = 0;
+    while (src[len] != '\0' && len < dst_size - 1) {
+        len++;
+    }
+    if (src[len] != '\0' && len > 0) {
+        if (((unsigned char)src[len] & 0xC0) == 0x80) {
+            while (len > 0 && ((unsigned char)src[len - 1] & 0xC0) == 0x80) {
+                len--;
+            }
+            if (len > 0) {
+                len--;
+            }
+        }
+    }
+    memcpy(dst, src, len);
+    dst[len] = '\0';
+}
 
 #endif
