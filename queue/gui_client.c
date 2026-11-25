@@ -217,6 +217,8 @@ static GtkWidget *w_send_btn = NULL;
 
 static GtkWidget *w_file_btn = NULL;
 
+
+static GtkWidget *w_attach_menu = NULL;
 static void ui_rebuild_users_list(void);
 static void ui_rebuild_rooms_list(void);
 static void ui_update_tab_labels(void);
@@ -383,7 +385,8 @@ static void apply_css(void) {
         );
     }
 
-    char css_data[4096];
+
+    char css_data[6144];
     snprintf(css_data, sizeof(css_data),
         "window { background-color: %s; color: %s; font-size: %dpt; }\n"
         "label { color: %s; font-size: %dpt; }\n"
@@ -419,7 +422,14 @@ static void apply_css(void) {
         "list row:selected { background-color: %s; color: %s; }\n"
         "button.file-btn { background-image: none; background-color: %s; border: 1px solid %s; border-radius: 6px; padding: 3px 10px; }\n"
         "button.file-btn, button.file-btn label { color: %s; font-weight: bold; }\n"
-        "button.file-btn:hover { background-image: none; background-color: %s; }\n",
+
+        "button.file-btn:hover { background-image: none; background-color: %s; }\n"
+        "button.photo-btn { background-image: none; background-color: %s; border: 1px solid %s; border-radius: 8px; padding: 6px; }\n"
+        "button.photo-btn label { color: %s; font-weight: normal; font-size: %dpt; }\n"
+        "button.photo-btn:hover { background-image: none; background-color: %s; border-color: %s; }\n"
+        "menu { background-color: %s; color: %s; border: 1px solid %s; padding: 4px; }\n"
+        "menuitem { padding: 6px 14px; color: %s; }\n"
+        "menuitem:hover { background-color: %s; color: %s; }\n",
         t->win_bg, t->fg, ui_pt,
         t->fg, ui_pt,
         t->chat_bg, t->border,
@@ -451,7 +461,14 @@ static void apply_css(void) {
         t->row_hover,
 
         t->row_sel_bg, t->row_sel_fg,
-        t->entry_bg, t->border, t->accent, t->row_hover
+
+        t->entry_bg, t->border, t->accent, t->row_hover,
+        t->entry_bg, t->border,
+        t->muted, hint_pt,
+        t->row_hover, t->accent,
+        t->entry_bg, t->fg, t->border,
+        t->fg,
+        t->row_sel_bg, t->row_sel_fg
     );
 
     gtk_css_provider_load_from_data(g_css_provider, css_data, -1, NULL);
@@ -704,6 +721,109 @@ static void on_file_download_clicked(GtkWidget *btn, gpointer data) {
     g_free(save_path);
 }
 
+
+static int is_image_filename(const char *name) {
+    if (name == NULL) {
+        return 0;
+    }
+    const char *dot = strrchr(name, '.');
+    if (dot == NULL || dot[1] == '\0') {
+        return 0;
+    }
+    return strcasecmp(dot, ".png") == 0 ||
+           strcasecmp(dot, ".jpg") == 0 ||
+           strcasecmp(dot, ".jpeg") == 0 ||
+           strcasecmp(dot, ".gif") == 0 ||
+           strcasecmp(dot, ".bmp") == 0 ||
+           strcasecmp(dot, ".webp") == 0;
+}
+
+static GdkPixbuf *shm_fetch_pixbuf(const char *stored) {
+    if (stored == NULL || stored[0] == '\0' || g_msqid < 0) {
+        return NULL;
+    }
+
+    pthread_mutex_lock(&g_mtx);
+    long cur_id = g_my_id;
+    pthread_mutex_unlock(&g_mtx);
+    if (cur_id <= 0) {
+        return NULL;
+    }
+
+    drain_type(g_msqid, g_reply_type);
+
+    struct qmsg req;
+    memset(&req, 0, sizeof(req));
+    req.mtype = ARBITER_TYPE;
+    req.cmd = CMD_FILE_GET;
+    req.sender_id = cur_id;
+    req.reply_type = g_reply_type;
+    snprintf(req.text, sizeof(req.text), "%.*s", MAX_TEXT - 1, stored);
+
+    if (msgsnd(g_msqid, &req, MSG_SIZE, IPC_NOWAIT) < 0) {
+        return NULL;
+    }
+
+    struct qmsg rep;
+    if (wait_reply(g_msqid, g_reply_type, &rep, 200) < 0) {
+        return NULL;
+    }
+
+    int shmid = (int)rep.target_id;
+    long fsize = rep.timestamp;
+    if (shmid < 0 || fsize <= 0 || fsize > MAX_FILE_SIZE) {
+        if (shmid >= 0) {
+            shmctl(shmid, IPC_RMID, NULL);
+        }
+        return NULL;
+    }
+
+    void *ptr = shmat(shmid, NULL, SHM_RDONLY);
+    if (ptr == (void *)-1) {
+        shmctl(shmid, IPC_RMID, NULL);
+        return NULL;
+    }
+
+    GdkPixbufLoader *loader = gdk_pixbuf_loader_new();
+    gboolean ok = gdk_pixbuf_loader_write(loader, (const guchar *)ptr, (gsize)fsize, NULL);
+    if (!gdk_pixbuf_loader_close(loader, NULL)) {
+        ok = FALSE;
+    }
+
+    shmdt(ptr);
+    shmctl(shmid, IPC_RMID, NULL);
+
+    GdkPixbuf *result = NULL;
+    if (ok) {
+        GdkPixbuf *raw = gdk_pixbuf_loader_get_pixbuf(loader);
+        if (raw != NULL) {
+            int w = gdk_pixbuf_get_width(raw);
+            int h = gdk_pixbuf_get_height(raw);
+            int max_w = 260;
+            int max_h = 220;
+            if (w > max_w || h > max_h) {
+                double sx = (double)max_w / (double)w;
+                double sy = (double)max_h / (double)h;
+                double sc = (sx < sy) ? sx : sy;
+                int nw = (int)(w * sc);
+                int nh = (int)(h * sc);
+                if (nw < 1) {
+                    nw = 1;
+                }
+                if (nh < 1) {
+                    nh = 1;
+                }
+                result = gdk_pixbuf_scale_simple(raw, nw, nh, GDK_INTERP_BILINEAR);
+            } else {
+                result = g_object_ref(raw);
+            }
+        }
+    }
+
+    g_object_unref(loader);
+    return result;
+}
+
 static void ui_attach_file_widget(GtkTextChildAnchor *anchor) {
     if (w_chat_view == NULL || anchor == NULL) {
         return;
@@ -722,17 +842,47 @@ static void ui_attach_file_widget(GtkTextChildAnchor *anchor) {
 
     char sz_str[32];
     format_file_size(fsize, sz_str, sizeof(sz_str));
-    char label[160];
-    snprintf(label, sizeof(label), "File: %s (%s)", orig, sz_str);
 
-    GtkWidget *btn = gtk_button_new_with_label(label);
-    gtk_style_context_add_class(gtk_widget_get_style_context(btn), "file-btn");
+    GtkWidget *btn = NULL;
+    if (is_image_filename(orig)) {
+        GdkPixbuf *pb = g_object_get_data(G_OBJECT(anchor), "pixbuf");
+        if (pb == NULL && g_object_get_data(G_OBJECT(anchor), "pb_tried") == NULL) {
+            g_object_set_data(G_OBJECT(anchor), "pb_tried", GINT_TO_POINTER(1));
+            pb = shm_fetch_pixbuf(stored);
+            if (pb != NULL) {
+                g_object_set_data_full(G_OBJECT(anchor), "pixbuf", pb, g_object_unref);
+            }
+        }
+        if (pb != NULL) {
+            btn = gtk_button_new();
+            gtk_style_context_add_class(gtk_widget_get_style_context(btn), "photo-btn");
+            gtk_widget_set_tooltip_text(btn, "Click to save photo");
+
+            GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+            GtkWidget *img = gtk_image_new_from_pixbuf(pb);
+            char cap[160];
+            snprintf(cap, sizeof(cap), "%s (%s)", orig, sz_str);
+            GtkWidget *lbl = gtk_label_new(cap);
+            gtk_box_pack_start(GTK_BOX(box), img, FALSE, FALSE, 0);
+            gtk_box_pack_start(GTK_BOX(box), lbl, FALSE, FALSE, 0);
+            gtk_container_add(GTK_CONTAINER(btn), box);
+        }
+    }
+
+    if (btn == NULL) {
+        char label[160];
+        snprintf(label, sizeof(label), "File: %s (%s)", orig, sz_str);
+        btn = gtk_button_new_with_label(label);
+        gtk_style_context_add_class(gtk_widget_get_style_context(btn), "file-btn");
+        gtk_widget_set_tooltip_text(btn, "Click to save file");
+    }
+
     g_object_set_data_full(G_OBJECT(btn), "stored", g_strdup(stored), g_free);
     g_object_set_data_full(G_OBJECT(btn), "orig", g_strdup(orig), g_free);
     g_signal_connect(btn, "clicked", G_CALLBACK(on_file_download_clicked), NULL);
 
     gtk_text_view_add_child_at_anchor(GTK_TEXT_VIEW(w_chat_view), btn, anchor);
-    gtk_widget_show(btn);
+    gtk_widget_show_all(btn);
 }
 
 static void ui_attach_dialog_widgets(struct dialog_entry *d) {
@@ -2237,10 +2387,8 @@ static void on_send_clicked(GtkWidget *widget, gpointer data) {
 }
 
 
-static void on_send_file_clicked(GtkWidget *widget, gpointer data) {
-    (void)widget;
-    (void)data;
 
+static void do_send_attachment(int images_only) {
     pthread_mutex_lock(&g_mtx);
     long cur_id = g_my_id;
     char cur_name[MAX_NAME];
@@ -2271,13 +2419,25 @@ static void on_send_file_clicked(GtkWidget *widget, gpointer data) {
     }
 
     GtkWidget *dlg = gtk_file_chooser_dialog_new(
-        "Send File",
+        images_only ? "Send Photo" : "Send File",
         GTK_WINDOW(w_window),
         GTK_FILE_CHOOSER_ACTION_OPEN,
         "_Cancel", GTK_RESPONSE_CANCEL,
         "_Send", GTK_RESPONSE_ACCEPT,
         NULL
     );
+
+    if (images_only) {
+        GtkFileFilter *img_filter = gtk_file_filter_new();
+        gtk_file_filter_set_name(img_filter, "Images (PNG, JPG, GIF, WebP, BMP)");
+        gtk_file_filter_add_pixbuf_formats(img_filter);
+        gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(dlg), img_filter);
+
+        GtkFileFilter *all_filter = gtk_file_filter_new();
+        gtk_file_filter_set_name(all_filter, "All files");
+        gtk_file_filter_add_pattern(all_filter, "*");
+        gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(dlg), all_filter);
+    }
 
     char *fpath = NULL;
     if (gtk_dialog_run(GTK_DIALOG(dlg)) == GTK_RESPONSE_ACCEPT) {
@@ -2365,6 +2525,33 @@ static void on_send_file_clicked(GtkWidget *widget, gpointer data) {
     gtk_widget_grab_focus(w_msg_entry);
 }
 
+static void on_menu_attach_photo(GtkMenuItem *item, gpointer data) {
+    (void)item;
+    (void)data;
+    do_send_attachment(1);
+}
+
+static void on_menu_attach_file(GtkMenuItem *item, gpointer data) {
+    (void)item;
+    (void)data;
+    do_send_attachment(0);
+}
+
+static void on_attach_clicked(GtkWidget *widget, gpointer data) {
+    (void)data;
+    if (w_attach_menu == NULL) {
+        return;
+    }
+    gtk_widget_show_all(w_attach_menu);
+    gtk_menu_popup_at_widget(
+        GTK_MENU(w_attach_menu),
+        widget,
+        GDK_GRAVITY_NORTH_WEST,
+        GDK_GRAVITY_SOUTH_WEST,
+        NULL
+    );
+}
+
 
 static gboolean on_window_configure(GtkWidget *widget, GdkEventConfigure *event, gpointer data) {
     (void)widget;
@@ -2417,6 +2604,11 @@ static void on_window_destroy(GtkWidget *widget, gpointer data) {
 
     w_sidebar = NULL;
     send_logout();
+
+    if (w_attach_menu != NULL) {
+        gtk_widget_destroy(w_attach_menu);
+        w_attach_menu = NULL;
+    }
     g_running = 0;
     gtk_main_quit();
 }
@@ -2648,9 +2840,20 @@ static void build_ui(void) {
 
 
 
-    w_file_btn = gtk_button_new_with_label("File");
+
+    w_attach_menu = gtk_menu_new();
+    GtkWidget *mi_photo = gtk_menu_item_new_with_label("📷  Photo");
+    GtkWidget *mi_file = gtk_menu_item_new_with_label("📄  File");
+    g_signal_connect(mi_photo, "activate", G_CALLBACK(on_menu_attach_photo), NULL);
+    g_signal_connect(mi_file, "activate", G_CALLBACK(on_menu_attach_file), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(w_attach_menu), mi_photo);
+    gtk_menu_shell_append(GTK_MENU_SHELL(w_attach_menu), mi_file);
+
+    w_file_btn = gtk_button_new_with_label("📎");
+    gtk_widget_set_tooltip_text(w_file_btn, "Attach photo or file");
     gtk_style_context_add_class(gtk_widget_get_style_context(w_file_btn), "tab-btn");
-    g_signal_connect(w_file_btn, "clicked", G_CALLBACK(on_send_file_clicked), NULL);
+
+    g_signal_connect(w_file_btn, "clicked", G_CALLBACK(on_attach_clicked), NULL);
 
     gtk_box_pack_start(GTK_BOX(bottom_bar), w_target_entry, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(bottom_bar), w_msg_entry, TRUE, TRUE, 0);
