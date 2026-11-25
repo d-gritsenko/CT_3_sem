@@ -1,6 +1,5 @@
 #define _DEFAULT_SOURCE
 
-
 #include <errno.h>
 #include <gtk/gtk.h>
 #include <pthread.h>
@@ -15,59 +14,128 @@
 #include <time.h>
 #include <unistd.h>
 
-
 #include "protocol.h"
-
 
 #define MAX_DIALOGS (MAX_CLIENTS + MAX_ROOMS + 8)
 #define MAX_PENDING_ACKS 128
 
-
 enum ui_event_kind {
-   EV_CHAT = 1,
-   EV_ACK = 2,
-   EV_LOST = 3,
-   EV_WHO = 4,
-   EV_ROOM_MSG = 5,
-   EV_ROOMS = 6
+    EV_CHAT = 1,
+    EV_ACK = 2,
+    EV_LOST = 3,
+    EV_WHO = 4,
+    EV_ROOM_MSG = 5,
+    EV_ROOMS = 6
 };
-
 
 struct ui_event {
-   int kind;
-   long msg_id;
-   char room[MAX_NAME];
-   char sender[MAX_NAME];
-   char text[MAX_TEXT];
+    int kind;
+    long msg_id;
+    char room[MAX_NAME];
+    char sender[MAX_NAME];
+    char text[MAX_TEXT];
 };
-
 
 struct pending_ack {
-   long msg_id;
-   char sender[MAX_NAME];
+    long msg_id;
+    char sender[MAX_NAME];
 };
-
 
 struct dialog_entry {
-   int used;
-   int is_room;
-   int online;
-   int joined;
-   int member_count;
-   int unread;
-   char peer[MAX_NAME];
-   GtkTextBuffer *buf;
-   struct pending_ack pending_acks[MAX_PENDING_ACKS];
-   int pending_ack_count;
+    int used;
+    int is_room;
+    int online;
+    int joined;
+    int member_count;
+    int unread;
+    char peer[MAX_NAME];
+    GtkTextBuffer *buf;
+    struct pending_ack pending_acks[MAX_PENDING_ACKS];
+    int pending_ack_count;
 };
-
 
 struct room_list_item {
-   char name[MAX_NAME];
-   int joined;
-   int members;
+    char name[MAX_NAME];
+    int joined;
+    int members;
 };
 
+struct ui_theme {
+    const char *name;
+    const char *win_bg;
+    const char *fg;
+    const char *entry_bg;
+    const char *border;
+    const char *accent;
+    const char *accent_hover;
+    const char *btn_fg;
+    const char *disabled_bg;
+    const char *muted;
+    const char *chat_bg;
+    const char *row_hover;
+    const char *row_sel_bg;
+    const char *row_sel_fg;
+    const char *leave_bg;
+    const char *leave_hover;
+    const char *incoming;
+    const char *outgoing;
+    const char *ack;
+    const char *warn;
+    const char *err;
+    const char *sys;
+    const char *online;
+    const char *unread;
+};
+
+static const struct ui_theme g_themes[] = {
+    {
+        "Catppuccin Mocha",
+        "#1e1e2e", "#cdd6f4", "#313244", "#45475a",
+        "#89b4fa", "#b4befe", "#11111b", "#313244",
+        "#7f849c", "#181825", "#313244", "#45475a", "#ffffff",
+        "#f38ba8", "#eba0ac",
+        "#89dceb", "#a6e3a1", "#89b4fa", "#f9e2af", "#f38ba8", "#94e2d5",
+        "#a6e3a1", "#f9e2af"
+    },
+    {
+        "Nord Dark",
+        "#2e3440", "#eceff4", "#3b4252", "#4c566a",
+        "#88c0d0", "#8fbcbb", "#2e3440", "#3b4252",
+        "#7b88a1", "#242933", "#3b4252", "#4c566a", "#ffffff",
+        "#bf616a", "#d08770",
+        "#88c0d0", "#a3be8c", "#81a1c1", "#ebcb8b", "#bf616a", "#8fbcbb",
+        "#a3be8c", "#ebcb8b"
+    },
+    {
+        "Gruvbox Dark",
+        "#282828", "#ebdbb2", "#3c3836", "#504945",
+        "#fabd2f", "#fe8019", "#1d2021", "#3c3836",
+        "#928374", "#1d2021", "#3c3836", "#504945", "#fbf1c7",
+        "#fb4934", "#cc241d",
+        "#83a598", "#b8bb26", "#8ec07c", "#fabd2f", "#fb4934", "#fe8019",
+        "#b8bb26", "#fabd2f"
+    },
+    {
+        "Tokyo Night",
+        "#1a1b26", "#c0caf5", "#24283b", "#414868",
+        "#7aa2f7", "#bb9af7", "#15161e", "#24283b",
+        "#787c99", "#16161e", "#24283b", "#414868", "#ffffff",
+        "#f7768e", "#ff9e64",
+        "#7dcfff", "#9ece6a", "#7aa2f7", "#e0af68", "#f7768e", "#2ac3de",
+        "#9ece6a", "#e0af68"
+    },
+    {
+        "Cyber Dark",
+        "#222426", "#f8f8f2", "#2e3236", "#494d52",
+        "#a6e22e", "#66d9ef", "#1b1d1e", "#2e3236",
+        "#75715e", "#1a1c1d", "#2e3236", "#494d52", "#ffffff",
+        "#f92672", "#fd971f",
+        "#66d9ef", "#a6e22e", "#ae81ff", "#e6db74", "#f92672", "#a6e22e",
+        "#a6e22e", "#e6db74"
+    }
+};
+
+#define THEME_COUNT ((int)(sizeof(g_themes) / sizeof(g_themes[0])))
 
 static volatile sig_atomic_t g_running = 1;
 static volatile sig_atomic_t g_who_force = 0;
@@ -79,24 +147,21 @@ static long g_next_msg_id = 1;
 static char g_my_name[MAX_NAME];
 static pthread_mutex_t g_mtx = PTHREAD_MUTEX_INITIALIZER;
 
-
 static int g_was_connected = 0;
 static int g_suppress_select = 0;
-
+static int g_theme_idx = 0;
+static GtkCssProvider *g_css_provider = NULL;
 
 static GtkTextBuffer *g_sys_buf = NULL;
 static struct dialog_entry g_dialogs[MAX_DIALOGS];
 static char g_active_peer[MAX_NAME] = "";
 static int g_active_is_room = 0;
 
-
 static char g_online_users[MAX_CLIENTS][MAX_NAME];
 static int g_online_count = 0;
 
-
 static struct room_list_item g_rooms_cache[MAX_ROOMS];
 static int g_rooms_cache_count = 0;
-
 
 static GtkWidget *w_window = NULL;
 static GtkWidget *w_nick_entry = NULL;
@@ -104,30 +169,26 @@ static GtkWidget *w_reg_btn = NULL;
 static GtkWidget *w_reconn_btn = NULL;
 static GtkWidget *w_logout_btn = NULL;
 static GtkWidget *w_status_lbl = NULL;
+static GtkWidget *w_theme_combo = NULL;
 static GtkWidget *w_chat_header = NULL;
 static GtkWidget *w_leave_btn = NULL;
 static GtkWidget *w_chat_view = NULL;
-
 
 static GtkWidget *w_tab_users = NULL;
 static GtkWidget *w_tab_rooms = NULL;
 static GtkWidget *w_sidebar_stack = NULL;
 
-
 static GtkWidget *w_users_lbl = NULL;
 static GtkWidget *w_users_list = NULL;
-
 
 static GtkWidget *w_room_entry = NULL;
 static GtkWidget *w_join_btn = NULL;
 static GtkWidget *w_rooms_lbl = NULL;
 static GtkWidget *w_rooms_list = NULL;
 
-
 static GtkWidget *w_target_entry = NULL;
 static GtkWidget *w_msg_entry = NULL;
 static GtkWidget *w_send_btn = NULL;
-
 
 static void ui_rebuild_users_list(void);
 static void ui_rebuild_rooms_list(void);
@@ -135,1036 +196,1056 @@ static void ui_update_tab_labels(void);
 static void ui_update_chat_header(void);
 static void ui_switch_dialog(const char *peer, int is_room, int set_target);
 
+static const struct ui_theme *current_theme(void) {
+    if (g_theme_idx < 0 || g_theme_idx >= THEME_COUNT) {
+        return &g_themes[0];
+    }
+    return &g_themes[g_theme_idx];
+}
 
 static void get_timestamp(char *buf, size_t size) {
-   time_t now = time(NULL);
-   struct tm tm_now;
-   localtime_r(&now, &tm_now);
-   strftime(buf, size, "%H:%M:%S", &tm_now);
+    time_t now = time(NULL);
+    struct tm tm_now;
+    localtime_r(&now, &tm_now);
+    strftime(buf, size, "%H:%M:%S", &tm_now);
 }
-
 
 static void drain_type(int msqid, long mtype) {
-   struct qmsg tmp;
-   while (msgrcv(msqid, &tmp, MSG_SIZE, mtype, IPC_NOWAIT) >= 0) {
-   }
+    struct qmsg tmp;
+    while (msgrcv(msqid, &tmp, MSG_SIZE, mtype, IPC_NOWAIT) >= 0) {
+    }
 }
-
 
 static int wait_reply(int msqid, long reply_type, struct qmsg *rep, int max_tries) {
-   for (int i = 0; i < max_tries; i++) {
-       ssize_t n = msgrcv(msqid, rep, MSG_SIZE, reply_type, IPC_NOWAIT);
-       if (n >= 0) {
-           return 0;
-       }
-       if (errno == ENOMSG) {
-           usleep(10000);
-           continue;
-       }
-       if (errno == EINTR) {
-           continue;
-       }
-       return -1;
-   }
-   return -1;
+    for (int i = 0; i < max_tries; i++) {
+        ssize_t n = msgrcv(msqid, rep, MSG_SIZE, reply_type, IPC_NOWAIT);
+        if (n >= 0) {
+            return 0;
+        }
+        if (errno == ENOMSG) {
+            usleep(10000);
+            continue;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        return -1;
+    }
+    return -1;
 }
-
 
 static void send_logout(void) {
-   pthread_mutex_lock(&g_mtx);
-   long my_id = g_my_id;
-   g_my_id = 0;
-   g_my_name[0] = '\0';
-   pthread_mutex_unlock(&g_mtx);
+    pthread_mutex_lock(&g_mtx);
+    long my_id = g_my_id;
+    g_my_id = 0;
+    g_my_name[0] = '\0';
+    pthread_mutex_unlock(&g_mtx);
 
-
-   if (my_id > 0 && g_msqid >= 0) {
-       struct qmsg msg;
-       memset(&msg, 0, sizeof(msg));
-       msg.mtype = ARBITER_TYPE;
-       msg.cmd = CMD_LOGOUT;
-       msg.sender_id = my_id;
-       msg.reply_type = g_reply_type;
-       msgsnd(g_msqid, &msg, MSG_SIZE, IPC_NOWAIT);
-   }
+    if (my_id > 0 && g_msqid >= 0) {
+        struct qmsg msg;
+        memset(&msg, 0, sizeof(msg));
+        msg.mtype = ARBITER_TYPE;
+        msg.cmd = CMD_LOGOUT;
+        msg.sender_id = my_id;
+        msg.reply_type = g_reply_type;
+        msgsnd(g_msqid, &msg, MSG_SIZE, IPC_NOWAIT);
+    }
 }
-
 
 static void send_read_ack(long msg_id, const char *sender_name) {
-   if (msg_id <= 0 || sender_name == NULL || sender_name[0] == '\0' || g_msqid < 0) {
-       return;
-   }
+    if (msg_id <= 0 || sender_name == NULL || sender_name[0] == '\0' || g_msqid < 0) {
+        return;
+    }
 
+    char cur_name[MAX_NAME];
+    pthread_mutex_lock(&g_mtx);
+    long my_id = g_my_id;
+    snprintf(cur_name, sizeof(cur_name), "%.*s", MAX_NAME - 1, g_my_name);
+    pthread_mutex_unlock(&g_mtx);
 
-   char cur_name[MAX_NAME];
-   pthread_mutex_lock(&g_mtx);
-   long my_id = g_my_id;
-   snprintf(cur_name, sizeof(cur_name), "%.*s", MAX_NAME - 1, g_my_name);
-   pthread_mutex_unlock(&g_mtx);
+    if (my_id <= 0 || cur_name[0] == '\0') {
+        return;
+    }
 
-
-   if (my_id <= 0 || cur_name[0] == '\0') {
-       return;
-   }
-
-
-   struct qmsg ack;
-   memset(&ack, 0, sizeof(ack));
-   ack.mtype = ARBITER_TYPE;
-   ack.cmd = CMD_ACK;
-   ack.sender_id = my_id;
-   ack.msg_id = msg_id;
-   snprintf(ack.name, sizeof(ack.name), "%.*s", MAX_NAME - 1, sender_name);
-   snprintf(ack.sender_name, sizeof(ack.sender_name), "%.*s", MAX_NAME - 1, cur_name);
-   msgsnd(g_msqid, &ack, MSG_SIZE, IPC_NOWAIT);
+    struct qmsg ack;
+    memset(&ack, 0, sizeof(ack));
+    ack.mtype = ARBITER_TYPE;
+    ack.cmd = CMD_ACK;
+    ack.sender_id = my_id;
+    ack.msg_id = msg_id;
+    snprintf(ack.name, sizeof(ack.name), "%.*s", MAX_NAME - 1, sender_name);
+    snprintf(ack.sender_name, sizeof(ack.sender_name), "%.*s", MAX_NAME - 1, cur_name);
+    msgsnd(g_msqid, &ack, MSG_SIZE, IPC_NOWAIT);
 }
 
+static void apply_buffer_theme(GtkTextBuffer *buf) {
+    if (buf == NULL) {
+        return;
+    }
+    const struct ui_theme *t = current_theme();
+    GtkTextTagTable *table = gtk_text_buffer_get_tag_table(buf);
+    GtkTextTag *tag;
+
+    if ((tag = gtk_text_tag_table_lookup(table, "time")) != NULL) {
+        g_object_set(tag, "foreground", t->muted, NULL);
+    }
+    if ((tag = gtk_text_tag_table_lookup(table, "incoming")) != NULL) {
+        g_object_set(tag, "foreground", t->incoming, NULL);
+    }
+    if ((tag = gtk_text_tag_table_lookup(table, "outgoing")) != NULL) {
+        g_object_set(tag, "foreground", t->outgoing, NULL);
+    }
+    if ((tag = gtk_text_tag_table_lookup(table, "ack")) != NULL) {
+        g_object_set(tag, "foreground", t->ack, NULL);
+    }
+    if ((tag = gtk_text_tag_table_lookup(table, "warn")) != NULL) {
+        g_object_set(tag, "foreground", t->warn, NULL);
+    }
+    if ((tag = gtk_text_tag_table_lookup(table, "err")) != NULL) {
+        g_object_set(tag, "foreground", t->err, NULL);
+    }
+    if ((tag = gtk_text_tag_table_lookup(table, "sys")) != NULL) {
+        g_object_set(tag, "foreground", t->sys, NULL);
+    }
+}
 
 static GtkTextBuffer *create_chat_buffer(void) {
-   GtkTextBuffer *buf = gtk_text_buffer_new(NULL);
-   gtk_text_buffer_create_tag(buf, "time", "foreground", "#7f849c", NULL);
-   gtk_text_buffer_create_tag(buf, "incoming", "foreground", "#89dceb", "weight", PANGO_WEIGHT_BOLD, NULL);
-   gtk_text_buffer_create_tag(buf, "outgoing", "foreground", "#a6e3a1", "weight", PANGO_WEIGHT_BOLD, NULL);
-   gtk_text_buffer_create_tag(buf, "ack", "foreground", "#89b4fa", NULL);
-   gtk_text_buffer_create_tag(buf, "warn", "foreground", "#f9e2af", NULL);
-   gtk_text_buffer_create_tag(buf, "err", "foreground", "#f38ba8", "weight", PANGO_WEIGHT_BOLD, NULL);
-   gtk_text_buffer_create_tag(buf, "sys", "foreground", "#94e2d5", NULL);
-   return buf;
+    const struct ui_theme *t = current_theme();
+    GtkTextBuffer *buf = gtk_text_buffer_new(NULL);
+    gtk_text_buffer_create_tag(buf, "time", "foreground", t->muted, NULL);
+    gtk_text_buffer_create_tag(buf, "incoming", "foreground", t->incoming, "weight", PANGO_WEIGHT_BOLD, NULL);
+    gtk_text_buffer_create_tag(buf, "outgoing", "foreground", t->outgoing, "weight", PANGO_WEIGHT_BOLD, NULL);
+    gtk_text_buffer_create_tag(buf, "ack", "foreground", t->ack, NULL);
+    gtk_text_buffer_create_tag(buf, "warn", "foreground", t->warn, NULL);
+    gtk_text_buffer_create_tag(buf, "err", "foreground", t->err, "weight", PANGO_WEIGHT_BOLD, NULL);
+    gtk_text_buffer_create_tag(buf, "sys", "foreground", t->sys, NULL);
+    return buf;
 }
 
+static void apply_theme(int idx) {
+    if (idx < 0 || idx >= THEME_COUNT) {
+        idx = 0;
+    }
+    g_theme_idx = idx;
+    const struct ui_theme *t = current_theme();
+
+    if (g_css_provider == NULL) {
+        g_css_provider = gtk_css_provider_new();
+        gtk_style_context_add_provider_for_screen(
+            gdk_screen_get_default(),
+            GTK_STYLE_PROVIDER(g_css_provider),
+            GTK_STYLE_PROVIDER_PRIORITY_APPLICATION
+        );
+    }
+
+    char css_data[4096];
+    snprintf(css_data, sizeof(css_data),
+        "window { background-color: %s; color: %s; }\n"
+        "label { color: %s; }\n"
+        "entry { background-color: %s; color: %s; border: 1px solid %s; border-radius: 6px; padding: 6px 10px; }\n"
+        "entry:focus { border-color: %s; }\n"
+        "button { background-image: none; background-color: %s; border-radius: 6px; padding: 6px 14px; border: none; }\n"
+        "button, button label { color: %s; font-weight: bold; }\n"
+        "button:hover { background-image: none; background-color: %s; }\n"
+        "button:disabled { background-image: none; background-color: %s; }\n"
+        "button:disabled, button:disabled label { color: %s; }\n"
+        "button.tab-btn { background-image: none; background-color: %s; border-radius: 6px; padding: 5px 8px; border: 1px solid %s; }\n"
+        "button.tab-btn, button.tab-btn label { color: %s; font-weight: bold; }\n"
+        "button.tab-btn:hover { background-image: none; background-color: %s; }\n"
+        "button.tab-active { background-image: none; background-color: %s; border: 1px solid %s; }\n"
+        "button.tab-active, button.tab-active label { color: %s; }\n"
+        "button.tab-active:hover { background-image: none; background-color: %s; }\n"
+        "button.leave-btn { background-image: none; background-color: %s; padding: 3px 10px; }\n"
+        "button.leave-btn, button.leave-btn label { color: %s; }\n"
+        "button.leave-btn:hover { background-image: none; background-color: %s; }\n"
+        "combobox button { background-image: none; background-color: %s; border: 1px solid %s; border-radius: 6px; padding: 4px 10px; }\n"
+        "combobox button, combobox button label, combobox button cellview { color: %s; font-weight: normal; }\n"
+        "combobox button:hover { background-image: none; background-color: %s; }\n"
+        "textview text { background-color: %s; color: %s; font-family: monospace; font-size: 11pt; }\n"
+        "scrolledwindow { border: 1px solid %s; border-radius: 6px; }\n"
+        "list { background-color: %s; color: %s; }\n"
+        "list row { padding: 2px 4px; }\n"
+        "list row:hover { background-color: %s; }\n"
+        "list row:selected { background-color: %s; color: %s; }\n",
+        t->win_bg, t->fg,
+        t->fg,
+        t->entry_bg, t->fg, t->border,
+        t->accent,
+        t->accent,
+        t->btn_fg,
+        t->accent_hover,
+        t->disabled_bg,
+        t->muted,
+        t->entry_bg, t->border,
+        t->fg,
+        t->row_hover,
+        t->accent, t->accent,
+        t->btn_fg,
+        t->accent_hover,
+        t->leave_bg,
+        t->btn_fg,
+        t->leave_hover,
+        t->entry_bg, t->border,
+        t->fg,
+        t->row_hover,
+        t->chat_bg, t->fg,
+        t->border,
+        t->chat_bg, t->fg,
+        t->row_hover,
+        t->row_sel_bg, t->row_sel_fg
+    );
+
+    gtk_css_provider_load_from_data(g_css_provider, css_data, -1, NULL);
+
+    apply_buffer_theme(g_sys_buf);
+    for (int i = 0; i < MAX_DIALOGS; i++) {
+        if (g_dialogs[i].used && g_dialogs[i].buf != NULL) {
+            apply_buffer_theme(g_dialogs[i].buf);
+        }
+    }
+
+    ui_rebuild_users_list();
+    ui_rebuild_rooms_list();
+}
+
+static void on_theme_changed(GtkComboBox *combo, gpointer data) {
+    (void)data;
+    int idx = gtk_combo_box_get_active(combo);
+    if (idx >= 0 && idx < THEME_COUNT) {
+        apply_theme(idx);
+    }
+}
 
 static int is_user_online(const char *name) {
-   for (int i = 0; i < g_online_count; i++) {
-       if (strcmp(g_online_users[i], name) == 0) {
-           return 1;
-       }
-   }
-   return 0;
+    for (int i = 0; i < g_online_count; i++) {
+        if (strcmp(g_online_users[i], name) == 0) {
+            return 1;
+        }
+    }
+    return 0;
 }
-
 
 static struct dialog_entry *find_dialog(const char *peer, int is_room) {
-   if (peer == NULL || peer[0] == '\0') {
-       return NULL;
-   }
-   for (int i = 0; i < MAX_DIALOGS; i++) {
-       if (g_dialogs[i].used && g_dialogs[i].is_room == is_room && strcmp(g_dialogs[i].peer, peer) == 0) {
-           return &g_dialogs[i];
-       }
-   }
-   return NULL;
+    if (peer == NULL || peer[0] == '\0') {
+        return NULL;
+    }
+    for (int i = 0; i < MAX_DIALOGS; i++) {
+        if (g_dialogs[i].used && g_dialogs[i].is_room == is_room && strcmp(g_dialogs[i].peer, peer) == 0) {
+            return &g_dialogs[i];
+        }
+    }
+    return NULL;
 }
-
 
 static struct dialog_entry *get_or_create_dialog(const char *peer, int is_room) {
-   struct dialog_entry *d = find_dialog(peer, is_room);
-   if (d != NULL) {
-       return d;
-   }
-   for (int i = 0; i < MAX_DIALOGS; i++) {
-       if (!g_dialogs[i].used) {
-           memset(&g_dialogs[i], 0, sizeof(g_dialogs[i]));
-           g_dialogs[i].used = 1;
-           g_dialogs[i].is_room = is_room;
-           g_dialogs[i].online = is_room ? 0 : is_user_online(peer);
-           snprintf(g_dialogs[i].peer, sizeof(g_dialogs[i].peer), "%.*s", MAX_NAME - 1, peer);
-           g_dialogs[i].buf = create_chat_buffer();
-           return &g_dialogs[i];
-       }
-   }
-   return NULL;
+    struct dialog_entry *d = find_dialog(peer, is_room);
+    if (d != NULL) {
+        return d;
+    }
+    for (int i = 0; i < MAX_DIALOGS; i++) {
+        if (!g_dialogs[i].used) {
+            memset(&g_dialogs[i], 0, sizeof(g_dialogs[i]));
+            g_dialogs[i].used = 1;
+            g_dialogs[i].is_room = is_room;
+            g_dialogs[i].online = is_room ? 0 : is_user_online(peer);
+            snprintf(g_dialogs[i].peer, sizeof(g_dialogs[i].peer), "%.*s", MAX_NAME - 1, peer);
+            g_dialogs[i].buf = create_chat_buffer();
+            return &g_dialogs[i];
+        }
+    }
+    return NULL;
 }
-
 
 static void flush_dialog_acks(struct dialog_entry *d) {
-   if (d == NULL) {
-       return;
-   }
-   for (int i = 0; i < d->pending_ack_count; i++) {
-       send_read_ack(d->pending_acks[i].msg_id, d->pending_acks[i].sender);
-   }
-   d->pending_ack_count = 0;
+    if (d == NULL) {
+        return;
+    }
+    for (int i = 0; i < d->pending_ack_count; i++) {
+        send_read_ack(d->pending_acks[i].msg_id, d->pending_acks[i].sender);
+    }
+    d->pending_ack_count = 0;
 }
-
 
 static void queue_dialog_ack(struct dialog_entry *d, long msg_id, const char *sender) {
-   if (d == NULL || msg_id <= 0 || sender == NULL || sender[0] == '\0') {
-       return;
-   }
-   if (d->pending_ack_count < MAX_PENDING_ACKS) {
-       d->pending_acks[d->pending_ack_count].msg_id = msg_id;
-       snprintf(d->pending_acks[d->pending_ack_count].sender, MAX_NAME, "%.*s", MAX_NAME - 1, sender);
-       d->pending_ack_count++;
-   }
+    if (d == NULL || msg_id <= 0 || sender == NULL || sender[0] == '\0') {
+        return;
+    }
+    if (d->pending_ack_count < MAX_PENDING_ACKS) {
+        d->pending_acks[d->pending_ack_count].msg_id = msg_id;
+        snprintf(d->pending_acks[d->pending_ack_count].sender, MAX_NAME, "%.*s", MAX_NAME - 1, sender);
+        d->pending_ack_count++;
+    }
 }
-
 
 static void ui_scroll_if_active(GtkTextBuffer *buf) {
-   if (w_chat_view == NULL || buf == NULL) {
-       return;
-   }
-   if (gtk_text_view_get_buffer(GTK_TEXT_VIEW(w_chat_view)) != buf) {
-       return;
-   }
-   GtkTextIter end;
-   GtkTextMark *mark = gtk_text_buffer_get_insert(buf);
-   gtk_text_buffer_get_end_iter(buf, &end);
-   gtk_text_buffer_move_mark(buf, mark, &end);
-   gtk_text_view_scroll_to_mark(GTK_TEXT_VIEW(w_chat_view), mark, 0.0, TRUE, 0.0, 1.0);
+    if (w_chat_view == NULL || buf == NULL) {
+        return;
+    }
+    if (gtk_text_view_get_buffer(GTK_TEXT_VIEW(w_chat_view)) != buf) {
+        return;
+    }
+    GtkTextIter end;
+    GtkTextMark *mark = gtk_text_buffer_get_insert(buf);
+    gtk_text_buffer_get_end_iter(buf, &end);
+    gtk_text_buffer_move_mark(buf, mark, &end);
+    gtk_text_view_scroll_to_mark(GTK_TEXT_VIEW(w_chat_view), mark, 0.0, TRUE, 0.0, 1.0);
 }
-
 
 static void ui_append_line_to(GtkTextBuffer *buf, const char *tag_name, const char *prefix, const char *body) {
-   if (buf == NULL) {
-       return;
-   }
+    if (buf == NULL) {
+        return;
+    }
 
+    char ts[16];
+    get_timestamp(ts, sizeof(ts));
 
-   char ts[16];
-   get_timestamp(ts, sizeof(ts));
+    GtkTextIter end;
+    gtk_text_buffer_get_end_iter(buf, &end);
 
+    char ts_str[24];
+    snprintf(ts_str, sizeof(ts_str), "[%s] ", ts);
+    gtk_text_buffer_insert_with_tags_by_name(buf, &end, ts_str, -1, "time", NULL);
 
-   GtkTextIter end;
-   gtk_text_buffer_get_end_iter(buf, &end);
+    if (prefix != NULL && prefix[0] != '\0') {
+        gtk_text_buffer_insert_with_tags_by_name(buf, &end, prefix, -1, tag_name, NULL);
+    }
 
+    if (body != NULL && body[0] != '\0') {
+        gtk_text_buffer_insert(buf, &end, body, -1);
+    }
 
-   char ts_str[24];
-   snprintf(ts_str, sizeof(ts_str), "[%s] ", ts);
-   gtk_text_buffer_insert_with_tags_by_name(buf, &end, ts_str, -1, "time", NULL);
-
-
-   if (prefix != NULL && prefix[0] != '\0') {
-       gtk_text_buffer_insert_with_tags_by_name(buf, &end, prefix, -1, tag_name, NULL);
-   }
-
-
-   if (body != NULL && body[0] != '\0') {
-       gtk_text_buffer_insert(buf, &end, body, -1);
-   }
-
-
-   gtk_text_buffer_insert(buf, &end, "\n", -1);
-   ui_scroll_if_active(buf);
+    gtk_text_buffer_insert(buf, &end, "\n", -1);
+    ui_scroll_if_active(buf);
 }
-
 
 static void ui_append_sys(const char *tag_name, const char *text) {
-   ui_append_line_to(g_sys_buf, tag_name, text, NULL);
+    ui_append_line_to(g_sys_buf, tag_name, text, NULL);
 }
-
 
 static void ui_append_error(const char *text) {
-   GtkTextBuffer *cur = (w_chat_view != NULL) ? gtk_text_view_get_buffer(GTK_TEXT_VIEW(w_chat_view)) : g_sys_buf;
-   ui_append_line_to(cur != NULL ? cur : g_sys_buf, "err", text, NULL);
+    GtkTextBuffer *cur = (w_chat_view != NULL) ? gtk_text_view_get_buffer(GTK_TEXT_VIEW(w_chat_view)) : g_sys_buf;
+    ui_append_line_to(cur != NULL ? cur : g_sys_buf, "err", text, NULL);
 }
-
 
 static void ui_append_outgoing_to(GtkTextBuffer *buf, long msg_id, const char *body) {
-   if (buf == NULL) {
-       return;
-   }
+    if (buf == NULL) {
+        return;
+    }
 
+    char ts[16];
+    get_timestamp(ts, sizeof(ts));
 
-   char ts[16];
-   get_timestamp(ts, sizeof(ts));
+    GtkTextIter end;
+    gtk_text_buffer_get_end_iter(buf, &end);
 
+    char ts_str[24];
+    snprintf(ts_str, sizeof(ts_str), "[%s] ", ts);
+    gtk_text_buffer_insert_with_tags_by_name(buf, &end, ts_str, -1, "time", NULL);
+    gtk_text_buffer_insert_with_tags_by_name(buf, &end, "you: ", -1, "outgoing", NULL);
 
-   GtkTextIter end;
-   gtk_text_buffer_get_end_iter(buf, &end);
+    if (body != NULL && body[0] != '\0') {
+        gtk_text_buffer_insert(buf, &end, body, -1);
+    }
 
+    char m_start[32];
+    char m_end[32];
+    snprintf(m_start, sizeof(m_start), "ms_%ld", msg_id);
+    snprintf(m_end, sizeof(m_end), "me_%ld", msg_id);
 
-   char ts_str[24];
-   snprintf(ts_str, sizeof(ts_str), "[%s] ", ts);
-   gtk_text_buffer_insert_with_tags_by_name(buf, &end, ts_str, -1, "time", NULL);
-   gtk_text_buffer_insert_with_tags_by_name(buf, &end, "you: ", -1, "outgoing", NULL);
+    gtk_text_buffer_get_end_iter(buf, &end);
+    gtk_text_buffer_create_mark(buf, m_start, &end, TRUE);
+    gtk_text_buffer_insert_with_tags_by_name(buf, &end, " ✓", -1, "time", NULL);
+    gtk_text_buffer_get_end_iter(buf, &end);
+    gtk_text_buffer_create_mark(buf, m_end, &end, TRUE);
+    gtk_text_buffer_insert(buf, &end, "\n", -1);
 
-
-   if (body != NULL && body[0] != '\0') {
-       gtk_text_buffer_insert(buf, &end, body, -1);
-   }
-
-
-   char m_start[32];
-   char m_end[32];
-   snprintf(m_start, sizeof(m_start), "ms_%ld", msg_id);
-   snprintf(m_end, sizeof(m_end), "me_%ld", msg_id);
-
-
-   gtk_text_buffer_get_end_iter(buf, &end);
-   gtk_text_buffer_create_mark(buf, m_start, &end, TRUE);
-   gtk_text_buffer_insert_with_tags_by_name(buf, &end, " ✓", -1, "time", NULL);
-   gtk_text_buffer_get_end_iter(buf, &end);
-   gtk_text_buffer_create_mark(buf, m_end, &end, TRUE);
-   gtk_text_buffer_insert(buf, &end, "\n", -1);
-
-
-   ui_scroll_if_active(buf);
+    ui_scroll_if_active(buf);
 }
-
 
 static void ui_mark_delivered(long msg_id) {
-   char m_start[32];
-   char m_end[32];
-   snprintf(m_start, sizeof(m_start), "ms_%ld", msg_id);
-   snprintf(m_end, sizeof(m_end), "me_%ld", msg_id);
+    char m_start[32];
+    char m_end[32];
+    snprintf(m_start, sizeof(m_start), "ms_%ld", msg_id);
+    snprintf(m_end, sizeof(m_end), "me_%ld", msg_id);
 
-
-   for (int i = 0; i < MAX_DIALOGS; i++) {
-       if (!g_dialogs[i].used || g_dialogs[i].buf == NULL) {
-           continue;
-       }
-       GtkTextMark *ms = gtk_text_buffer_get_mark(g_dialogs[i].buf, m_start);
-       GtkTextMark *me = gtk_text_buffer_get_mark(g_dialogs[i].buf, m_end);
-       if (ms != NULL && me != NULL) {
-           GtkTextIter s;
-           GtkTextIter e;
-           gtk_text_buffer_get_iter_at_mark(g_dialogs[i].buf, &s, ms);
-           gtk_text_buffer_get_iter_at_mark(g_dialogs[i].buf, &e, me);
-           gtk_text_buffer_delete(g_dialogs[i].buf, &s, &e);
-           gtk_text_buffer_insert_with_tags_by_name(g_dialogs[i].buf, &s, " ✓✓", -1, "ack", NULL);
-           gtk_text_buffer_delete_mark(g_dialogs[i].buf, ms);
-           gtk_text_buffer_delete_mark(g_dialogs[i].buf, me);
-           return;
-       }
-   }
+    for (int i = 0; i < MAX_DIALOGS; i++) {
+        if (!g_dialogs[i].used || g_dialogs[i].buf == NULL) {
+            continue;
+        }
+        GtkTextMark *ms = gtk_text_buffer_get_mark(g_dialogs[i].buf, m_start);
+        GtkTextMark *me = gtk_text_buffer_get_mark(g_dialogs[i].buf, m_end);
+        if (ms != NULL && me != NULL) {
+            GtkTextIter s;
+            GtkTextIter e;
+            gtk_text_buffer_get_iter_at_mark(g_dialogs[i].buf, &s, ms);
+            gtk_text_buffer_get_iter_at_mark(g_dialogs[i].buf, &e, me);
+            gtk_text_buffer_delete(g_dialogs[i].buf, &s, &e);
+            gtk_text_buffer_insert_with_tags_by_name(g_dialogs[i].buf, &s, " ✓✓", -1, "ack", NULL);
+            gtk_text_buffer_delete_mark(g_dialogs[i].buf, ms);
+            gtk_text_buffer_delete_mark(g_dialogs[i].buf, me);
+            return;
+        }
+    }
 }
-
 
 static void ui_update_chat_header(void) {
-   if (w_chat_header == NULL) {
-       return;
-   }
+    if (w_chat_header == NULL) {
+        return;
+    }
 
+    if (g_active_peer[0] == '\0') {
+        gtk_label_set_text(GTK_LABEL(w_chat_header), "★ System");
+        if (w_leave_btn != NULL) {
+            gtk_widget_set_visible(w_leave_btn, FALSE);
+        }
+        return;
+    }
 
-   if (g_active_peer[0] == '\0') {
-       gtk_label_set_text(GTK_LABEL(w_chat_header), "★ System");
-       if (w_leave_btn != NULL) {
-           gtk_widget_set_visible(w_leave_btn, FALSE);
-       }
-       return;
-   }
-
-
-   char header[MAX_NAME + 64];
-   if (g_active_is_room) {
-       struct dialog_entry *d = find_dialog(g_active_peer, 1);
-       int members = (d != NULL && d->member_count > 0) ? d->member_count : 1;
-       snprintf(header, sizeof(header), "#%s (%d %s)", g_active_peer, members, members == 1 ? "member" : "members");
-       gtk_label_set_text(GTK_LABEL(w_chat_header), header);
-       if (w_leave_btn != NULL) {
-           gtk_widget_set_visible(w_leave_btn, (d != NULL && d->joined) ? TRUE : FALSE);
-       }
-   } else {
-       int online = is_user_online(g_active_peer);
-       snprintf(header, sizeof(header), "Chat with %s (%s)", g_active_peer, online ? "online" : "offline");
-       gtk_label_set_text(GTK_LABEL(w_chat_header), header);
-       if (w_leave_btn != NULL) {
-           gtk_widget_set_visible(w_leave_btn, FALSE);
-       }
-   }
+    char header[MAX_NAME + 64];
+    if (g_active_is_room) {
+        struct dialog_entry *d = find_dialog(g_active_peer, 1);
+        int members = (d != NULL && d->member_count > 0) ? d->member_count : 1;
+        snprintf(header, sizeof(header), "#%s (%d %s)", g_active_peer, members, members == 1 ? "member" : "members");
+        gtk_label_set_text(GTK_LABEL(w_chat_header), header);
+        if (w_leave_btn != NULL) {
+            gtk_widget_set_visible(w_leave_btn, (d != NULL && d->joined) ? TRUE : FALSE);
+        }
+    } else {
+        int online = is_user_online(g_active_peer);
+        snprintf(header, sizeof(header), "Chat with %s (%s)", g_active_peer, online ? "online" : "offline");
+        gtk_label_set_text(GTK_LABEL(w_chat_header), header);
+        if (w_leave_btn != NULL) {
+            gtk_widget_set_visible(w_leave_btn, FALSE);
+        }
+    }
 }
-
 
 static void ui_update_tab_labels(void) {
-   if (w_tab_users == NULL || w_tab_rooms == NULL) {
-       return;
-   }
+    if (w_tab_users == NULL || w_tab_rooms == NULL) {
+        return;
+    }
 
+    int unread_users = 0;
+    int unread_rooms = 0;
+    for (int i = 0; i < MAX_DIALOGS; i++) {
+        if (!g_dialogs[i].used || g_dialogs[i].unread <= 0) {
+            continue;
+        }
+        if (g_dialogs[i].is_room) {
+            unread_rooms += g_dialogs[i].unread;
+        } else {
+            unread_users += g_dialogs[i].unread;
+        }
+    }
 
-   int unread_users = 0;
-   int unread_rooms = 0;
-   for (int i = 0; i < MAX_DIALOGS; i++) {
-       if (!g_dialogs[i].used || g_dialogs[i].unread <= 0) {
-           continue;
-       }
-       if (g_dialogs[i].is_room) {
-           unread_rooms += g_dialogs[i].unread;
-       } else {
-           unread_users += g_dialogs[i].unread;
-       }
-   }
+    char u_lbl[32];
+    char r_lbl[32];
+    if (unread_users > 0) {
+        snprintf(u_lbl, sizeof(u_lbl), "Users (%d)", unread_users);
+    } else {
+        snprintf(u_lbl, sizeof(u_lbl), "Users");
+    }
+    if (unread_rooms > 0) {
+        snprintf(r_lbl, sizeof(r_lbl), "Rooms (%d)", unread_rooms);
+    } else {
+        snprintf(r_lbl, sizeof(r_lbl), "Rooms");
+    }
 
-
-   char u_lbl[32];
-   char r_lbl[32];
-   if (unread_users > 0) {
-       snprintf(u_lbl, sizeof(u_lbl), "Users (%d)", unread_users);
-   } else {
-       snprintf(u_lbl, sizeof(u_lbl), "Users");
-   }
-   if (unread_rooms > 0) {
-       snprintf(r_lbl, sizeof(r_lbl), "Rooms (%d)", unread_rooms);
-   } else {
-       snprintf(r_lbl, sizeof(r_lbl), "Rooms");
-   }
-
-
-   gtk_button_set_label(GTK_BUTTON(w_tab_users), u_lbl);
-   gtk_button_set_label(GTK_BUTTON(w_tab_rooms), r_lbl);
+    gtk_button_set_label(GTK_BUTTON(w_tab_users), u_lbl);
+    gtk_button_set_label(GTK_BUTTON(w_tab_rooms), r_lbl);
 }
-
 
 static void ui_select_sidebar_tab(const char *tab_name) {
-   if (w_sidebar_stack == NULL || w_tab_users == NULL || w_tab_rooms == NULL) {
-       return;
-   }
-   gtk_stack_set_visible_child_name(GTK_STACK(w_sidebar_stack), tab_name);
+    if (w_sidebar_stack == NULL || w_tab_users == NULL || w_tab_rooms == NULL) {
+        return;
+    }
+    gtk_stack_set_visible_child_name(GTK_STACK(w_sidebar_stack), tab_name);
 
-
-   GtkStyleContext *ctx_u = gtk_widget_get_style_context(w_tab_users);
-   GtkStyleContext *ctx_r = gtk_widget_get_style_context(w_tab_rooms);
-   if (strcmp(tab_name, "rooms") == 0) {
-       gtk_style_context_remove_class(ctx_u, "tab-active");
-       gtk_style_context_add_class(ctx_r, "tab-active");
-   } else {
-       gtk_style_context_add_class(ctx_u, "tab-active");
-       gtk_style_context_remove_class(ctx_r, "tab-active");
-   }
+    GtkStyleContext *ctx_u = gtk_widget_get_style_context(w_tab_users);
+    GtkStyleContext *ctx_r = gtk_widget_get_style_context(w_tab_rooms);
+    if (strcmp(tab_name, "rooms") == 0) {
+        gtk_style_context_remove_class(ctx_u, "tab-active");
+        gtk_style_context_add_class(ctx_r, "tab-active");
+    } else {
+        gtk_style_context_add_class(ctx_u, "tab-active");
+        gtk_style_context_remove_class(ctx_r, "tab-active");
+    }
 }
-
 
 static int g_sidebar_rebuild_pending = 0;
 
-
 static gboolean ui_deferred_sidebar_rebuild(gpointer data) {
-   (void)data;
-   g_sidebar_rebuild_pending = 0;
-   if (!g_running) {
-       return G_SOURCE_REMOVE;
-   }
-   ui_rebuild_users_list();
-   ui_rebuild_rooms_list();
-   ui_update_tab_labels();
-   return G_SOURCE_REMOVE;
+    (void)data;
+    g_sidebar_rebuild_pending = 0;
+    if (!g_running) {
+        return G_SOURCE_REMOVE;
+    }
+    ui_rebuild_users_list();
+    ui_rebuild_rooms_list();
+    ui_update_tab_labels();
+    return G_SOURCE_REMOVE;
 }
-
 
 static void ui_schedule_sidebar_rebuild(void) {
-   if (!g_sidebar_rebuild_pending) {
-       g_sidebar_rebuild_pending = 1;
-       g_idle_add(ui_deferred_sidebar_rebuild, NULL);
-   }
+    if (!g_sidebar_rebuild_pending) {
+        g_sidebar_rebuild_pending = 1;
+        g_idle_add(ui_deferred_sidebar_rebuild, NULL);
+    }
 }
-
 
 static void ui_switch_dialog(const char *peer, int is_room, int set_target) {
-   if (w_chat_view == NULL) {
-       return;
-   }
+    if (w_chat_view == NULL) {
+        return;
+    }
 
+    if (peer == NULL || peer[0] == '\0') {
+        g_active_peer[0] = '\0';
+        g_active_is_room = 0;
+        gtk_text_view_set_buffer(GTK_TEXT_VIEW(w_chat_view), g_sys_buf);
+        ui_scroll_if_active(g_sys_buf);
+        ui_update_chat_header();
+        return;
+    }
 
-   if (peer == NULL || peer[0] == '\0') {
-       g_active_peer[0] = '\0';
-       g_active_is_room = 0;
-       gtk_text_view_set_buffer(GTK_TEXT_VIEW(w_chat_view), g_sys_buf);
-       ui_scroll_if_active(g_sys_buf);
-       ui_update_chat_header();
-       return;
-   }
+    struct dialog_entry *d = get_or_create_dialog(peer, is_room);
+    if (d == NULL) {
+        return;
+    }
 
+    snprintf(g_active_peer, sizeof(g_active_peer), "%.*s", MAX_NAME - 1, d->peer);
+    g_active_is_room = is_room;
+    d->unread = 0;
+    flush_dialog_acks(d);
 
-   struct dialog_entry *d = get_or_create_dialog(peer, is_room);
-   if (d == NULL) {
-       return;
-   }
+    gtk_text_view_set_buffer(GTK_TEXT_VIEW(w_chat_view), d->buf);
+    ui_scroll_if_active(d->buf);
+    ui_update_chat_header();
 
+    if (set_target && w_target_entry != NULL) {
+        if (is_room) {
+            char room_target[MAX_NAME + 2];
+            snprintf(room_target, sizeof(room_target), "#%s", d->peer);
+            gtk_entry_set_text(GTK_ENTRY(w_target_entry), room_target);
+        } else {
+            gtk_entry_set_text(GTK_ENTRY(w_target_entry), d->peer);
+        }
+    }
 
-   snprintf(g_active_peer, sizeof(g_active_peer), "%.*s", MAX_NAME - 1, d->peer);
-   g_active_is_room = is_room;
-   d->unread = 0;
-   flush_dialog_acks(d);
-
-
-   gtk_text_view_set_buffer(GTK_TEXT_VIEW(w_chat_view), d->buf);
-   ui_scroll_if_active(d->buf);
-   ui_update_chat_header();
-
-
-   if (set_target && w_target_entry != NULL) {
-       if (is_room) {
-           char room_target[MAX_NAME + 2];
-           snprintf(room_target, sizeof(room_target), "#%s", d->peer);
-           gtk_entry_set_text(GTK_ENTRY(w_target_entry), room_target);
-       } else {
-           gtk_entry_set_text(GTK_ENTRY(w_target_entry), d->peer);
-       }
-   }
-
-
-   ui_schedule_sidebar_rebuild();
+    ui_schedule_sidebar_rebuild();
 }
-
 
 static void destroy_row_cb(GtkWidget *widget, gpointer data) {
-   (void)data;
-   gtk_widget_destroy(widget);
+    (void)data;
+    gtk_widget_destroy(widget);
 }
-
 
 static GtkWidget *make_sidebar_row(const char *markup_text, const char *key, const char *value) {
-   GtkWidget *row = gtk_list_box_row_new();
-   GtkWidget *lbl = gtk_label_new(NULL);
-   gtk_label_set_markup(GTK_LABEL(lbl), markup_text);
-   gtk_widget_set_halign(lbl, GTK_ALIGN_START);
-   gtk_widget_set_margin_top(lbl, 4);
-   gtk_widget_set_margin_bottom(lbl, 4);
-   gtk_widget_set_margin_start(lbl, 8);
-   gtk_widget_set_margin_end(lbl, 8);
-   gtk_container_add(GTK_CONTAINER(row), lbl);
-   g_object_set_data_full(G_OBJECT(row), key, g_strdup(value), g_free);
-   return row;
+    GtkWidget *row = gtk_list_box_row_new();
+    GtkWidget *lbl = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(lbl), markup_text);
+    gtk_widget_set_halign(lbl, GTK_ALIGN_START);
+    gtk_widget_set_margin_top(lbl, 4);
+    gtk_widget_set_margin_bottom(lbl, 4);
+    gtk_widget_set_margin_start(lbl, 8);
+    gtk_widget_set_margin_end(lbl, 8);
+    gtk_container_add(GTK_CONTAINER(row), lbl);
+    g_object_set_data_full(G_OBJECT(row), key, g_strdup(value), g_free);
+    return row;
 }
-
 
 static void ui_rebuild_users_list(void) {
-   if (w_users_list == NULL || w_users_lbl == NULL) {
-       return;
-   }
+    if (w_users_list == NULL || w_users_lbl == NULL) {
+        return;
+    }
 
+    const struct ui_theme *t = current_theme();
 
-   char cur_name[MAX_NAME];
-   pthread_mutex_lock(&g_mtx);
-   snprintf(cur_name, sizeof(cur_name), "%.*s", MAX_NAME - 1, g_my_name);
-   pthread_mutex_unlock(&g_mtx);
+    char cur_name[MAX_NAME];
+    pthread_mutex_lock(&g_mtx);
+    snprintf(cur_name, sizeof(cur_name), "%.*s", MAX_NAME - 1, g_my_name);
+    pthread_mutex_unlock(&g_mtx);
 
+    int other_online = 0;
+    for (int i = 0; i < g_online_count; i++) {
+        if (cur_name[0] != '\0' && strcmp(g_online_users[i], cur_name) == 0) {
+            continue;
+        }
+        other_online++;
+    }
 
-   int other_online = 0;
-   for (int i = 0; i < g_online_count; i++) {
-       if (cur_name[0] != '\0' && strcmp(g_online_users[i], cur_name) == 0) {
-           continue;
-       }
-       other_online++;
-   }
+    char header[64];
+    snprintf(header, sizeof(header), "Online (%d)", other_online);
+    gtk_label_set_text(GTK_LABEL(w_users_lbl), header);
 
+    g_suppress_select = 1;
+    gtk_container_foreach(GTK_CONTAINER(w_users_list), destroy_row_cb, NULL);
 
-   char header[64];
-   snprintf(header, sizeof(header), "Online (%d)", other_online);
-   gtk_label_set_text(GTK_LABEL(w_users_lbl), header);
+    char sys_markup[128];
+    snprintf(sys_markup, sizeof(sys_markup), "<span foreground='%s'>★</span> System", t->sys);
+    GtkWidget *sys_row = make_sidebar_row(sys_markup, "username", "");
+    gtk_list_box_insert(GTK_LIST_BOX(w_users_list), sys_row, -1);
+    GtkListBoxRow *row_to_select = (!g_active_is_room && g_active_peer[0] == '\0') ? GTK_LIST_BOX_ROW(sys_row) : NULL;
 
+    for (int i = 0; i < g_online_count; i++) {
+        const char *uname = g_online_users[i];
+        if (cur_name[0] != '\0' && strcmp(uname, cur_name) == 0) {
+            continue;
+        }
+        struct dialog_entry *d = find_dialog(uname, 0);
+        char *esc = g_markup_escape_text(uname, -1);
+        char label_text[MAX_NAME * 6 + 160];
 
-   g_suppress_select = 1;
-   gtk_container_foreach(GTK_CONTAINER(w_users_list), destroy_row_cb, NULL);
+        if (d != NULL && d->unread > 0) {
+            snprintf(label_text, sizeof(label_text),
+                     "<span foreground='%s'>●</span> <span foreground='%s' weight='bold'>%s (%d)</span>",
+                     t->online, t->unread, esc, d->unread);
+        } else {
+            snprintf(label_text, sizeof(label_text),
+                     "<span foreground='%s'>●</span> %s", t->online, esc);
+        }
+        g_free(esc);
 
+        GtkWidget *row = make_sidebar_row(label_text, "username", uname);
+        gtk_list_box_insert(GTK_LIST_BOX(w_users_list), row, -1);
+        if (!g_active_is_room && strcmp(g_active_peer, uname) == 0) {
+            row_to_select = GTK_LIST_BOX_ROW(row);
+        }
+    }
 
-   GtkWidget *sys_row = make_sidebar_row("<span foreground='#94e2d5'>★</span> System", "username", "");
-   gtk_list_box_insert(GTK_LIST_BOX(w_users_list), sys_row, -1);
-   GtkListBoxRow *row_to_select = (!g_active_is_room && g_active_peer[0] == '\0') ? GTK_LIST_BOX_ROW(sys_row) : NULL;
+    for (int i = 0; i < MAX_DIALOGS; i++) {
+        if (!g_dialogs[i].used || g_dialogs[i].is_room) {
+            continue;
+        }
+        if (is_user_online(g_dialogs[i].peer)) {
+            continue;
+        }
+        char *esc = g_markup_escape_text(g_dialogs[i].peer, -1);
+        char label_text[MAX_NAME * 6 + 160];
+        if (g_dialogs[i].unread > 0) {
+            snprintf(label_text, sizeof(label_text),
+                     "<span foreground='%s'>○</span> <span foreground='%s' weight='bold'>%s (%d)</span>",
+                     t->muted, t->unread, esc, g_dialogs[i].unread);
+        } else {
+            snprintf(label_text, sizeof(label_text),
+                     "<span foreground='%s'>○ %s</span>", t->muted, esc);
+        }
+        g_free(esc);
 
+        GtkWidget *row = make_sidebar_row(label_text, "username", g_dialogs[i].peer);
+        gtk_list_box_insert(GTK_LIST_BOX(w_users_list), row, -1);
+        if (!g_active_is_room && strcmp(g_active_peer, g_dialogs[i].peer) == 0) {
+            row_to_select = GTK_LIST_BOX_ROW(row);
+        }
+    }
 
-   for (int i = 0; i < g_online_count; i++) {
-       const char *uname = g_online_users[i];
-       if (cur_name[0] != '\0' && strcmp(uname, cur_name) == 0) {
-           continue;
-       }
-       struct dialog_entry *d = find_dialog(uname, 0);
-       char *esc = g_markup_escape_text(uname, -1);
-       char label_text[MAX_NAME * 6 + 128];
-
-
-       if (d != NULL && d->unread > 0) {
-           snprintf(label_text, sizeof(label_text),
-                    "<span foreground='#a6e3a1'>●</span> <span foreground='#f9e2af' weight='bold'>%s (%d)</span>",
-                    esc, d->unread);
-       } else {
-           snprintf(label_text, sizeof(label_text),
-                    "<span foreground='#a6e3a1'>●</span> %s", esc);
-       }
-       g_free(esc);
-
-
-       GtkWidget *row = make_sidebar_row(label_text, "username", uname);
-   gtk_list_box_insert(GTK_LIST_BOX(w_users_list), row, -1);
-   if (!g_active_is_room && strcmp(g_active_peer, uname) == 0) {
-       row_to_select = GTK_LIST_BOX_ROW(row);
-   }
+    gtk_widget_show_all(w_users_list);
+    if (row_to_select != NULL) {
+        gtk_list_box_select_row(GTK_LIST_BOX(w_users_list), row_to_select);
+    } else {
+        gtk_list_box_unselect_all(GTK_LIST_BOX(w_users_list));
+    }
+    g_suppress_select = 0;
 }
-
-
-   for (int i = 0; i < MAX_DIALOGS; i++) {
-       if (!g_dialogs[i].used || g_dialogs[i].is_room) {
-           continue;
-       }
-       if (is_user_online(g_dialogs[i].peer)) {
-           continue;
-       }
-       char *esc = g_markup_escape_text(g_dialogs[i].peer, -1);
-       char label_text[MAX_NAME * 6 + 128];
-       if (g_dialogs[i].unread > 0) {
-           snprintf(label_text, sizeof(label_text),
-                    "<span foreground='#7f849c'>○</span> <span foreground='#f9e2af' weight='bold'>%s (%d)</span>",
-                    esc, g_dialogs[i].unread);
-       } else {
-           snprintf(label_text, sizeof(label_text),
-                    "<span foreground='#7f849c'>○ %s</span>", esc);
-       }
-       g_free(esc);
-
-
-       GtkWidget *row = make_sidebar_row(label_text, "username", g_dialogs[i].peer);
-       gtk_list_box_insert(GTK_LIST_BOX(w_users_list), row, -1);
-       if (!g_active_is_room && strcmp(g_active_peer, g_dialogs[i].peer) == 0) {
-           row_to_select = GTK_LIST_BOX_ROW(row);
-       }
-   }
-
-
-   gtk_widget_show_all(w_users_list);
-   if (row_to_select != NULL) {
-       gtk_list_box_select_row(GTK_LIST_BOX(w_users_list), row_to_select);
-   } else {
-       gtk_list_box_unselect_all(GTK_LIST_BOX(w_users_list));
-   }
-   g_suppress_select = 0;
-}
-
 
 static void ui_rebuild_rooms_list(void) {
-   if (w_rooms_list == NULL || w_rooms_lbl == NULL) {
-       return;
-   }
+    if (w_rooms_list == NULL || w_rooms_lbl == NULL) {
+        return;
+    }
 
+    const struct ui_theme *t = current_theme();
 
-   char header[64];
-   snprintf(header, sizeof(header), "Active rooms (%d)", g_rooms_cache_count);
-   gtk_label_set_text(GTK_LABEL(w_rooms_lbl), header);
+    char header[64];
+    snprintf(header, sizeof(header), "Active rooms (%d)", g_rooms_cache_count);
+    gtk_label_set_text(GTK_LABEL(w_rooms_lbl), header);
 
+    g_suppress_select = 1;
+    gtk_container_foreach(GTK_CONTAINER(w_rooms_list), destroy_row_cb, NULL);
 
-   g_suppress_select = 1;
-   gtk_container_foreach(GTK_CONTAINER(w_rooms_list), destroy_row_cb, NULL);
+    GtkListBoxRow *row_to_select = NULL;
 
+    for (int i = 0; i < g_rooms_cache_count; i++) {
+        const char *rname = g_rooms_cache[i].name;
+        int joined = g_rooms_cache[i].joined;
+        int members = g_rooms_cache[i].members;
+        struct dialog_entry *d = find_dialog(rname, 1);
+        char *esc = g_markup_escape_text(rname, -1);
+        char label_text[MAX_NAME * 6 + 160];
 
-   GtkListBoxRow *row_to_select = NULL;
+        if (joined) {
+            if (d != NULL && d->unread > 0) {
+                snprintf(label_text, sizeof(label_text),
+                         "<span foreground='%s' weight='bold'>#%s (%d) [%d]</span>",
+                         t->unread, esc, members, d->unread);
+            } else {
+                snprintf(label_text, sizeof(label_text),
+                         "<span foreground='%s'>#</span>%s <span foreground='%s'>(%d)</span>",
+                         t->online, esc, t->muted, members);
+            }
+        } else {
+            snprintf(label_text, sizeof(label_text),
+                     "<span foreground='%s'>+ #%s (%d)</span>", t->muted, esc, members);
+        }
+        g_free(esc);
 
+        GtkWidget *row = make_sidebar_row(label_text, "roomname", rname);
+        g_object_set_data(G_OBJECT(row), "joined", GINT_TO_POINTER(joined));
+        gtk_list_box_insert(GTK_LIST_BOX(w_rooms_list), row, -1);
 
-   for (int i = 0; i < g_rooms_cache_count; i++) {
-       const char *rname = g_rooms_cache[i].name;
-       int joined = g_rooms_cache[i].joined;
-       int members = g_rooms_cache[i].members;
-       struct dialog_entry *d = find_dialog(rname, 1);
-       char *esc = g_markup_escape_text(rname, -1);
-       char label_text[MAX_NAME * 6 + 128];
+        if (g_active_is_room && strcmp(g_active_peer, rname) == 0) {
+            row_to_select = GTK_LIST_BOX_ROW(row);
+        }
+    }
 
-
-       if (joined) {
-           if (d != NULL && d->unread > 0) {
-               snprintf(label_text, sizeof(label_text),
-                        "<span foreground='#f9e2af' weight='bold'>#%s (%d) [%d]</span>",
-                        esc, members, d->unread);
-           } else {
-               snprintf(label_text, sizeof(label_text),
-                        "<span foreground='#a6e3a1'>#</span>%s <span foreground='#7f849c'>(%d)</span>",
-                        esc, members);
-           }
-       } else {
-           snprintf(label_text, sizeof(label_text),
-                    "<span foreground='#7f849c'>+ #%s (%d)</span>", esc, members);
-       }
-       g_free(esc);
-
-
-       GtkWidget *row = make_sidebar_row(label_text, "roomname", rname);
-       g_object_set_data(G_OBJECT(row), "joined", GINT_TO_POINTER(joined));
-       gtk_list_box_insert(GTK_LIST_BOX(w_rooms_list), row, -1);
-
-
-       if (g_active_is_room && strcmp(g_active_peer, rname) == 0) {
-           row_to_select = GTK_LIST_BOX_ROW(row);
-       }
-   }
-
-
-   gtk_widget_show_all(w_rooms_list);
-   if (row_to_select != NULL) {
-       gtk_list_box_select_row(GTK_LIST_BOX(w_rooms_list), row_to_select);
-   } else {
-       gtk_list_box_unselect_all(GTK_LIST_BOX(w_rooms_list));
-   }
-   g_suppress_select = 0;
+    gtk_widget_show_all(w_rooms_list);
+    if (row_to_select != NULL) {
+        gtk_list_box_select_row(GTK_LIST_BOX(w_rooms_list), row_to_select);
+    } else {
+        gtk_list_box_unselect_all(GTK_LIST_BOX(w_rooms_list));
+    }
+    g_suppress_select = 0;
 }
-
 
 static void ui_update_users_list(long count, const char *list_text) {
-   (void)count;
-   g_online_count = 0;
+    (void)count;
+    g_online_count = 0;
 
+    char cur_name[MAX_NAME];
+    pthread_mutex_lock(&g_mtx);
+    snprintf(cur_name, sizeof(cur_name), "%.*s", MAX_NAME - 1, g_my_name);
+    pthread_mutex_unlock(&g_mtx);
 
-   char cur_name[MAX_NAME];
-   pthread_mutex_lock(&g_mtx);
-   snprintf(cur_name, sizeof(cur_name), "%.*s", MAX_NAME - 1, g_my_name);
-   pthread_mutex_unlock(&g_mtx);
+    if (list_text != NULL && list_text[0] != '\0') {
+        char copy[MAX_TEXT];
+        snprintf(copy, sizeof(copy), "%.*s", MAX_TEXT - 1, list_text);
+        char *saveptr = NULL;
+        char *tok = strtok_r(copy, ",", &saveptr);
+        while (tok != NULL && g_online_count < MAX_CLIENTS) {
+            while (*tok == ' ') {
+                tok++;
+            }
+            if (*tok != '\0') {
+                snprintf(g_online_users[g_online_count], MAX_NAME, "%.*s", MAX_NAME - 1, tok);
+                g_online_count++;
+                if (cur_name[0] != '\0' && strcmp(tok, cur_name) != 0) {
+                    get_or_create_dialog(tok, 0);
+                }
+            }
+            tok = strtok_r(NULL, ",", &saveptr);
+        }
+    }
 
+    for (int i = 0; i < MAX_DIALOGS; i++) {
+        if (g_dialogs[i].used && !g_dialogs[i].is_room) {
+            g_dialogs[i].online = is_user_online(g_dialogs[i].peer);
+        }
+    }
 
-   if (list_text != NULL && list_text[0] != '\0') {
-       char copy[MAX_TEXT];
-       snprintf(copy, sizeof(copy), "%.*s", MAX_TEXT - 1, list_text);
-       char *saveptr = NULL;
-       char *tok = strtok_r(copy, ",", &saveptr);
-       while (tok != NULL && g_online_count < MAX_CLIENTS) {
-           while (*tok == ' ') {
-               tok++;
-           }
-           if (*tok != '\0') {
-               snprintf(g_online_users[g_online_count], MAX_NAME, "%.*s", MAX_NAME - 1, tok);
-               g_online_count++;
-               if (cur_name[0] != '\0' && strcmp(tok, cur_name) != 0) {
-                   get_or_create_dialog(tok, 0);
-               }
-           }
-           tok = strtok_r(NULL, ",", &saveptr);
-       }
-   }
-
-
-   for (int i = 0; i < MAX_DIALOGS; i++) {
-       if (g_dialogs[i].used && !g_dialogs[i].is_room) {
-           g_dialogs[i].online = is_user_online(g_dialogs[i].peer);
-       }
-   }
-
-
-   ui_rebuild_users_list();
-   ui_update_chat_header();
-   ui_update_tab_labels();
+    ui_rebuild_users_list();
+    ui_update_chat_header();
+    ui_update_tab_labels();
 }
-
 
 static void ui_update_rooms_list(long count, const char *list_text) {
-   (void)count;
-   g_rooms_cache_count = 0;
+    (void)count;
+    g_rooms_cache_count = 0;
 
+    for (int i = 0; i < MAX_DIALOGS; i++) {
+        if (g_dialogs[i].used && g_dialogs[i].is_room) {
+            g_dialogs[i].joined = 0;
+            g_dialogs[i].member_count = 0;
+        }
+    }
 
-   for (int i = 0; i < MAX_DIALOGS; i++) {
-       if (g_dialogs[i].used && g_dialogs[i].is_room) {
-           g_dialogs[i].joined = 0;
-           g_dialogs[i].member_count = 0;
-       }
-   }
+    if (list_text != NULL && list_text[0] != '\0') {
+        char copy[MAX_TEXT];
+        snprintf(copy, sizeof(copy), "%.*s", MAX_TEXT - 1, list_text);
+        char *saveptr = NULL;
+        char *tok = strtok_r(copy, ",", &saveptr);
+        while (tok != NULL && g_rooms_cache_count < MAX_ROOMS) {
+            while (*tok == ' ') {
+                tok++;
+            }
+            if (*tok != '\0') {
+                int joined = 0;
+                if (*tok == '*') {
+                    joined = 1;
+                    tok++;
+                }
+                int members = 0;
+                char *lp = strrchr(tok, '(');
+                if (lp != NULL) {
+                    members = atoi(lp + 1);
+                    *lp = '\0';
+                }
+                if (*tok != '\0') {
+                    struct room_list_item *item = &g_rooms_cache[g_rooms_cache_count++];
+                    snprintf(item->name, sizeof(item->name), "%.*s", MAX_NAME - 1, tok);
+                    item->joined = joined;
+                    item->members = members;
 
+                    struct dialog_entry *d = find_dialog(item->name, 1);
+                    if (d != NULL) {
+                        d->joined = joined;
+                        d->member_count = members;
+                    }
+                }
+            }
+            tok = strtok_r(NULL, ",", &saveptr);
+        }
+    }
 
-   if (list_text != NULL && list_text[0] != '\0') {
-       char copy[MAX_TEXT];
-       snprintf(copy, sizeof(copy), "%.*s", MAX_TEXT - 1, list_text);
-       char *saveptr = NULL;
-       char *tok = strtok_r(copy, ",", &saveptr);
-       while (tok != NULL && g_rooms_cache_count < MAX_ROOMS) {
-           while (*tok == ' ') {
-               tok++;
-           }
-           if (*tok != '\0') {
-               int joined = 0;
-               if (*tok == '*') {
-                   joined = 1;
-                   tok++;
-               }
-               int members = 0;
-               char *lp = strrchr(tok, '(');
-               if (lp != NULL) {
-                   members = atoi(lp + 1);
-                   *lp = '\0';
-               }
-               if (*tok != '\0') {
-                   struct room_list_item *item = &g_rooms_cache[g_rooms_cache_count++];
-                   snprintf(item->name, sizeof(item->name), "%.*s", MAX_NAME - 1, tok);
-                   item->joined = joined;
-                   item->members = members;
-
-
-                   struct dialog_entry *d = find_dialog(item->name, 1);
-                   if (d != NULL) {
-                       d->joined = joined;
-                       d->member_count = members;
-                   }
-               }
-           }
-           tok = strtok_r(NULL, ",", &saveptr);
-       }
-   }
-
-
-   ui_rebuild_rooms_list();
-   ui_update_chat_header();
-   ui_update_tab_labels();
+    ui_rebuild_rooms_list();
+    ui_update_chat_header();
+    ui_update_tab_labels();
 }
-
 
 static void clear_all_dialogs(void) {
-   ui_switch_dialog("", 0, 0);
-   for (int i = 0; i < MAX_DIALOGS; i++) {
-       if (g_dialogs[i].used) {
-           if (g_dialogs[i].buf != NULL) {
-               g_object_unref(g_dialogs[i].buf);
-           }
-           memset(&g_dialogs[i], 0, sizeof(g_dialogs[i]));
-       }
-   }
+    ui_switch_dialog("", 0, 0);
+    for (int i = 0; i < MAX_DIALOGS; i++) {
+        if (g_dialogs[i].used) {
+            if (g_dialogs[i].buf != NULL) {
+                g_object_unref(g_dialogs[i].buf);
+            }
+            memset(&g_dialogs[i], 0, sizeof(g_dialogs[i]));
+        }
+    }
 }
-
 
 static int do_join_room(const char *raw_name) {
-   pthread_mutex_lock(&g_mtx);
-   long cur_id = g_my_id;
-   pthread_mutex_unlock(&g_mtx);
+    pthread_mutex_lock(&g_mtx);
+    long cur_id = g_my_id;
+    pthread_mutex_unlock(&g_mtx);
 
+    if (cur_id <= 0) {
+        ui_append_error("Register first.");
+        return 0;
+    }
 
-   if (cur_id <= 0) {
-       ui_append_error("Register first.");
-       return 0;
-   }
+    if (raw_name == NULL) {
+        return 0;
+    }
+    while (*raw_name == ' ' || *raw_name == '#') {
+        raw_name++;
+    }
+    if (raw_name[0] == '\0' || strchr(raw_name, '#') != NULL ||
+        strchr(raw_name, ',') != NULL || strchr(raw_name, ' ') != NULL ||
+        strlen(raw_name) >= MAX_NAME - 1) {
+        ui_append_error("Invalid room name (no spaces, '#' or ',').");
+        return 0;
+    }
 
+    struct qmsg req;
+    memset(&req, 0, sizeof(req));
+    req.mtype = ARBITER_TYPE;
+    req.cmd = CMD_ROOM_JOIN;
+    req.sender_id = cur_id;
+    req.reply_type = g_reply_type;
+    snprintf(req.name, sizeof(req.name), "%.*s", MAX_NAME - 2, raw_name);
 
-   if (raw_name == NULL) {
-       return 0;
-   }
-   while (*raw_name == ' ' || *raw_name == '#') {
-       raw_name++;
-   }
-   if (raw_name[0] == '\0' || strchr(raw_name, '#') != NULL ||
-       strchr(raw_name, ',') != NULL || strchr(raw_name, ' ') != NULL ||
-       strlen(raw_name) >= MAX_NAME - 1) {
-       ui_append_error("Invalid room name (no spaces, '#' or ',').");
-       return 0;
-   }
+    if (msgsnd(g_msqid, &req, MSG_SIZE, IPC_NOWAIT) < 0) {
+        ui_append_error(errno == EAGAIN
+            ? "Message queue is full, try again."
+            : "Failed to send room join request.");
+        return 0;
+    }
 
+    struct qmsg rep;
+    if (wait_reply(g_msqid, g_reply_type, &rep, 200) < 0) {
+        ui_append_error("No response from arbiter.");
+        return 0;
+    }
+    rep.text[MAX_TEXT - 1] = '\0';
 
-   struct qmsg req;
-   memset(&req, 0, sizeof(req));
-   req.mtype = ARBITER_TYPE;
-   req.cmd = CMD_ROOM_JOIN;
-   req.sender_id = cur_id;
-   req.reply_type = g_reply_type;
-   snprintf(req.name, sizeof(req.name), "%.*s", MAX_NAME - 2, raw_name);
+    if (rep.target_id > 0) {
+        struct dialog_entry *d = get_or_create_dialog(req.name, 1);
+        if (d != NULL) {
+            d->joined = 1;
+            d->member_count = (int)rep.target_id;
+            char note[MAX_TEXT + MAX_NAME + 16];
+            snprintf(note, sizeof(note), "* You %s #%s.", rep.text, req.name);
+            ui_append_line_to(d->buf, "sys", note, NULL);
+        }
+        g_who_force = 1;
+        ui_switch_dialog(req.name, 1, 1);
+        ui_select_sidebar_tab("rooms");
+        if (w_msg_entry != NULL) {
+            gtk_widget_grab_focus(w_msg_entry);
+        }
+        return 1;
+    }
 
-
-   if (msgsnd(g_msqid, &req, MSG_SIZE, IPC_NOWAIT) < 0) {
-       ui_append_error(errno == EAGAIN
-           ? "Message queue is full, try again."
-           : "Failed to send room join request.");
-       return 0;
-   }
-
-
-   struct qmsg rep;
-   if (wait_reply(g_msqid, g_reply_type, &rep, 200) < 0) {
-       ui_append_error("No response from arbiter.");
-       return 0;
-   }
-   rep.text[MAX_TEXT - 1] = '\0';
-
-
-   if (rep.target_id > 0) {
-       struct dialog_entry *d = get_or_create_dialog(req.name, 1);
-       if (d != NULL) {
-           d->joined = 1;
-           d->member_count = (int)rep.target_id;
-           char note[MAX_TEXT + MAX_NAME + 16];
-           snprintf(note, sizeof(note), "* You %s #%s.", rep.text, req.name);
-           ui_append_line_to(d->buf, "sys", note, NULL);
-       }
-       g_who_force = 1;
-       ui_switch_dialog(req.name, 1, 1);
-       ui_select_sidebar_tab("rooms");
-       if (w_msg_entry != NULL) {
-           gtk_widget_grab_focus(w_msg_entry);
-       }
-       return 1;
-   }
-
-
-   char err[MAX_TEXT + 32];
-   snprintf(err, sizeof(err), "Room error: %s", rep.text);
-   ui_append_error(err);
-   return 0;
+    char err[MAX_TEXT + 32];
+    snprintf(err, sizeof(err), "Room error: %s", rep.text);
+    ui_append_error(err);
+    return 0;
 }
-
 
 static void on_join_room_clicked(GtkWidget *widget, gpointer data) {
-   (void)widget;
-   (void)data;
-   if (w_room_entry == NULL) {
-       return;
-   }
-   const char *rname = gtk_entry_get_text(GTK_ENTRY(w_room_entry));
-   if (do_join_room(rname)) {
-       gtk_entry_set_text(GTK_ENTRY(w_room_entry), "");
-   }
+    (void)widget;
+    (void)data;
+    if (w_room_entry == NULL) {
+        return;
+    }
+    const char *rname = gtk_entry_get_text(GTK_ENTRY(w_room_entry));
+    if (do_join_room(rname)) {
+        gtk_entry_set_text(GTK_ENTRY(w_room_entry), "");
+    }
 }
-
 
 static void on_leave_room_clicked(GtkWidget *widget, gpointer data) {
-   (void)widget;
-   (void)data;
-   if (!g_active_is_room || g_active_peer[0] == '\0') {
-       return;
-   }
+    (void)widget;
+    (void)data;
+    if (!g_active_is_room || g_active_peer[0] == '\0') {
+        return;
+    }
 
+    pthread_mutex_lock(&g_mtx);
+    long cur_id = g_my_id;
+    pthread_mutex_unlock(&g_mtx);
 
-   pthread_mutex_lock(&g_mtx);
-   long cur_id = g_my_id;
-   pthread_mutex_unlock(&g_mtx);
+    if (cur_id <= 0) {
+        return;
+    }
 
+    char rname[MAX_NAME];
+    snprintf(rname, sizeof(rname), "%.*s", MAX_NAME - 1, g_active_peer);
 
-   if (cur_id <= 0) {
-       return;
-   }
+    struct qmsg req;
+    memset(&req, 0, sizeof(req));
+    req.mtype = ARBITER_TYPE;
+    req.cmd = CMD_ROOM_LEAVE;
+    req.sender_id = cur_id;
+    req.reply_type = g_reply_type;
+    snprintf(req.name, sizeof(req.name), "%.*s", MAX_NAME - 2, rname);
 
+    if (msgsnd(g_msqid, &req, MSG_SIZE, IPC_NOWAIT) < 0) {
+        ui_append_error(errno == EAGAIN
+            ? "Message queue is full, try again."
+            : "Failed to leave room.");
+        return;
+    }
 
-   char rname[MAX_NAME];
-   snprintf(rname, sizeof(rname), "%.*s", MAX_NAME - 1, g_active_peer);
+    struct qmsg rep;
+    if (wait_reply(g_msqid, g_reply_type, &rep, 200) < 0) {
+        ui_append_error("No response from arbiter.");
+        return;
+    }
+    rep.text[MAX_TEXT - 1] = '\0';
 
-
-   struct qmsg req;
-   memset(&req, 0, sizeof(req));
-   req.mtype = ARBITER_TYPE;
-   req.cmd = CMD_ROOM_LEAVE;
-   req.sender_id = cur_id;
-   req.reply_type = g_reply_type;
-   snprintf(req.name, sizeof(req.name), "%.*s", MAX_NAME - 2, rname);
-
-
-   if (msgsnd(g_msqid, &req, MSG_SIZE, IPC_NOWAIT) < 0) {
-       ui_append_error(errno == EAGAIN
-           ? "Message queue is full, try again."
-           : "Failed to leave room.");
-       return;
-   }
-
-
-   struct qmsg rep;
-   if (wait_reply(g_msqid, g_reply_type, &rep, 200) < 0) {
-       ui_append_error("No response from arbiter.");
-       return;
-   }
-   rep.text[MAX_TEXT - 1] = '\0';
-
-
-   if (rep.target_id > 0) {
-       struct dialog_entry *d = find_dialog(rname, 1);
-       if (d != NULL) {
-           d->joined = 0;
-           d->unread = 0;
-           d->pending_ack_count = 0;
-       }
-       char note[MAX_NAME + 32];
-       snprintf(note, sizeof(note), "Left #%s.", rname);
-       ui_append_sys("warn", note);
-       g_who_force = 1;
-       ui_switch_dialog("", 0, 0);
-       if (w_target_entry != NULL) {
-           gtk_entry_set_text(GTK_ENTRY(w_target_entry), "");
-       }
-   } else {
-       char err[MAX_TEXT + 32];
-       snprintf(err, sizeof(err), "Leave failed: %s", rep.text);
-       ui_append_error(err);
-   }
+    if (rep.target_id > 0) {
+        struct dialog_entry *d = find_dialog(rname, 1);
+        if (d != NULL) {
+            d->joined = 0;
+            d->unread = 0;
+            d->pending_ack_count = 0;
+        }
+        char note[MAX_NAME + 32];
+        snprintf(note, sizeof(note), "Left #%s.", rname);
+        ui_append_sys("warn", note);
+        g_who_force = 1;
+        ui_switch_dialog("", 0, 0);
+        if (w_target_entry != NULL) {
+            gtk_entry_set_text(GTK_ENTRY(w_target_entry), "");
+        }
+    } else {
+        char err[MAX_TEXT + 32];
+        snprintf(err, sizeof(err), "Leave failed: %s", rep.text);
+        ui_append_error(err);
+    }
 }
-
 
 static void on_user_row_selected(GtkListBox *box, GtkListBoxRow *row, gpointer data) {
-   (void)data;
-   if (g_suppress_select || row == NULL) {
-       return;
-   }
+    (void)data;
+    if (g_suppress_select || row == NULL) {
+        return;
+    }
 
+    const char *uname = g_object_get_data(G_OBJECT(row), "username");
+    if (uname == NULL) {
+        return;
+    }
 
-   const char *uname = g_object_get_data(G_OBJECT(row), "username");
-   if (uname == NULL) {
-       return;
-   }
+    if (uname[0] == '\0') {
+        ui_switch_dialog("", 0, 0);
+        return;
+    }
 
+    char cur_name[MAX_NAME];
+    pthread_mutex_lock(&g_mtx);
+    snprintf(cur_name, sizeof(cur_name), "%.*s", MAX_NAME - 1, g_my_name);
+    pthread_mutex_unlock(&g_mtx);
 
-   if (uname[0] == '\0') {
-       ui_switch_dialog("", 0, 0);
-       return;
-   }
+    if (strcmp(uname, cur_name) == 0) {
+        gtk_list_box_unselect_row(box, row);
+        return;
+    }
 
-
-   char cur_name[MAX_NAME];
-   pthread_mutex_lock(&g_mtx);
-   snprintf(cur_name, sizeof(cur_name), "%.*s", MAX_NAME - 1, g_my_name);
-   pthread_mutex_unlock(&g_mtx);
-
-
-   if (strcmp(uname, cur_name) == 0) {
-       gtk_list_box_unselect_row(box, row);
-       return;
-   }
-
-
-   ui_switch_dialog(uname, 0, 1);
-   if (w_msg_entry != NULL) {
-       gtk_widget_grab_focus(w_msg_entry);
-   }
+    ui_switch_dialog(uname, 0, 1);
+    if (w_msg_entry != NULL) {
+        gtk_widget_grab_focus(w_msg_entry);
+    }
 }
-
 
 static void on_room_row_selected(GtkListBox *box, GtkListBoxRow *row, gpointer data) {
-   (void)box;
-   (void)data;
-   if (g_suppress_select || row == NULL) {
-       return;
-   }
+    (void)box;
+    (void)data;
+    if (g_suppress_select || row == NULL) {
+        return;
+    }
 
+    const char *rname = g_object_get_data(G_OBJECT(row), "roomname");
+    if (rname == NULL || rname[0] == '\0') {
+        return;
+    }
 
-   const char *rname = g_object_get_data(G_OBJECT(row), "roomname");
-   if (rname == NULL || rname[0] == '\0') {
-       return;
-   }
+    int joined = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(row), "joined"));
+    if (!joined) {
+        do_join_room(rname);
+        return;
+    }
 
-
-   int joined = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(row), "joined"));
-   if (!joined) {
-       do_join_room(rname);
-       return;
-   }
-
-
-   ui_switch_dialog(rname, 1, 1);
-   if (w_msg_entry != NULL) {
-       gtk_widget_grab_focus(w_msg_entry);
-   }
+    ui_switch_dialog(rname, 1, 1);
+    if (w_msg_entry != NULL) {
+        gtk_widget_grab_focus(w_msg_entry);
+    }
 }
-
 
 static void on_tab_users_clicked(GtkWidget *widget, gpointer data) {
-   (void)widget;
-   (void)data;
-   ui_select_sidebar_tab("users");
+    (void)widget;
+    (void)data;
+    ui_select_sidebar_tab("users");
 }
-
 
 static void on_tab_rooms_clicked(GtkWidget *widget, gpointer data) {
-   (void)widget;
-   (void)data;
-   ui_select_sidebar_tab("rooms");
+    (void)widget;
+    (void)data;
+    ui_select_sidebar_tab("rooms");
 }
 
-
 static void ui_set_connected_state(int connected, const char *name, long id) {
-   gtk_widget_set_sensitive(w_nick_entry, !connected);
-   gtk_widget_set_visible(w_reg_btn, !connected);
-   gtk_widget_set_visible(w_reconn_btn, !connected);
-   gtk_widget_set_visible(w_logout_btn, connected);
-   gtk_widget_set_sensitive(w_target_entry, connected);
-   gtk_widget_set_sensitive(w_msg_entry, connected);
-   gtk_widget_set_sensitive(w_send_btn, connected);
-   gtk_widget_set_sensitive(w_users_list, connected);
-   gtk_widget_set_sensitive(w_rooms_list, connected);
-   gtk_widget_set_sensitive(w_room_entry, connected);
-   gtk_widget_set_sensitive(w_join_btn, connected);
-   gtk_widget_set_sensitive(w_tab_users, connected);
-   gtk_widget_set_sensitive(w_tab_rooms, connected);
+    gtk_widget_set_sensitive(w_nick_entry, !connected);
+    gtk_widget_set_visible(w_reg_btn, !connected);
+    gtk_widget_set_visible(w_reconn_btn, !connected);
+    gtk_widget_set_visible(w_logout_btn, connected);
+    gtk_widget_set_sensitive(w_target_entry, connected);
+    gtk_widget_set_sensitive(w_msg_entry, connected);
+    gtk_widget_set_sensitive(w_send_btn, connected);
+    gtk_widget_set_sensitive(w_users_list, connected);
+    gtk_widget_set_sensitive(w_rooms_list, connected);
+    gtk_widget_set_sensitive(w_room_entry, connected);
+    gtk_widget_set_sensitive(w_join_btn, connected);
+    gtk_widget_set_sensitive(w_tab_users, connected);
+    gtk_widget_set_sensitive(w_tab_rooms, connected);
 
-
-   if (connected) {
-       char status[128];
-       char title[128];
-       snprintf(status, sizeof(status), "Online: %s (id=%ld)", name, id);
-       snprintf(title, sizeof(title), "Queue Messenger — %s", name);
-       gtk_label_set_text(GTK_LABEL(w_status_lbl), status);
-       gtk_window_set_title(GTK_WINDOW(w_window), title);
-       gtk_widget_grab_focus(w_target_entry);
-   } else {
+    if (connected) {
+        char status[128];
+        char title[128];
+        snprintf(status, sizeof(status), "Online: %s (id=%ld)", name, id);
+        snprintf(title, sizeof(title), "Queue Messenger — %s", name);
+        gtk_label_set_text(GTK_LABEL(w_status_lbl), status);
+        gtk_window_set_title(GTK_WINDOW(w_window), title);
+        gtk_widget_grab_focus(w_target_entry);
+    } else {
         gtk_label_set_text(GTK_LABEL(w_status_lbl), "Disconnected");
         gtk_window_set_title(GTK_WINDOW(w_window), "Queue Messenger");
         clear_all_dialogs();
@@ -1177,909 +1258,762 @@ static void ui_set_connected_state(int connected, const char *name, long id) {
     }
 }
 
-
 static gboolean ui_handle_event(gpointer user_data) {
-   struct ui_event *ev = (struct ui_event *)user_data;
+    struct ui_event *ev = (struct ui_event *)user_data;
 
+    if (!g_running || w_chat_view == NULL) {
+        free(ev);
+        return G_SOURCE_REMOVE;
+    }
 
-   if (!g_running || w_chat_view == NULL) {
-       free(ev);
-       return G_SOURCE_REMOVE;
-   }
+    if (ev->kind == EV_CHAT) {
+        struct dialog_entry *d = get_or_create_dialog(ev->sender, 0);
+        if (d != NULL) {
+            char prefix[MAX_NAME + 8];
+            snprintf(prefix, sizeof(prefix), "%s: ", ev->sender);
+            ui_append_line_to(d->buf, "incoming", prefix, ev->text);
 
+            if (!g_active_is_room && strcmp(g_active_peer, d->peer) == 0) {
+                send_read_ack(ev->msg_id, ev->sender);
+            } else {
+                d->unread++;
+                queue_dialog_ack(d, ev->msg_id, ev->sender);
+                ui_rebuild_users_list();
+                ui_update_tab_labels();
+            }
+        }
+    } else if (ev->kind == EV_ROOM_MSG) {
+        struct dialog_entry *d = get_or_create_dialog(ev->room, 1);
+        if (d != NULL) {
+            d->joined = 1;
+            if (strcmp(ev->sender, "arbiter") == 0) {
+                ui_append_line_to(d->buf, "sys", "* ", ev->text);
+                g_who_force = 1;
+            } else {
+                char prefix[MAX_NAME + 8];
+                snprintf(prefix, sizeof(prefix), "%s: ", ev->sender);
+                ui_append_line_to(d->buf, "incoming", prefix, ev->text);
 
-   if (ev->kind == EV_CHAT) {
-       struct dialog_entry *d = get_or_create_dialog(ev->sender, 0);
-       if (d != NULL) {
-           char prefix[MAX_NAME + 8];
-           snprintf(prefix, sizeof(prefix), "%s: ", ev->sender);
-           ui_append_line_to(d->buf, "incoming", prefix, ev->text);
+                if (g_active_is_room && strcmp(g_active_peer, d->peer) == 0) {
+                    send_read_ack(ev->msg_id, ev->sender);
+                } else {
+                    d->unread++;
+                    queue_dialog_ack(d, ev->msg_id, ev->sender);
+                    ui_rebuild_rooms_list();
+                    ui_update_tab_labels();
+                }
+            }
+        }
+    } else if (ev->kind == EV_ACK) {
+        ui_mark_delivered(ev->msg_id);
+    } else if (ev->kind == EV_WHO) {
+        ui_update_users_list(ev->msg_id, ev->text);
+    } else if (ev->kind == EV_ROOMS) {
+        ui_update_rooms_list(ev->msg_id, ev->text);
+    } else if (ev->kind == EV_LOST) {
+        pthread_mutex_lock(&g_mtx);
+        g_my_id = 0;
+        g_my_name[0] = '\0';
+        pthread_mutex_unlock(&g_mtx);
+        ui_set_connected_state(0, "", 0);
+        gtk_widget_set_sensitive(w_reg_btn, FALSE);
+        gtk_widget_set_sensitive(w_reconn_btn, FALSE);
+        gtk_widget_set_sensitive(w_logout_btn, FALSE);
+        gtk_widget_set_sensitive(w_nick_entry, FALSE);
+        ui_append_sys("err", "Connection lost (arbiter stopped).");
+    }
 
-
-           if (!g_active_is_room && strcmp(g_active_peer, d->peer) == 0) {
-               send_read_ack(ev->msg_id, ev->sender);
-           } else {
-               d->unread++;
-               queue_dialog_ack(d, ev->msg_id, ev->sender);
-               ui_rebuild_users_list();
-               ui_update_tab_labels();
-           }
-       }
-   } else if (ev->kind == EV_ROOM_MSG) {
-       struct dialog_entry *d = get_or_create_dialog(ev->room, 1);
-       if (d != NULL) {
-           d->joined = 1;
-           if (strcmp(ev->sender, "arbiter") == 0) {
-               ui_append_line_to(d->buf, "sys", "* ", ev->text);
-               g_who_force = 1;
-           } else {
-               char prefix[MAX_NAME + 8];
-               snprintf(prefix, sizeof(prefix), "%s: ", ev->sender);
-               ui_append_line_to(d->buf, "incoming", prefix, ev->text);
-
-
-               if (g_active_is_room && strcmp(g_active_peer, d->peer) == 0) {
-                   send_read_ack(ev->msg_id, ev->sender);
-               } else {
-                   d->unread++;
-                   queue_dialog_ack(d, ev->msg_id, ev->sender);
-                   ui_rebuild_rooms_list();
-                   ui_update_tab_labels();
-               }
-           }
-       }
-   } else if (ev->kind == EV_ACK) {
-       ui_mark_delivered(ev->msg_id);
-   } else if (ev->kind == EV_WHO) {
-       ui_update_users_list(ev->msg_id, ev->text);
-   } else if (ev->kind == EV_ROOMS) {
-       ui_update_rooms_list(ev->msg_id, ev->text);
-   } else if (ev->kind == EV_LOST) {
-       pthread_mutex_lock(&g_mtx);
-       g_my_id = 0;
-       g_my_name[0] = '\0';
-       pthread_mutex_unlock(&g_mtx);
-       ui_set_connected_state(0, "", 0);
-       gtk_widget_set_sensitive(w_reg_btn, FALSE);
-       gtk_widget_set_sensitive(w_reconn_btn, FALSE);
-       gtk_widget_set_sensitive(w_logout_btn, FALSE);
-       gtk_widget_set_sensitive(w_nick_entry, FALSE);
-       ui_append_sys("err", "Connection lost (arbiter stopped).");
-   }
-
-
-   free(ev);
-   return G_SOURCE_REMOVE;
+    free(ev);
+    return G_SOURCE_REMOVE;
 }
-
 
 static void *recv_worker(void *arg) {
-   (void)arg;
-   struct qmsg msg;
+    (void)arg;
+    struct qmsg msg;
 
+    while (g_running) {
+        pthread_mutex_lock(&g_mtx);
+        long my_id = g_my_id;
+        pthread_mutex_unlock(&g_mtx);
 
-   while (g_running) {
-       pthread_mutex_lock(&g_mtx);
-       long my_id = g_my_id;
-       pthread_mutex_unlock(&g_mtx);
+        if (my_id <= 0) {
+            usleep(50000);
+            continue;
+        }
 
+        ssize_t n = msgrcv(g_msqid, &msg, MSG_SIZE, my_id, IPC_NOWAIT);
+        if (n >= 0) {
+            if (msg.cmd == CMD_CHAT) {
+                msg.sender_name[MAX_NAME - 1] = '\0';
+                msg.text[MAX_TEXT - 1] = '\0';
 
-       if (my_id <= 0) {
-           usleep(50000);
-           continue;
-       }
+                struct ui_event *ev = calloc(1, sizeof(*ev));
+                if (ev != NULL) {
+                    ev->kind = EV_CHAT;
+                    ev->msg_id = msg.msg_id;
+                    copy_utf8_safe(ev->sender, sizeof(ev->sender), msg.sender_name);
+                    copy_utf8_safe(ev->text, sizeof(ev->text), msg.text);
+                    g_idle_add(ui_handle_event, ev);
+                }
+            } else if (msg.cmd == CMD_ROOM_MSG) {
+                msg.name[MAX_NAME - 1] = '\0';
+                msg.sender_name[MAX_NAME - 1] = '\0';
+                msg.text[MAX_TEXT - 1] = '\0';
 
+                struct ui_event *ev = calloc(1, sizeof(*ev));
+                if (ev != NULL) {
+                    ev->kind = EV_ROOM_MSG;
+                    ev->msg_id = msg.msg_id;
+                    copy_utf8_safe(ev->room, sizeof(ev->room), msg.name);
+                    copy_utf8_safe(ev->sender, sizeof(ev->sender), msg.sender_name);
+                    copy_utf8_safe(ev->text, sizeof(ev->text), msg.text);
+                    g_idle_add(ui_handle_event, ev);
+                }
+            } else if (msg.cmd == CMD_ACK) {
+                msg.sender_name[MAX_NAME - 1] = '\0';
 
-       ssize_t n = msgrcv(g_msqid, &msg, MSG_SIZE, my_id, IPC_NOWAIT);
-       if (n >= 0) {
-           if (msg.cmd == CMD_CHAT) {
-               msg.sender_name[MAX_NAME - 1] = '\0';
-               msg.text[MAX_TEXT - 1] = '\0';
+                struct ui_event *ev = calloc(1, sizeof(*ev));
+                if (ev != NULL) {
+                    ev->kind = EV_ACK;
+                    ev->msg_id = msg.msg_id;
+                    copy_utf8_safe(ev->sender, sizeof(ev->sender), msg.sender_name);
+                    g_idle_add(ui_handle_event, ev);
+                }
+            }
+        } else {
+            if (errno == ENOMSG) {
+                usleep(50000);
+            } else if (errno == EINTR) {
+                continue;
+            } else {
+                struct ui_event *ev = calloc(1, sizeof(*ev));
+                if (ev != NULL) {
+                    ev->kind = EV_LOST;
+                    g_idle_add(ui_handle_event, ev);
+                }
+                g_running = 0;
+                break;
+            }
+        }
+    }
 
-
-               struct ui_event *ev = calloc(1, sizeof(*ev));
-               if (ev != NULL) {
-                   ev->kind = EV_CHAT;
-                   ev->msg_id = msg.msg_id;
-                   copy_utf8_safe(ev->sender, sizeof(ev->sender), msg.sender_name);
-                   copy_utf8_safe(ev->text, sizeof(ev->text), msg.text);
-                   g_idle_add(ui_handle_event, ev);
-               }
-           } else if (msg.cmd == CMD_ROOM_MSG) {
-               msg.name[MAX_NAME - 1] = '\0';
-               msg.sender_name[MAX_NAME - 1] = '\0';
-               msg.text[MAX_TEXT - 1] = '\0';
-
-
-               struct ui_event *ev = calloc(1, sizeof(*ev));
-               if (ev != NULL) {
-                   ev->kind = EV_ROOM_MSG;
-                   ev->msg_id = msg.msg_id;
-                   copy_utf8_safe(ev->room, sizeof(ev->room), msg.name);
-                   copy_utf8_safe(ev->sender, sizeof(ev->sender), msg.sender_name);
-                   copy_utf8_safe(ev->text, sizeof(ev->text), msg.text);
-                   g_idle_add(ui_handle_event, ev);
-               }
-           } else if (msg.cmd == CMD_ACK) {
-               msg.sender_name[MAX_NAME - 1] = '\0';
-
-
-               struct ui_event *ev = calloc(1, sizeof(*ev));
-               if (ev != NULL) {
-                   ev->kind = EV_ACK;
-                   ev->msg_id = msg.msg_id;
-                   copy_utf8_safe(ev->sender, sizeof(ev->sender), msg.sender_name);
-                   g_idle_add(ui_handle_event, ev);
-               }
-           }
-       } else {
-           if (errno == ENOMSG) {
-               usleep(50000);
-           } else if (errno == EINTR) {
-               continue;
-           } else {
-               struct ui_event *ev = calloc(1, sizeof(*ev));
-               if (ev != NULL) {
-                   ev->kind = EV_LOST;
-                   g_idle_add(ui_handle_event, ev);
-               }
-               g_running = 0;
-               break;
-           }
-       }
-   }
-
-
-   return NULL;
+    return NULL;
 }
-
 
 static void *heartbeat_worker(void *arg) {
-   (void)arg;
-   struct qmsg hb;
-   int hb_ticks = 0;
-   int poll_ticks = 0;
+    (void)arg;
+    struct qmsg hb;
+    int hb_ticks = 0;
+    int poll_ticks = 0;
 
+    long last_who_count = -1;
+    char last_who_list[MAX_TEXT];
+    last_who_list[0] = '\0';
 
-   long last_who_count = -1;
-   char last_who_list[MAX_TEXT];
-   last_who_list[0] = '\0';
+    long last_room_count = -1;
+    char last_room_list[MAX_TEXT];
+    last_room_list[0] = '\0';
 
+    while (g_running) {
+        usleep(100000);
+        hb_ticks++;
+        poll_ticks++;
 
-   long last_room_count = -1;
-   char last_room_list[MAX_TEXT];
-   last_room_list[0] = '\0';
+        pthread_mutex_lock(&g_mtx);
+        long my_id = g_my_id;
+        pthread_mutex_unlock(&g_mtx);
 
+        if (my_id <= 0) {
+            last_who_count = -1;
+            last_who_list[0] = '\0';
+            last_room_count = -1;
+            last_room_list[0] = '\0';
+            continue;
+        }
 
-   while (g_running) {
-       usleep(100000);
-       hb_ticks++;
-       poll_ticks++;
+        if (hb_ticks >= HEARTBEAT_INTERVAL * 10) {
+            hb_ticks = 0;
+            memset(&hb, 0, sizeof(hb));
+            hb.mtype = ARBITER_TYPE;
+            hb.cmd = CMD_HEARTBEAT;
+            hb.sender_id = my_id;
+            if (msgsnd(g_msqid, &hb, MSG_SIZE, IPC_NOWAIT) < 0 && errno != EINTR && errno != EAGAIN) {
+                g_running = 0;
+                break;
+            }
+        }
 
+        if (g_who_force || poll_ticks >= 20) {
+            int forced = g_who_force;
+            g_who_force = 0;
+            poll_ticks = 0;
 
-       pthread_mutex_lock(&g_mtx);
-       long my_id = g_my_id;
-       pthread_mutex_unlock(&g_mtx);
+            drain_type(g_msqid, g_who_reply_type);
 
+            struct qmsg req;
+            memset(&req, 0, sizeof(req));
+            req.mtype = ARBITER_TYPE;
+            req.cmd = CMD_WHO;
+            req.sender_id = my_id;
+            req.reply_type = g_who_reply_type;
 
-       if (my_id <= 0) {
-           last_who_count = -1;
-           last_who_list[0] = '\0';
-           last_room_count = -1;
-           last_room_list[0] = '\0';
-           continue;
-       }
+            if (msgsnd(g_msqid, &req, MSG_SIZE, IPC_NOWAIT) == 0) {
+                struct qmsg rep;
+                if (wait_reply(g_msqid, g_who_reply_type, &rep, 50) == 0) {
+                    rep.text[MAX_TEXT - 1] = '\0';
+                    if (forced || rep.target_id != last_who_count || strcmp(rep.text, last_who_list) != 0) {
+                        last_who_count = rep.target_id;
+                        snprintf(last_who_list, sizeof(last_who_list), "%.*s", MAX_TEXT - 1, rep.text);
 
+                        struct ui_event *ev = calloc(1, sizeof(*ev));
+                        if (ev != NULL) {
+                            ev->kind = EV_WHO;
+                            ev->msg_id = rep.target_id;
+                            snprintf(ev->text, sizeof(ev->text), "%.*s", MAX_TEXT - 1, rep.text);
+                            g_idle_add(ui_handle_event, ev);
+                        }
+                    }
+                }
+            }
 
-       if (hb_ticks >= HEARTBEAT_INTERVAL * 10) {
-           hb_ticks = 0;
-           memset(&hb, 0, sizeof(hb));
-           hb.mtype = ARBITER_TYPE;
-           hb.cmd = CMD_HEARTBEAT;
-           hb.sender_id = my_id;
-           if (msgsnd(g_msqid, &hb, MSG_SIZE, IPC_NOWAIT) < 0 && errno != EINTR && errno != EAGAIN) {
-               g_running = 0;
-               break;
-           }
-       }
+            drain_type(g_msqid, g_who_reply_type);
 
+            memset(&req, 0, sizeof(req));
+            req.mtype = ARBITER_TYPE;
+            req.cmd = CMD_ROOM_LIST;
+            req.sender_id = my_id;
+            req.reply_type = g_who_reply_type;
 
-       if (g_who_force || poll_ticks >= 20) {
-           int forced = g_who_force;
-           g_who_force = 0;
-           poll_ticks = 0;
+            if (msgsnd(g_msqid, &req, MSG_SIZE, IPC_NOWAIT) == 0) {
+                struct qmsg rep;
+                if (wait_reply(g_msqid, g_who_reply_type, &rep, 50) == 0) {
+                    rep.text[MAX_TEXT - 1] = '\0';
+                    if (forced || rep.target_id != last_room_count || strcmp(rep.text, last_room_list) != 0) {
+                        last_room_count = rep.target_id;
+                        snprintf(last_room_list, sizeof(last_room_list), "%.*s", MAX_TEXT - 1, rep.text);
 
+                        struct ui_event *ev = calloc(1, sizeof(*ev));
+                        if (ev != NULL) {
+                            ev->kind = EV_ROOMS;
+                            ev->msg_id = rep.target_id;
+                            snprintf(ev->text, sizeof(ev->text), "%.*s", MAX_TEXT - 1, rep.text);
+                            g_idle_add(ui_handle_event, ev);
+                        }
+                    }
+                }
+            }
+        }
+    }
 
-           drain_type(g_msqid, g_who_reply_type);
-
-
-           struct qmsg req;
-           memset(&req, 0, sizeof(req));
-           req.mtype = ARBITER_TYPE;
-           req.cmd = CMD_WHO;
-           req.sender_id = my_id;
-           req.reply_type = g_who_reply_type;
-
-
-           if (msgsnd(g_msqid, &req, MSG_SIZE, IPC_NOWAIT) == 0) {
-               struct qmsg rep;
-               if (wait_reply(g_msqid, g_who_reply_type, &rep, 50) == 0) {
-                   rep.text[MAX_TEXT - 1] = '\0';
-                   if (forced || rep.target_id != last_who_count || strcmp(rep.text, last_who_list) != 0) {
-                       last_who_count = rep.target_id;
-                       snprintf(last_who_list, sizeof(last_who_list), "%.*s", MAX_TEXT - 1, rep.text);
-
-
-                       struct ui_event *ev = calloc(1, sizeof(*ev));
-                       if (ev != NULL) {
-                           ev->kind = EV_WHO;
-                           ev->msg_id = rep.target_id;
-                           snprintf(ev->text, sizeof(ev->text), "%.*s", MAX_TEXT - 1, rep.text);
-                           g_idle_add(ui_handle_event, ev);
-                       }
-                   }
-               }
-           }
-
-
-           drain_type(g_msqid, g_who_reply_type);
-
-
-           memset(&req, 0, sizeof(req));
-           req.mtype = ARBITER_TYPE;
-           req.cmd = CMD_ROOM_LIST;
-           req.sender_id = my_id;
-           req.reply_type = g_who_reply_type;
-
-
-           if (msgsnd(g_msqid, &req, MSG_SIZE, IPC_NOWAIT) == 0) {
-               struct qmsg rep;
-               if (wait_reply(g_msqid, g_who_reply_type, &rep, 50) == 0) {
-                   rep.text[MAX_TEXT - 1] = '\0';
-                   if (forced || rep.target_id != last_room_count || strcmp(rep.text, last_room_list) != 0) {
-                       last_room_count = rep.target_id;
-                       snprintf(last_room_list, sizeof(last_room_list), "%.*s", MAX_TEXT - 1, rep.text);
-
-
-                       struct ui_event *ev = calloc(1, sizeof(*ev));
-                       if (ev != NULL) {
-                           ev->kind = EV_ROOMS;
-                           ev->msg_id = rep.target_id;
-                           snprintf(ev->text, sizeof(ev->text), "%.*s", MAX_TEXT - 1, rep.text);
-                           g_idle_add(ui_handle_event, ev);
-                       }
-                   }
-               }
-           }
-       }
-   }
-
-
-   drain_type(g_msqid, g_who_reply_type);
-   return NULL;
+    drain_type(g_msqid, g_who_reply_type);
+    return NULL;
 }
-
 
 static void do_auth(int is_reconnect) {
-   pthread_mutex_lock(&g_mtx);
-   long cur_id = g_my_id;
-   pthread_mutex_unlock(&g_mtx);
+    pthread_mutex_lock(&g_mtx);
+    long cur_id = g_my_id;
+    pthread_mutex_unlock(&g_mtx);
 
+    if (cur_id > 0) {
+        return;
+    }
 
-   if (cur_id > 0) {
-       return;
-   }
+    const char *name = gtk_entry_get_text(GTK_ENTRY(w_nick_entry));
+    if (name == NULL || name[0] == '\0' || strchr(name, '#') != NULL || strchr(name, ',') != NULL || strlen(name) >= MAX_NAME) {
+        ui_append_sys("err", "Invalid name (1..31 chars, no '#' or ',').");
+        return;
+    }
 
+    struct qmsg req;
+    memset(&req, 0, sizeof(req));
+    req.mtype = ARBITER_TYPE;
+    req.cmd = is_reconnect ? CMD_RECONNECT : CMD_REGISTER;
+    req.reply_type = g_reply_type;
+    snprintf(req.name, sizeof(req.name), "%.*s", MAX_NAME - 1, name);
 
-   const char *name = gtk_entry_get_text(GTK_ENTRY(w_nick_entry));
-   if (name == NULL || name[0] == '\0' || strchr(name, '#') != NULL || strchr(name, ',') != NULL || strlen(name) >= MAX_NAME) {
-       ui_append_sys("err", "Invalid name (1..31 chars, no '#' or ',').");
-       return;
-   }
+    if (msgsnd(g_msqid, &req, MSG_SIZE, IPC_NOWAIT) < 0) {
+        ui_append_sys("err", errno == EAGAIN
+            ? "Message queue is full, try again."
+            : "Failed to send request to arbiter.");
+        return;
+    }
 
+    struct qmsg rep;
+    if (wait_reply(g_msqid, g_reply_type, &rep, 200) < 0) {
+        ui_append_sys("err", "No response from arbiter.");
+        return;
+    }
 
-   struct qmsg req;
-   memset(&req, 0, sizeof(req));
-   req.mtype = ARBITER_TYPE;
-   req.cmd = is_reconnect ? CMD_RECONNECT : CMD_REGISTER;
-   req.reply_type = g_reply_type;
-   snprintf(req.name, sizeof(req.name), "%.*s", MAX_NAME - 1, name);
+    if (rep.target_id > 0) {
+        pthread_mutex_lock(&g_mtx);
+        g_my_id = rep.target_id;
+        g_next_msg_id = 1;
+        snprintf(g_my_name, sizeof(g_my_name), "%.*s", MAX_NAME - 1, name);
+        pthread_mutex_unlock(&g_mtx);
 
+        g_was_connected = 1;
+        ui_set_connected_state(1, name, rep.target_id);
+        g_who_force = 1;
 
-   if (msgsnd(g_msqid, &req, MSG_SIZE, IPC_NOWAIT) < 0) {
-       ui_append_sys("err", errno == EAGAIN
-           ? "Message queue is full, try again."
-           : "Failed to send request to arbiter.");
-       return;
-   }
-
-
-   struct qmsg rep;
-   if (wait_reply(g_msqid, g_reply_type, &rep, 200) < 0) {
-       ui_append_sys("err", "No response from arbiter.");
-       return;
-   }
-
-
-   if (rep.target_id > 0) {
-       pthread_mutex_lock(&g_mtx);
-       g_my_id = rep.target_id;
-       g_next_msg_id = 1;
-       snprintf(g_my_name, sizeof(g_my_name), "%.*s", MAX_NAME - 1, name);
-       pthread_mutex_unlock(&g_mtx);
-
-
-       g_was_connected = 1;
-       ui_set_connected_state(1, name, rep.target_id);
-       g_who_force = 1;
-
-
-       char info[128];
-       snprintf(info, sizeof(info), "%s as %s (id=%ld).",
-                is_reconnect ? "Reconnected" : "Registered", name, rep.target_id);
-       ui_append_sys("sys", info);
-   } else {
-       char info[MAX_TEXT + 64];
-       rep.text[MAX_TEXT - 1] = '\0';
-       snprintf(info, sizeof(info), "%s failed: %s",
-                is_reconnect ? "Reconnect" : "Registration", rep.text);
-       ui_append_sys("err", info);
-   }
+        char info[128];
+        snprintf(info, sizeof(info), "%s as %s (id=%ld).",
+                 is_reconnect ? "Reconnected" : "Registered", name, rep.target_id);
+        ui_append_sys("sys", info);
+    } else {
+        char info[MAX_TEXT + 64];
+        rep.text[MAX_TEXT - 1] = '\0';
+        snprintf(info, sizeof(info), "%s failed: %s",
+                 is_reconnect ? "Reconnect" : "Registration", rep.text);
+        ui_append_sys("err", info);
+    }
 }
-
 
 static void on_register_clicked(GtkWidget *widget, gpointer data) {
-   (void)widget;
-   (void)data;
-   do_auth(0);
+    (void)widget;
+    (void)data;
+    do_auth(0);
 }
-
 
 static void on_reconnect_clicked(GtkWidget *widget, gpointer data) {
-   (void)widget;
-   (void)data;
-   do_auth(1);
+    (void)widget;
+    (void)data;
+    do_auth(1);
 }
-
 
 static void on_logout_clicked(GtkWidget *widget, gpointer data) {
-   (void)widget;
-   (void)data;
-   send_logout();
-   ui_set_connected_state(0, "", 0);
-   ui_append_sys("warn", "Logged out.");
+    (void)widget;
+    (void)data;
+    send_logout();
+    ui_set_connected_state(0, "", 0);
+    ui_append_sys("warn", "Logged out.");
 }
-
 
 static void on_nick_activate(GtkWidget *widget, gpointer data) {
-   (void)widget;
-   (void)data;
-   do_auth(g_was_connected);
+    (void)widget;
+    (void)data;
+    do_auth(g_was_connected);
 }
-
 
 static void on_send_clicked(GtkWidget *widget, gpointer data) {
-   (void)widget;
-   (void)data;
+    (void)widget;
+    (void)data;
 
+    pthread_mutex_lock(&g_mtx);
+    long cur_id = g_my_id;
+    char cur_name[MAX_NAME];
+    snprintf(cur_name, sizeof(cur_name), "%.*s", MAX_NAME - 1, g_my_name);
+    pthread_mutex_unlock(&g_mtx);
 
-   pthread_mutex_lock(&g_mtx);
-   long cur_id = g_my_id;
-   char cur_name[MAX_NAME];
-   snprintf(cur_name, sizeof(cur_name), "%.*s", MAX_NAME - 1, g_my_name);
-   pthread_mutex_unlock(&g_mtx);
+    if (cur_id <= 0) {
+        ui_append_error("Register first.");
+        return;
+    }
 
+    const char *target = gtk_entry_get_text(GTK_ENTRY(w_target_entry));
+    const char *text = gtk_entry_get_text(GTK_ENTRY(w_msg_entry));
 
-   if (cur_id <= 0) {
-       ui_append_error("Register first.");
-       return;
-   }
+    if (target == NULL || target[0] == '\0' || strlen(target) >= MAX_NAME + 1) {
+        ui_append_error("Enter a valid recipient or #room.");
+        gtk_widget_grab_focus(w_target_entry);
+        return;
+    }
+    if (text == NULL || text[0] == '\0') {
+        return;
+    }
 
+    if (target[0] == '#') {
+        const char *rname = target + 1;
+        if (rname[0] == '\0' || strlen(rname) >= MAX_NAME - 1) {
+            ui_append_error("Enter a valid #room name.");
+            return;
+        }
 
-   const char *target = gtk_entry_get_text(GTK_ENTRY(w_target_entry));
-   const char *text = gtk_entry_get_text(GTK_ENTRY(w_msg_entry));
+        long msg_id = g_next_msg_id++;
 
+        struct qmsg req;
+        memset(&req, 0, sizeof(req));
+        req.mtype = ARBITER_TYPE;
+        req.cmd = CMD_ROOM_MSG;
+        req.sender_id = cur_id;
+        req.msg_id = msg_id;
+        req.reply_type = g_reply_type;
+        snprintf(req.name, sizeof(req.name), "%.*s", MAX_NAME - 2, rname);
+        copy_utf8_safe(req.text, sizeof(req.text), text);
 
-   if (target == NULL || target[0] == '\0' || strlen(target) >= MAX_NAME + 1) {
-       ui_append_error("Enter a valid recipient or #room.");
-       gtk_widget_grab_focus(w_target_entry);
-       return;
-   }
-   if (text == NULL || text[0] == '\0') {
-       return;
-   }
+        if (msgsnd(g_msqid, &req, MSG_SIZE, IPC_NOWAIT) < 0) {
+            ui_append_error(errno == EAGAIN
+                ? "Message queue is full, try again."
+                : "Failed to send room message.");
+            return;
+        }
 
+        struct qmsg rep;
+        if (wait_reply(g_msqid, g_reply_type, &rep, 200) < 0) {
+            ui_append_error("No response from arbiter.");
+            return;
+        }
+        rep.text[MAX_TEXT - 1] = '\0';
 
-   if (target[0] == '#') {
-       const char *rname = target + 1;
-       if (rname[0] == '\0' || strlen(rname) >= MAX_NAME - 1) {
-           ui_append_error("Enter a valid #room name.");
-           return;
-       }
+        if (rep.target_id < 0) {
+            char err[MAX_TEXT + 32];
+            snprintf(err, sizeof(err), "Room send failed: %s", rep.text);
+            ui_append_error(err);
+            return;
+        }
 
+        struct dialog_entry *d = get_or_create_dialog(rname, 1);
+        if (d == NULL) {
+            return;
+        }
+        d->joined = 1;
+        if (!g_active_is_room || strcmp(g_active_peer, d->peer) != 0) {
+            ui_switch_dialog(d->peer, 1, 0);
+        }
+        ui_append_outgoing_to(d->buf, msg_id, text);
+        gtk_entry_set_text(GTK_ENTRY(w_msg_entry), "");
+        gtk_widget_grab_focus(w_msg_entry);
+        return;
+    }
 
-       long msg_id = g_next_msg_id++;
+    if (strlen(target) >= MAX_NAME) {
+        ui_append_error("Enter a valid recipient.");
+        gtk_widget_grab_focus(w_target_entry);
+        return;
+    }
+    if (strcmp(target, cur_name) == 0) {
+        ui_append_error("Cannot send message to yourself.");
+        return;
+    }
+    if (strcasecmp(target, "arbiter") == 0) {
+        ui_append_error("Cannot send message to arbiter.");
+        return;
+    }
 
+    struct qmsg req;
+    memset(&req, 0, sizeof(req));
+    req.mtype = ARBITER_TYPE;
+    req.cmd = CMD_LOOKUP;
+    req.sender_id = cur_id;
+    req.reply_type = g_reply_type;
+    snprintf(req.name, sizeof(req.name), "%.*s", MAX_NAME - 1, target);
 
-       struct qmsg req;
-       memset(&req, 0, sizeof(req));
-       req.mtype = ARBITER_TYPE;
-       req.cmd = CMD_ROOM_MSG;
-       req.sender_id = cur_id;
-       req.msg_id = msg_id;
-       req.reply_type = g_reply_type;
-       snprintf(req.name, sizeof(req.name), "%.*s", MAX_NAME - 2, rname);
-       copy_utf8_safe(req.text, sizeof(req.text), text);
+    if (msgsnd(g_msqid, &req, MSG_SIZE, IPC_NOWAIT) < 0) {
+        ui_append_error(errno == EAGAIN
+            ? "Message queue is full, try again."
+            : "Failed to send request to arbiter.");
+        return;
+    }
 
+    struct qmsg rep;
+    if (wait_reply(g_msqid, g_reply_type, &rep, 200) < 0) {
+        ui_append_error("No response from arbiter.");
+        return;
+    }
 
-       if (msgsnd(g_msqid, &req, MSG_SIZE, IPC_NOWAIT) < 0) {
-           ui_append_error(errno == EAGAIN
-               ? "Message queue is full, try again."
-               : "Failed to send room message.");
-           return;
-       }
+    struct dialog_entry *d = get_or_create_dialog(target, 0);
+    if (d == NULL) {
+        return;
+    }
+    d->online = (rep.target_id > 0);
 
+    if (g_active_is_room || strcmp(g_active_peer, d->peer) != 0) {
+        ui_switch_dialog(d->peer, 0, 0);
+    } else {
+        ui_update_chat_header();
+    }
 
-       struct qmsg rep;
-       if (wait_reply(g_msqid, g_reply_type, &rep, 200) < 0) {
-           ui_append_error("No response from arbiter.");
-           return;
-       }
-       rep.text[MAX_TEXT - 1] = '\0';
+    long msg_id = g_next_msg_id++;
 
+    if (rep.target_id > 0) {
+        struct qmsg chat;
+        memset(&chat, 0, sizeof(chat));
+        chat.mtype = rep.target_id;
+        chat.cmd = CMD_CHAT;
+        chat.sender_id = cur_id;
+        chat.msg_id = msg_id;
+        snprintf(chat.sender_name, sizeof(chat.sender_name), "%.*s", MAX_NAME - 1, cur_name);
+        copy_utf8_safe(chat.text, sizeof(chat.text), text);
 
-       if (rep.target_id < 0) {
-           char err[MAX_TEXT + 32];
-           snprintf(err, sizeof(err), "Room send failed: %s", rep.text);
-           ui_append_error(err);
-           return;
-       }
+        if (msgsnd(g_msqid, &chat, MSG_SIZE, IPC_NOWAIT) < 0) {
+            ui_append_error(errno == EAGAIN
+                ? "Message queue is full, try again."
+                : "Failed to send message.");
+            return;
+        }
 
+        ui_append_outgoing_to(d->buf, msg_id, text);
+    } else {
+        struct qmsg st;
+        memset(&st, 0, sizeof(st));
+        st.mtype = ARBITER_TYPE;
+        st.cmd = CMD_STORE;
+        st.sender_id = cur_id;
+        st.msg_id = msg_id;
+        snprintf(st.name, sizeof(st.name), "%.*s", MAX_NAME - 1, target);
+        snprintf(st.sender_name, sizeof(st.sender_name), "%.*s", MAX_NAME - 1, cur_name);
+        copy_utf8_safe(st.text, sizeof(st.text), text);
 
-       struct dialog_entry *d = get_or_create_dialog(rname, 1);
-       if (d == NULL) {
-           return;
-       }
-       d->joined = 1;
-       if (!g_active_is_room || strcmp(g_active_peer, d->peer) != 0) {
-           ui_switch_dialog(d->peer, 1, 0);
-       }
-       ui_append_outgoing_to(d->buf, msg_id, text);
-       gtk_entry_set_text(GTK_ENTRY(w_msg_entry), "");
-       gtk_widget_grab_focus(w_msg_entry);
-       return;
-   }
+        if (msgsnd(g_msqid, &st, MSG_SIZE, IPC_NOWAIT) < 0) {
+            ui_append_error(errno == EAGAIN
+                ? "Message queue is full, try again."
+                : "Failed to store offline message.");
+            return;
+        }
 
+        ui_append_outgoing_to(d->buf, msg_id, text);
+    }
 
-   if (strlen(target) >= MAX_NAME) {
-       ui_append_error("Enter a valid recipient.");
-       gtk_widget_grab_focus(w_target_entry);
-       return;
-   }
-   if (strcmp(target, cur_name) == 0) {
-       ui_append_error("Cannot send message to yourself.");
-       return;
-   }
-   if (strcasecmp(target, "arbiter") == 0) {
-       ui_append_error("Cannot send message to arbiter.");
-       return;
-   }
-
-
-   struct qmsg req;
-   memset(&req, 0, sizeof(req));
-   req.mtype = ARBITER_TYPE;
-   req.cmd = CMD_LOOKUP;
-   req.sender_id = cur_id;
-   req.reply_type = g_reply_type;
-   snprintf(req.name, sizeof(req.name), "%.*s", MAX_NAME - 1, target);
-
-
-   if (msgsnd(g_msqid, &req, MSG_SIZE, IPC_NOWAIT) < 0) {
-       ui_append_error(errno == EAGAIN
-           ? "Message queue is full, try again."
-           : "Failed to send request to arbiter.");
-       return;
-   }
-
-
-   struct qmsg rep;
-   if (wait_reply(g_msqid, g_reply_type, &rep, 200) < 0) {
-       ui_append_error("No response from arbiter.");
-       return;
-   }
-
-
-   struct dialog_entry *d = get_or_create_dialog(target, 0);
-   if (d == NULL) {
-       return;
-   }
-   d->online = (rep.target_id > 0);
-
-
-   if (g_active_is_room || strcmp(g_active_peer, d->peer) != 0) {
-       ui_switch_dialog(d->peer, 0, 0);
-   } else {
-       ui_update_chat_header();
-   }
-
-
-   long msg_id = g_next_msg_id++;
-
-
-   if (rep.target_id > 0) {
-       struct qmsg chat;
-       memset(&chat, 0, sizeof(chat));
-       chat.mtype = rep.target_id;
-       chat.cmd = CMD_CHAT;
-       chat.sender_id = cur_id;
-       chat.msg_id = msg_id;
-       snprintf(chat.sender_name, sizeof(chat.sender_name), "%.*s", MAX_NAME - 1, cur_name);
-       copy_utf8_safe(chat.text, sizeof(chat.text), text);
-
-
-       if (msgsnd(g_msqid, &chat, MSG_SIZE, IPC_NOWAIT) < 0) {
-           ui_append_error(errno == EAGAIN
-               ? "Message queue is full, try again."
-               : "Failed to send message.");
-           return;
-       }
-
-
-       ui_append_outgoing_to(d->buf, msg_id, text);
-   } else {
-       struct qmsg st;
-       memset(&st, 0, sizeof(st));
-       st.mtype = ARBITER_TYPE;
-       st.cmd = CMD_STORE;
-       st.sender_id = cur_id;
-       st.msg_id = msg_id;
-       snprintf(st.name, sizeof(st.name), "%.*s", MAX_NAME - 1, target);
-       snprintf(st.sender_name, sizeof(st.sender_name), "%.*s", MAX_NAME - 1, cur_name);
-       copy_utf8_safe(st.text, sizeof(st.text), text);
-
-
-       if (msgsnd(g_msqid, &st, MSG_SIZE, IPC_NOWAIT) < 0) {
-           ui_append_error(errno == EAGAIN
-               ? "Message queue is full, try again."
-               : "Failed to store offline message.");
-           return;
-       }
-
-
-       ui_append_outgoing_to(d->buf, msg_id, text);
-   }
-
-
-   gtk_entry_set_text(GTK_ENTRY(w_msg_entry), "");
-   gtk_widget_grab_focus(w_msg_entry);
+    gtk_entry_set_text(GTK_ENTRY(w_msg_entry), "");
+    gtk_widget_grab_focus(w_msg_entry);
 }
-
 
 static void on_window_destroy(GtkWidget *widget, gpointer data) {
-   (void)widget;
-   (void)data;
-   w_chat_view = NULL;
-   w_chat_header = NULL;
-   w_leave_btn = NULL;
-   w_users_list = NULL;
-   w_users_lbl = NULL;
-   w_rooms_list = NULL;
-   w_rooms_lbl = NULL;
-   w_room_entry = NULL;
-   w_join_btn = NULL;
-   w_tab_users = NULL;
-   w_tab_rooms = NULL;
-   w_sidebar_stack = NULL;
-   send_logout();
-   g_running = 0;
-   gtk_main_quit();
+    (void)widget;
+    (void)data;
+    w_chat_view = NULL;
+    w_chat_header = NULL;
+    w_leave_btn = NULL;
+    w_theme_combo = NULL;
+    w_users_list = NULL;
+    w_users_lbl = NULL;
+    w_rooms_list = NULL;
+    w_rooms_lbl = NULL;
+    w_room_entry = NULL;
+    w_join_btn = NULL;
+    w_tab_users = NULL;
+    w_tab_rooms = NULL;
+    w_sidebar_stack = NULL;
+    send_logout();
+    g_running = 0;
+    gtk_main_quit();
 }
-
-
-static void apply_styles(void) {
-   const char *css_data =
-       "window { background-color: #1e1e2e; color: #cdd6f4; }"
-       "label { color: #cdd6f4; }"
-       "entry { background-color: #313244; color: #cdd6f4; border: 1px solid #45475a; border-radius: 6px; padding: 6px 10px; }"
-       "entry:focus { border-color: #89b4fa; }"
-       "button { background-color: #89b4fa; color: #11111b; font-weight: bold; border-radius: 6px; padding: 6px 14px; border: none; }"
-       "button:hover { background-color: #b4befe; }"
-       "button:disabled { background-color: #45475a; color: #7f849c; }"
-       "button.tab-btn { background-color: #313244; color: #cdd6f4; font-weight: bold; border-radius: 6px; padding: 5px 8px; border: 1px solid #45475a; }"
-       "button.tab-btn:hover { background-color: #45475a; }"
-       "button.tab-active { background-color: #89b4fa; color: #11111b; border-color: #89b4fa; }"
-       "button.tab-active:hover { background-color: #b4befe; }"
-       "button.leave-btn { background-color: #f38ba8; color: #11111b; padding: 3px 10px; }"
-       "button.leave-btn:hover { background-color: #eba0ac; }"
-       "textview text { background-color: #181825; color: #cdd6f4; font-family: monospace; font-size: 11pt; }"
-       "scrolledwindow { border: 1px solid #45475a; border-radius: 6px; }"
-       "list { background-color: #181825; color: #a6e3a1; }"
-       "list row { padding: 2px 4px; }"
-       "list row:hover { background-color: #313244; }"
-       "list row:selected { background-color: #45475a; color: #ffffff; }";
-
-
-   GtkCssProvider *provider = gtk_css_provider_new();
-   gtk_css_provider_load_from_data(provider, css_data, -1, NULL);
-   gtk_style_context_add_provider_for_screen(
-       gdk_screen_get_default(),
-       GTK_STYLE_PROVIDER(provider),
-       GTK_STYLE_PROVIDER_PRIORITY_APPLICATION
-   );
-   g_object_unref(provider);
-}
-
 
 static void build_ui(void) {
-   apply_styles();
-
-
-   g_sys_buf = create_chat_buffer();
-
-
-   w_window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
-   gtk_window_set_title(GTK_WINDOW(w_window), "Queue Messenger");
-   gtk_window_set_default_size(GTK_WINDOW(w_window), 780, 500);
-   g_signal_connect(w_window, "destroy", G_CALLBACK(on_window_destroy), NULL);
-
-
-   GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
-   gtk_widget_set_margin_top(root, 12);
-   gtk_widget_set_margin_bottom(root, 12);
-   gtk_widget_set_margin_start(root, 12);
-   gtk_widget_set_margin_end(root, 12);
-   gtk_container_add(GTK_CONTAINER(w_window), root);
-
-
-   GtkWidget *top_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-   w_nick_entry = gtk_entry_new();
-   gtk_entry_set_placeholder_text(GTK_ENTRY(w_nick_entry), "Username");
-   gtk_entry_set_max_length(GTK_ENTRY(w_nick_entry), MAX_NAME - 1);
-   g_signal_connect(w_nick_entry, "activate", G_CALLBACK(on_nick_activate), NULL);
-
-
-   w_reg_btn = gtk_button_new_with_label("Register");
-   g_signal_connect(w_reg_btn, "clicked", G_CALLBACK(on_register_clicked), NULL);
-
-
-   w_reconn_btn = gtk_button_new_with_label("Reconnect");
-   g_signal_connect(w_reconn_btn, "clicked", G_CALLBACK(on_reconnect_clicked), NULL);
-
-
-   w_logout_btn = gtk_button_new_with_label("Logout");
-   g_signal_connect(w_logout_btn, "clicked", G_CALLBACK(on_logout_clicked), NULL);
-
-
-   w_status_lbl = gtk_label_new("Disconnected");
-   gtk_widget_set_halign(w_status_lbl, GTK_ALIGN_END);
-
-
-   gtk_box_pack_start(GTK_BOX(top_bar), w_nick_entry, FALSE, FALSE, 0);
-   gtk_box_pack_start(GTK_BOX(top_bar), w_reg_btn, FALSE, FALSE, 0);
-   gtk_box_pack_start(GTK_BOX(top_bar), w_reconn_btn, FALSE, FALSE, 0);
-   gtk_box_pack_start(GTK_BOX(top_bar), w_logout_btn, FALSE, FALSE, 0);
-   gtk_box_pack_end(GTK_BOX(top_bar), w_status_lbl, TRUE, TRUE, 0);
-   gtk_box_pack_start(GTK_BOX(root), top_bar, FALSE, FALSE, 0);
-
-
-   GtkWidget *mid_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
-
-
-   GtkWidget *chat_col = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
-
-
-   GtkWidget *header_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-   w_chat_header = gtk_label_new("★ System");
-   gtk_widget_set_halign(w_chat_header, GTK_ALIGN_START);
-
-
-   w_leave_btn = gtk_button_new_with_label("Leave");
-   gtk_style_context_add_class(gtk_widget_get_style_context(w_leave_btn), "leave-btn");
-   g_signal_connect(w_leave_btn, "clicked", G_CALLBACK(on_leave_room_clicked), NULL);
-
-
-   gtk_box_pack_start(GTK_BOX(header_bar), w_chat_header, TRUE, TRUE, 0);
-   gtk_box_pack_end(GTK_BOX(header_bar), w_leave_btn, FALSE, FALSE, 0);
-   gtk_box_pack_start(GTK_BOX(chat_col), header_bar, FALSE, FALSE, 0);
-
-
-   GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
-   gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
-
-
-   w_chat_view = gtk_text_view_new_with_buffer(g_sys_buf);
-   gtk_text_view_set_editable(GTK_TEXT_VIEW(w_chat_view), FALSE);
-   gtk_text_view_set_cursor_visible(GTK_TEXT_VIEW(w_chat_view), FALSE);
-   gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(w_chat_view), GTK_WRAP_WORD_CHAR);
-   gtk_text_view_set_left_margin(GTK_TEXT_VIEW(w_chat_view), 10);
-   gtk_text_view_set_right_margin(GTK_TEXT_VIEW(w_chat_view), 10);
-   gtk_text_view_set_top_margin(GTK_TEXT_VIEW(w_chat_view), 8);
-   gtk_text_view_set_bottom_margin(GTK_TEXT_VIEW(w_chat_view), 8);
-
-
-   gtk_container_add(GTK_CONTAINER(scroll), w_chat_view);
-   gtk_box_pack_start(GTK_BOX(chat_col), scroll, TRUE, TRUE, 0);
-   gtk_box_pack_start(GTK_BOX(mid_box), chat_col, TRUE, TRUE, 0);
-
-
-   GtkWidget *sidebar = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
-   gtk_widget_set_size_request(sidebar, 210, -1);
-
-
-   GtkWidget *tab_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-   gtk_box_set_homogeneous(GTK_BOX(tab_bar), TRUE);
-
-
-   w_tab_users = gtk_button_new_with_label("Users");
-   gtk_style_context_add_class(gtk_widget_get_style_context(w_tab_users), "tab-btn");
-   g_signal_connect(w_tab_users, "clicked", G_CALLBACK(on_tab_users_clicked), NULL);
-
-
-   w_tab_rooms = gtk_button_new_with_label("Rooms");
-   gtk_style_context_add_class(gtk_widget_get_style_context(w_tab_rooms), "tab-btn");
-   g_signal_connect(w_tab_rooms, "clicked", G_CALLBACK(on_tab_rooms_clicked), NULL);
-
-
-   gtk_box_pack_start(GTK_BOX(tab_bar), w_tab_users, TRUE, TRUE, 0);
-   gtk_box_pack_start(GTK_BOX(tab_bar), w_tab_rooms, TRUE, TRUE, 0);
-   gtk_box_pack_start(GTK_BOX(sidebar), tab_bar, FALSE, FALSE, 0);
-
-
-   w_sidebar_stack = gtk_stack_new();
-   gtk_stack_set_transition_type(GTK_STACK(w_sidebar_stack), GTK_STACK_TRANSITION_TYPE_NONE);
-
-
-   /* Users tab page */
-   GtkWidget *users_page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
-   w_users_lbl = gtk_label_new("Online (0)");
-   gtk_widget_set_halign(w_users_lbl, GTK_ALIGN_START);
-   gtk_box_pack_start(GTK_BOX(users_page), w_users_lbl, FALSE, FALSE, 0);
-
-
-   GtkWidget *users_scroll = gtk_scrolled_window_new(NULL, NULL);
-   gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(users_scroll), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
-
-
-   w_users_list = gtk_list_box_new();
-   gtk_list_box_set_selection_mode(GTK_LIST_BOX(w_users_list), GTK_SELECTION_SINGLE);
-   g_signal_connect(w_users_list, "row-selected", G_CALLBACK(on_user_row_selected), NULL);
-
-
-   gtk_container_add(GTK_CONTAINER(users_scroll), w_users_list);
-   gtk_box_pack_start(GTK_BOX(users_page), users_scroll, TRUE, TRUE, 0);
-   gtk_stack_add_named(GTK_STACK(w_sidebar_stack), users_page, "users");
-
-
-   /* Rooms tab page */
-   GtkWidget *rooms_page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
-   GtkWidget *join_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
-
-
-   w_room_entry = gtk_entry_new();
-   gtk_entry_set_placeholder_text(GTK_ENTRY(w_room_entry), "room");
-   gtk_entry_set_max_length(GTK_ENTRY(w_room_entry), MAX_NAME - 2);
-   gtk_entry_set_width_chars(GTK_ENTRY(w_room_entry), 10);
-   g_signal_connect(w_room_entry, "activate", G_CALLBACK(on_join_room_clicked), NULL);
-
-
-   w_join_btn = gtk_button_new_with_label("Join");
-   g_signal_connect(w_join_btn, "clicked", G_CALLBACK(on_join_room_clicked), NULL);
-
-
-   gtk_box_pack_start(GTK_BOX(join_bar), w_room_entry, TRUE, TRUE, 0);
-   gtk_box_pack_start(GTK_BOX(join_bar), w_join_btn, FALSE, FALSE, 0);
-   gtk_box_pack_start(GTK_BOX(rooms_page), join_bar, FALSE, FALSE, 0);
-
-
-   w_rooms_lbl = gtk_label_new("Active rooms (0)");
-   gtk_widget_set_halign(w_rooms_lbl, GTK_ALIGN_START);
-   gtk_box_pack_start(GTK_BOX(rooms_page), w_rooms_lbl, FALSE, FALSE, 0);
-
-
-   GtkWidget *rooms_scroll = gtk_scrolled_window_new(NULL, NULL);
-   gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(rooms_scroll), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
-
-
-   w_rooms_list = gtk_list_box_new();
-   gtk_list_box_set_selection_mode(GTK_LIST_BOX(w_rooms_list), GTK_SELECTION_SINGLE);
-   g_signal_connect(w_rooms_list, "row-selected", G_CALLBACK(on_room_row_selected), NULL);
-
-
-   gtk_container_add(GTK_CONTAINER(rooms_scroll), w_rooms_list);
-   gtk_box_pack_start(GTK_BOX(rooms_page), rooms_scroll, TRUE, TRUE, 0);
-   gtk_stack_add_named(GTK_STACK(w_sidebar_stack), rooms_page, "rooms");
-
-
-   gtk_box_pack_start(GTK_BOX(sidebar), w_sidebar_stack, TRUE, TRUE, 0);
-   gtk_box_pack_start(GTK_BOX(mid_box), sidebar, FALSE, FALSE, 0);
-
-
-   gtk_box_pack_start(GTK_BOX(root), mid_box, TRUE, TRUE, 0);
-
-
-   GtkWidget *bottom_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-   w_target_entry = gtk_entry_new();
-   gtk_entry_set_placeholder_text(GTK_ENTRY(w_target_entry), "To / #room");
-   gtk_entry_set_max_length(GTK_ENTRY(w_target_entry), MAX_NAME);
-   gtk_entry_set_width_chars(GTK_ENTRY(w_target_entry), 14);
-
-
-   w_msg_entry = gtk_entry_new();
-   gtk_entry_set_placeholder_text(GTK_ENTRY(w_msg_entry), "Message...");
-   gtk_entry_set_max_length(GTK_ENTRY(w_msg_entry), MAX_TEXT - 1);
-   g_signal_connect(w_msg_entry, "activate", G_CALLBACK(on_send_clicked), NULL);
-
-
-   w_send_btn = gtk_button_new_with_label("Send");
-   g_signal_connect(w_send_btn, "clicked", G_CALLBACK(on_send_clicked), NULL);
-
-
-   gtk_box_pack_start(GTK_BOX(bottom_bar), w_target_entry, FALSE, FALSE, 0);
-   gtk_box_pack_start(GTK_BOX(bottom_bar), w_msg_entry, TRUE, TRUE, 0);
-   gtk_box_pack_start(GTK_BOX(bottom_bar), w_send_btn, FALSE, FALSE, 0);
-   gtk_box_pack_start(GTK_BOX(root), bottom_bar, FALSE, FALSE, 0);
-
-
-   gtk_widget_show_all(w_window);
-   ui_select_sidebar_tab("users");
-   ui_set_connected_state(0, "", 0);
+    g_sys_buf = create_chat_buffer();
+
+    w_window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    gtk_window_set_title(GTK_WINDOW(w_window), "Queue Messenger");
+    gtk_window_set_default_size(GTK_WINDOW(w_window), 820, 500);
+    g_signal_connect(w_window, "destroy", G_CALLBACK(on_window_destroy), NULL);
+
+    GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    gtk_widget_set_margin_top(root, 12);
+    gtk_widget_set_margin_bottom(root, 12);
+    gtk_widget_set_margin_start(root, 12);
+    gtk_widget_set_margin_end(root, 12);
+    gtk_container_add(GTK_CONTAINER(w_window), root);
+
+    GtkWidget *top_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    w_nick_entry = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(w_nick_entry), "Username");
+    gtk_entry_set_max_length(GTK_ENTRY(w_nick_entry), MAX_NAME - 1);
+    g_signal_connect(w_nick_entry, "activate", G_CALLBACK(on_nick_activate), NULL);
+
+    w_reg_btn = gtk_button_new_with_label("Register");
+    g_signal_connect(w_reg_btn, "clicked", G_CALLBACK(on_register_clicked), NULL);
+
+    w_reconn_btn = gtk_button_new_with_label("Reconnect");
+    g_signal_connect(w_reconn_btn, "clicked", G_CALLBACK(on_reconnect_clicked), NULL);
+
+    w_logout_btn = gtk_button_new_with_label("Logout");
+    g_signal_connect(w_logout_btn, "clicked", G_CALLBACK(on_logout_clicked), NULL);
+
+    w_theme_combo = gtk_combo_box_text_new();
+    for (int i = 0; i < THEME_COUNT; i++) {
+        gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(w_theme_combo), g_themes[i].name);
+    }
+    gtk_combo_box_set_active(GTK_COMBO_BOX(w_theme_combo), g_theme_idx);
+    g_signal_connect(w_theme_combo, "changed", G_CALLBACK(on_theme_changed), NULL);
+
+    w_status_lbl = gtk_label_new("Disconnected");
+    gtk_widget_set_halign(w_status_lbl, GTK_ALIGN_END);
+
+    gtk_box_pack_start(GTK_BOX(top_bar), w_nick_entry, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(top_bar), w_reg_btn, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(top_bar), w_reconn_btn, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(top_bar), w_logout_btn, FALSE, FALSE, 0);
+    gtk_box_pack_end(GTK_BOX(top_bar), w_theme_combo, FALSE, FALSE, 0);
+    gtk_box_pack_end(GTK_BOX(top_bar), w_status_lbl, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(root), top_bar, FALSE, FALSE, 0);
+
+    GtkWidget *mid_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+
+    GtkWidget *chat_col = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+
+    GtkWidget *header_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    w_chat_header = gtk_label_new("★ System");
+    gtk_widget_set_halign(w_chat_header, GTK_ALIGN_START);
+
+    w_leave_btn = gtk_button_new_with_label("Leave");
+    gtk_style_context_add_class(gtk_widget_get_style_context(w_leave_btn), "leave-btn");
+    g_signal_connect(w_leave_btn, "clicked", G_CALLBACK(on_leave_room_clicked), NULL);
+
+    gtk_box_pack_start(GTK_BOX(header_bar), w_chat_header, TRUE, TRUE, 0);
+    gtk_box_pack_end(GTK_BOX(header_bar), w_leave_btn, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(chat_col), header_bar, FALSE, FALSE, 0);
+
+    GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+
+    w_chat_view = gtk_text_view_new_with_buffer(g_sys_buf);
+    gtk_text_view_set_editable(GTK_TEXT_VIEW(w_chat_view), FALSE);
+    gtk_text_view_set_cursor_visible(GTK_TEXT_VIEW(w_chat_view), FALSE);
+    gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(w_chat_view), GTK_WRAP_WORD_CHAR);
+    gtk_text_view_set_left_margin(GTK_TEXT_VIEW(w_chat_view), 10);
+    gtk_text_view_set_right_margin(GTK_TEXT_VIEW(w_chat_view), 10);
+    gtk_text_view_set_top_margin(GTK_TEXT_VIEW(w_chat_view), 8);
+    gtk_text_view_set_bottom_margin(GTK_TEXT_VIEW(w_chat_view), 8);
+
+    gtk_container_add(GTK_CONTAINER(scroll), w_chat_view);
+    gtk_box_pack_start(GTK_BOX(chat_col), scroll, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(mid_box), chat_col, TRUE, TRUE, 0);
+
+    GtkWidget *sidebar = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_widget_set_size_request(sidebar, 210, -1);
+
+    GtkWidget *tab_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_box_set_homogeneous(GTK_BOX(tab_bar), TRUE);
+
+    w_tab_users = gtk_button_new_with_label("Users");
+    gtk_style_context_add_class(gtk_widget_get_style_context(w_tab_users), "tab-btn");
+    g_signal_connect(w_tab_users, "clicked", G_CALLBACK(on_tab_users_clicked), NULL);
+
+    w_tab_rooms = gtk_button_new_with_label("Rooms");
+    gtk_style_context_add_class(gtk_widget_get_style_context(w_tab_rooms), "tab-btn");
+    g_signal_connect(w_tab_rooms, "clicked", G_CALLBACK(on_tab_rooms_clicked), NULL);
+
+    gtk_box_pack_start(GTK_BOX(tab_bar), w_tab_users, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(tab_bar), w_tab_rooms, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(sidebar), tab_bar, FALSE, FALSE, 0);
+
+    w_sidebar_stack = gtk_stack_new();
+    gtk_stack_set_transition_type(GTK_STACK(w_sidebar_stack), GTK_STACK_TRANSITION_TYPE_NONE);
+
+    /* Users tab page */
+    GtkWidget *users_page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    w_users_lbl = gtk_label_new("Online (0)");
+    gtk_widget_set_halign(w_users_lbl, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(users_page), w_users_lbl, FALSE, FALSE, 0);
+
+    GtkWidget *users_scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(users_scroll), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+
+    w_users_list = gtk_list_box_new();
+    gtk_list_box_set_selection_mode(GTK_LIST_BOX(w_users_list), GTK_SELECTION_SINGLE);
+    g_signal_connect(w_users_list, "row-selected", G_CALLBACK(on_user_row_selected), NULL);
+
+    gtk_container_add(GTK_CONTAINER(users_scroll), w_users_list);
+    gtk_box_pack_start(GTK_BOX(users_page), users_scroll, TRUE, TRUE, 0);
+    gtk_stack_add_named(GTK_STACK(w_sidebar_stack), users_page, "users");
+
+    /* Rooms tab page */
+    GtkWidget *rooms_page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    GtkWidget *join_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+
+    w_room_entry = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(w_room_entry), "room");
+    gtk_entry_set_max_length(GTK_ENTRY(w_room_entry), MAX_NAME - 2);
+    gtk_entry_set_width_chars(GTK_ENTRY(w_room_entry), 10);
+    g_signal_connect(w_room_entry, "activate", G_CALLBACK(on_join_room_clicked), NULL);
+
+    w_join_btn = gtk_button_new_with_label("Join");
+    g_signal_connect(w_join_btn, "clicked", G_CALLBACK(on_join_room_clicked), NULL);
+
+    gtk_box_pack_start(GTK_BOX(join_bar), w_room_entry, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(join_bar), w_join_btn, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(rooms_page), join_bar, FALSE, FALSE, 0);
+
+    w_rooms_lbl = gtk_label_new("Active rooms (0)");
+    gtk_widget_set_halign(w_rooms_lbl, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(rooms_page), w_rooms_lbl, FALSE, FALSE, 0);
+
+    GtkWidget *rooms_scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(rooms_scroll), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+
+    w_rooms_list = gtk_list_box_new();
+    gtk_list_box_set_selection_mode(GTK_LIST_BOX(w_rooms_list), GTK_SELECTION_SINGLE);
+    g_signal_connect(w_rooms_list, "row-selected", G_CALLBACK(on_room_row_selected), NULL);
+
+    gtk_container_add(GTK_CONTAINER(rooms_scroll), w_rooms_list);
+    gtk_box_pack_start(GTK_BOX(rooms_page), rooms_scroll, TRUE, TRUE, 0);
+    gtk_stack_add_named(GTK_STACK(w_sidebar_stack), rooms_page, "rooms");
+
+    gtk_box_pack_start(GTK_BOX(sidebar), w_sidebar_stack, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(mid_box), sidebar, FALSE, FALSE, 0);
+
+    gtk_box_pack_start(GTK_BOX(root), mid_box, TRUE, TRUE, 0);
+
+    GtkWidget *bottom_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    w_target_entry = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(w_target_entry), "To / #room");
+    gtk_entry_set_max_length(GTK_ENTRY(w_target_entry), MAX_NAME);
+    gtk_entry_set_width_chars(GTK_ENTRY(w_target_entry), 14);
+
+    w_msg_entry = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(w_msg_entry), "Message...");
+    gtk_entry_set_max_length(GTK_ENTRY(w_msg_entry), MAX_TEXT - 1);
+    g_signal_connect(w_msg_entry, "activate", G_CALLBACK(on_send_clicked), NULL);
+
+    w_send_btn = gtk_button_new_with_label("Send");
+    g_signal_connect(w_send_btn, "clicked", G_CALLBACK(on_send_clicked), NULL);
+
+    gtk_box_pack_start(GTK_BOX(bottom_bar), w_target_entry, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(bottom_bar), w_msg_entry, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(bottom_bar), w_send_btn, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(root), bottom_bar, FALSE, FALSE, 0);
+
+    apply_theme(g_theme_idx);
+    gtk_widget_show_all(w_window);
+    ui_select_sidebar_tab("users");
+    ui_set_connected_state(0, "", 0);
 }
 
-
 int main(int argc, char *argv[]) {
-   gtk_init(&argc, &argv);
+    gtk_init(&argc, &argv);
 
+    key_t key = ftok(QUEUE_KEY_PATH, QUEUE_KEY_PROJ);
+    if (key == (key_t)-1) {
+        perror("ftok");
+        return 1;
+    }
 
-   key_t key = ftok(QUEUE_KEY_PATH, QUEUE_KEY_PROJ);
-   if (key == (key_t)-1) {
-       perror("ftok");
-       return 1;
-   }
+    g_msqid = msgget(key, 0666);
+    if (g_msqid < 0) {
+        GtkWidget *dlg = gtk_message_dialog_new(
+            NULL,
+            GTK_DIALOG_MODAL,
+            GTK_MESSAGE_ERROR,
+            GTK_BUTTONS_OK,
+            "Arbiter is not running.\nStart './extraq arbiter' in a terminal first."
+        );
+        gtk_dialog_run(GTK_DIALOG(dlg));
+        gtk_widget_destroy(dlg);
+        return 1;
+    }
 
+    g_reply_type = REPLY_BASE + (long)getpid() * 2L;
+    g_who_reply_type = g_reply_type + 1L;
 
-   g_msqid = msgget(key, 0666);
-   if (g_msqid < 0) {
-       GtkWidget *dlg = gtk_message_dialog_new(
-           NULL,
-           GTK_DIALOG_MODAL,
-           GTK_MESSAGE_ERROR,
-           GTK_BUTTONS_OK,
-           "Arbiter is not running.\nStart './extraq arbiter' in a terminal first."
-       );
-       gtk_dialog_run(GTK_DIALOG(dlg));
-       gtk_widget_destroy(dlg);
-       return 1;
-   }
+    build_ui();
 
+    pthread_t t_recv;
+    pthread_t t_hb;
+    if (pthread_create(&t_recv, NULL, recv_worker, NULL) != 0) {
+        perror("pthread_create");
+        return 1;
+    }
+    if (pthread_create(&t_hb, NULL, heartbeat_worker, NULL) != 0) {
+        g_running = 0;
+        pthread_join(t_recv, NULL);
+        perror("pthread_create");
+        return 1;
+    }
 
-   g_reply_type = REPLY_BASE + (long)getpid() * 2L;
-   g_who_reply_type = g_reply_type + 1L;
+    gtk_main();
 
-
-   build_ui();
-
-
-   pthread_t t_recv;
-   pthread_t t_hb;
-   if (pthread_create(&t_recv, NULL, recv_worker, NULL) != 0) {
-       perror("pthread_create");
-       return 1;
-   }
-   if (pthread_create(&t_hb, NULL, heartbeat_worker, NULL) != 0) {
-       g_running = 0;
-       pthread_join(t_recv, NULL);
-       perror("pthread_create");
-       return 1;
-   }
-
-
-   gtk_main();
-
-
-   send_logout();
-   g_running = 0;
-   pthread_join(t_recv, NULL);
-   pthread_join(t_hb, NULL);
-   return 0;
+    send_logout();
+    g_running = 0;
+    pthread_join(t_recv, NULL);
+    pthread_join(t_hb, NULL);
+    return 0;
 }
