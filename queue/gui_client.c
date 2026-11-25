@@ -25,12 +25,16 @@ enum ui_event_kind {
     EV_LOST = 3,
     EV_WHO = 4,
     EV_ROOM_MSG = 5,
-    EV_ROOMS = 6
+    EV_ROOMS = 6,
+    EV_HISTORY_ITEM = 7
 };
 
 struct ui_event {
     int kind;
+    int is_room;
+    int is_outgoing;
     long msg_id;
+    long timestamp;
     char room[MAX_NAME];
     char sender[MAX_NAME];
     char text[MAX_TEXT];
@@ -51,7 +55,10 @@ struct dialog_entry {
     char peer[MAX_NAME];
     GtkTextBuffer *buf;
     struct pending_ack pending_acks[MAX_PENDING_ACKS];
+
     int pending_ack_count;
+    long unacked_ids[MAX_PENDING_ACKS];
+    int unacked_count;
 };
 
 struct room_list_item {
@@ -178,6 +185,7 @@ static GtkWidget *w_status_lbl = NULL;
 static GtkWidget *w_theme_combo = NULL;
 static GtkWidget *w_chat_header = NULL;
 static GtkWidget *w_leave_btn = NULL;
+static GtkWidget *w_delete_btn = NULL;
 static GtkWidget *w_chat_view = NULL;
 
 static GtkWidget *w_tab_users = NULL;
@@ -214,6 +222,22 @@ static void get_timestamp(char *buf, size_t size) {
     struct tm tm_now;
     localtime_r(&now, &tm_now);
     strftime(buf, size, "%H:%M:%S", &tm_now);
+}
+
+static void format_timestamp_from(time_t ts, char *buf, size_t size) {
+    time_t now = time(NULL);
+    if (ts <= 0) {
+        ts = now;
+    }
+    struct tm tm_ts;
+    struct tm tm_now;
+    localtime_r(&ts, &tm_ts);
+    localtime_r(&now, &tm_now);
+    if (tm_ts.tm_year == tm_now.tm_year && tm_ts.tm_yday == tm_now.tm_yday) {
+        strftime(buf, size, "%H:%M:%S", &tm_ts);
+    } else {
+        strftime(buf, size, "%d.%m %H:%M", &tm_ts);
+    }
 }
 
 static void drain_type(int msqid, long mtype) {
@@ -284,6 +308,31 @@ static void send_read_ack(long msg_id, const char *sender_name) {
     snprintf(ack.sender_name, sizeof(ack.sender_name), "%.*s", MAX_NAME - 1, cur_name);
     msgsnd(g_msqid, &ack, MSG_SIZE, IPC_NOWAIT);
 }
+
+static void send_mark_read(const char *peer, int is_room) {
+    if (peer == NULL || peer[0] == '\0' || g_msqid < 0) {
+        return;
+    }
+
+    pthread_mutex_lock(&g_mtx);
+    long my_id = g_my_id;
+    int is_dbg = g_is_debug;
+    pthread_mutex_unlock(&g_mtx);
+
+    if (my_id <= 0 || is_dbg) {
+        return;
+    }
+
+    struct qmsg req;
+    memset(&req, 0, sizeof(req));
+    req.mtype = ARBITER_TYPE;
+    req.cmd = CMD_MARK_READ;
+    req.sender_id = my_id;
+    req.target_id = is_room ? 1 : 0;
+    snprintf(req.name, sizeof(req.name), "%.*s", MAX_NAME - 1, peer);
+    msgsnd(g_msqid, &req, MSG_SIZE, IPC_NOWAIT);
+}
+
 
 static void apply_buffer_theme(GtkTextBuffer *buf) {
     if (buf == NULL) {
@@ -491,6 +540,24 @@ static struct dialog_entry *get_or_create_dialog(const char *peer, int is_room) 
     return NULL;
 }
 
+static void remove_dialog(const char *peer, int is_room) {
+    if (peer == NULL || peer[0] == '\0') {
+        return;
+    }
+    if (g_active_is_room == is_room && strcmp(g_active_peer, peer) == 0) {
+        ui_switch_dialog("", 0, 0);
+    }
+    for (int i = 0; i < MAX_DIALOGS; i++) {
+        if (g_dialogs[i].used && g_dialogs[i].is_room == is_room && strcmp(g_dialogs[i].peer, peer) == 0) {
+            if (g_dialogs[i].buf != NULL) {
+                g_object_unref(g_dialogs[i].buf);
+            }
+            memset(&g_dialogs[i], 0, sizeof(g_dialogs[i]));
+            break;
+        }
+    }
+}
+
 static void flush_dialog_acks(struct dialog_entry *d) {
     if (d == NULL) {
         return;
@@ -526,18 +593,22 @@ static void ui_scroll_if_active(GtkTextBuffer *buf) {
     gtk_text_view_scroll_to_mark(GTK_TEXT_VIEW(w_chat_view), mark, 0.0, TRUE, 0.0, 1.0);
 }
 
-static void ui_append_line_to(GtkTextBuffer *buf, const char *tag_name, const char *prefix, const char *body) {
+static void ui_append_line_ts(GtkTextBuffer *buf, time_t ts_val, const char *tag_name, const char *prefix, const char *body) {
     if (buf == NULL) {
         return;
     }
 
-    char ts[16];
-    get_timestamp(ts, sizeof(ts));
+    char ts[24];
+    if (ts_val > 0) {
+        format_timestamp_from(ts_val, ts, sizeof(ts));
+    } else {
+        get_timestamp(ts, sizeof(ts));
+    }
 
     GtkTextIter end;
     gtk_text_buffer_get_end_iter(buf, &end);
 
-    char ts_str[24];
+    char ts_str[32];
     snprintf(ts_str, sizeof(ts_str), "[%s] ", ts);
     gtk_text_buffer_insert_with_tags_by_name(buf, &end, ts_str, -1, "time", NULL);
 
@@ -551,6 +622,10 @@ static void ui_append_line_to(GtkTextBuffer *buf, const char *tag_name, const ch
 
     gtk_text_buffer_insert(buf, &end, "\n", -1);
     ui_scroll_if_active(buf);
+}
+
+static void ui_append_line_to(GtkTextBuffer *buf, const char *tag_name, const char *prefix, const char *body) {
+    ui_append_line_ts(buf, 0, tag_name, prefix, body);
 }
 
 static void ui_append_sys(const char *tag_name, const char *text) {
@@ -597,6 +672,18 @@ static void ui_append_outgoing_to(GtkTextBuffer *buf, long msg_id, const char *b
     ui_scroll_if_active(buf);
 }
 
+
+static void record_unacked_id(struct dialog_entry *d, long msg_id) {
+    if (d == NULL || msg_id <= 0) {
+        return;
+    }
+    if (d->unacked_count >= MAX_PENDING_ACKS) {
+        memmove(&d->unacked_ids[0], &d->unacked_ids[1], sizeof(long) * (MAX_PENDING_ACKS - 1));
+        d->unacked_count = MAX_PENDING_ACKS - 1;
+    }
+    d->unacked_ids[d->unacked_count++] = msg_id;
+}
+
 static void ui_mark_delivered(long msg_id) {
     char m_start[32];
     char m_end[32];
@@ -618,11 +705,37 @@ static void ui_mark_delivered(long msg_id) {
             gtk_text_buffer_insert_with_tags_by_name(g_dialogs[i].buf, &s, " ✓✓", -1, "ack", NULL);
             gtk_text_buffer_delete_mark(g_dialogs[i].buf, ms);
             gtk_text_buffer_delete_mark(g_dialogs[i].buf, me);
+            for (int j = 0; j < g_dialogs[i].unacked_count; j++) {
+                if (g_dialogs[i].unacked_ids[j] == msg_id) {
+                    for (int k = j; k < g_dialogs[i].unacked_count - 1; k++) {
+                        g_dialogs[i].unacked_ids[k] = g_dialogs[i].unacked_ids[k + 1];
+                    }
+                    g_dialogs[i].unacked_count--;
+                    break;
+                }
+            }
             return;
         }
     }
 }
 
+static void ui_mark_all_delivered(const char *peer) {
+    struct dialog_entry *d = find_dialog(peer, 0);
+    if (d == NULL) {
+        return;
+    }
+    while (d->unacked_count > 0) {
+        long mid = d->unacked_ids[0];
+        int prev_count = d->unacked_count;
+        ui_mark_delivered(mid);
+        if (d->unacked_count == prev_count) {
+            for (int k = 0; k < d->unacked_count - 1; k++) {
+                d->unacked_ids[k] = d->unacked_ids[k + 1];
+            }
+            d->unacked_count--;
+        }
+    }
+}
 static void ui_update_chat_header(void) {
     if (w_chat_header == NULL) {
         return;
@@ -632,6 +745,9 @@ static void ui_update_chat_header(void) {
         gtk_label_set_text(GTK_LABEL(w_chat_header), "★ System");
         if (w_leave_btn != NULL) {
             gtk_widget_set_visible(w_leave_btn, FALSE);
+        }
+        if (w_delete_btn != NULL) {
+            gtk_widget_set_visible(w_delete_btn, FALSE);
         }
         return;
     }
@@ -645,12 +761,20 @@ static void ui_update_chat_header(void) {
         if (w_leave_btn != NULL) {
             gtk_widget_set_visible(w_leave_btn, (d != NULL && d->joined) ? TRUE : FALSE);
         }
+        if (w_delete_btn != NULL) {
+            gtk_button_set_label(GTK_BUTTON(w_delete_btn), "Delete Room");
+            gtk_widget_set_visible(w_delete_btn, TRUE);
+        }
     } else {
         int online = is_user_online(g_active_peer);
         snprintf(header, sizeof(header), "Chat with %s (%s)", g_active_peer, online ? "online" : "offline");
         gtk_label_set_text(GTK_LABEL(w_chat_header), header);
         if (w_leave_btn != NULL) {
             gtk_widget_set_visible(w_leave_btn, FALSE);
+        }
+        if (w_delete_btn != NULL) {
+            gtk_button_set_label(GTK_BUTTON(w_delete_btn), "Delete Chat");
+            gtk_widget_set_visible(w_delete_btn, TRUE);
         }
     }
 }
@@ -751,6 +875,8 @@ static void ui_switch_dialog(const char *peer, int is_room, int set_target) {
     g_active_is_room = is_room;
     d->unread = 0;
     flush_dialog_acks(d);
+
+    send_mark_read(d->peer, is_room);
 
     gtk_text_view_set_buffer(GTK_TEXT_VIEW(w_chat_view), d->buf);
     ui_scroll_if_active(d->buf);
@@ -944,11 +1070,6 @@ static void ui_update_users_list(long count, const char *list_text) {
     (void)count;
     g_online_count = 0;
 
-    char cur_name[MAX_NAME];
-    pthread_mutex_lock(&g_mtx);
-    snprintf(cur_name, sizeof(cur_name), "%.*s", MAX_NAME - 1, g_my_name);
-    pthread_mutex_unlock(&g_mtx);
-
     if (list_text != NULL && list_text[0] != '\0') {
         char copy[MAX_TEXT];
         snprintf(copy, sizeof(copy), "%.*s", MAX_TEXT - 1, list_text);
@@ -961,9 +1082,6 @@ static void ui_update_users_list(long count, const char *list_text) {
             if (*tok != '\0') {
                 snprintf(g_online_users[g_online_count], MAX_NAME, "%.*s", MAX_NAME - 1, tok);
                 g_online_count++;
-                if (cur_name[0] != '\0' && strcmp(tok, cur_name) != 0) {
-                    get_or_create_dialog(tok, 0);
-                }
             }
             tok = strtok_r(NULL, ",", &saveptr);
         }
@@ -1100,8 +1218,8 @@ static int do_join_room(const char *raw_name) {
             d->joined = 1;
             d->member_count = (int)rep.target_id;
             char note[MAX_TEXT + MAX_NAME + 16];
-            snprintf(note, sizeof(note), "* You %s #%s.", rep.text, req.name);
-            ui_append_line_to(d->buf, "sys", note, NULL);
+            snprintf(note, sizeof(note), "Room #%s: %s.", req.name, rep.text);
+            ui_append_sys("sys", note);
         }
         g_who_force = 1;
         ui_switch_dialog(req.name, 1, 1);
@@ -1192,6 +1310,70 @@ static void on_leave_room_clicked(GtkWidget *widget, gpointer data) {
     }
 }
 
+static void on_delete_clicked(GtkWidget *widget, gpointer data) {
+    (void)widget;
+    (void)data;
+    if (g_active_peer[0] == '\0') {
+        return;
+    }
+
+    pthread_mutex_lock(&g_mtx);
+    long cur_id = g_my_id;
+    pthread_mutex_unlock(&g_mtx);
+
+    if (cur_id <= 0) {
+        return;
+    }
+
+    char peer[MAX_NAME];
+    int is_room = g_active_is_room;
+    snprintf(peer, sizeof(peer), "%.*s", MAX_NAME - 1, g_active_peer);
+
+    struct qmsg req;
+    memset(&req, 0, sizeof(req));
+    req.mtype = ARBITER_TYPE;
+    req.cmd = is_room ? CMD_DELETE_ROOM : CMD_DELETE_CHAT;
+    req.sender_id = cur_id;
+    req.reply_type = g_reply_type;
+    snprintf(req.name, sizeof(req.name), "%.*s", MAX_NAME - 1, peer);
+
+    if (msgsnd(g_msqid, &req, MSG_SIZE, IPC_NOWAIT) < 0) {
+        ui_append_error(errno == EAGAIN
+            ? "Message queue is full, try again."
+            : "Failed to delete.");
+        return;
+    }
+
+    struct qmsg rep;
+    if (wait_reply(g_msqid, g_reply_type, &rep, 200) < 0) {
+        ui_append_error("No response from arbiter.");
+        return;
+    }
+    rep.text[MAX_TEXT - 1] = '\0';
+
+    if (rep.target_id > 0) {
+        remove_dialog(peer, is_room);
+        if (w_target_entry != NULL) {
+            gtk_entry_set_text(GTK_ENTRY(w_target_entry), "");
+        }
+        char note[MAX_NAME + 48];
+        if (is_room) {
+            snprintf(note, sizeof(note), "Deleted room #%s.", peer);
+        } else {
+            snprintf(note, sizeof(note), "Deleted chat with %s.", peer);
+        }
+        ui_append_sys("warn", note);
+        g_who_force = 1;
+        ui_rebuild_users_list();
+        ui_rebuild_rooms_list();
+        ui_update_tab_labels();
+    } else {
+        char err[MAX_TEXT + 32];
+        snprintf(err, sizeof(err), "Delete failed: %s", rep.text);
+        ui_append_error(err);
+    }
+}
+
 static void on_user_row_selected(GtkListBox *box, GtkListBoxRow *row, gpointer data) {
     (void)data;
     if (g_suppress_select || row == NULL) {
@@ -1266,7 +1448,6 @@ static void ui_set_connected_state(int connected, const char *name, long id, int
         char title[128];
         snprintf(status, sizeof(status), "Online: %s%s (id=%ld)",
                  name, is_debug ? " [DEBUG]" : "", id);
-
         snprintf(title, sizeof(title), "DeepSpeak — %s%s",
                  name, is_debug ? " [DEBUG]" : "");
         gtk_label_set_text(GTK_LABEL(w_status_lbl), status);
@@ -1276,7 +1457,6 @@ static void ui_set_connected_state(int connected, const char *name, long id, int
         gtk_stack_set_visible_child_name(GTK_STACK(w_main_stack), "chat");
         gtk_widget_grab_focus(w_target_entry);
     } else {
-
         gtk_window_set_title(GTK_WINDOW(w_window), "DeepSpeak");
         clear_all_dialogs();
         if (w_target_entry != NULL) {
@@ -1302,16 +1482,41 @@ static gboolean ui_handle_event(gpointer user_data) {
         if (d != NULL) {
             char prefix[MAX_NAME + 8];
             snprintf(prefix, sizeof(prefix), "%s: ", ev->sender);
-            ui_append_line_to(d->buf, "incoming", prefix, ev->text);
+            ui_append_line_ts(d->buf, (time_t)ev->timestamp, "incoming", prefix, ev->text);
 
             if (!g_active_is_room && strcmp(g_active_peer, d->peer) == 0) {
                 send_read_ack(ev->msg_id, ev->sender);
+
+                send_mark_read(d->peer, 0);
             } else {
                 d->unread++;
                 queue_dialog_ack(d, ev->msg_id, ev->sender);
                 ui_rebuild_users_list();
                 ui_update_tab_labels();
             }
+        }
+    } else if (ev->kind == EV_HISTORY_ITEM) {
+        struct dialog_entry *d = get_or_create_dialog(ev->room, ev->is_room);
+        if (d != NULL) {
+            if (ev->is_room) {
+                d->joined = 1;
+            }
+            if (ev->is_outgoing) {
+                ui_append_line_ts(d->buf, (time_t)ev->timestamp, "outgoing", "you: ", ev->text);
+            } else {
+                char prefix[MAX_NAME + 8];
+                snprintf(prefix, sizeof(prefix), "%s: ", ev->sender);
+                ui_append_line_ts(d->buf, (time_t)ev->timestamp, "incoming", prefix, ev->text);
+
+            if (!ev->is_outgoing && ev->msg_id != 0) {
+                if (g_active_is_room == ev->is_room && strcmp(g_active_peer, d->peer) == 0) {
+                    send_mark_read(d->peer, ev->is_room);
+                } else {
+                    d->unread++;
+                }
+            }
+            }
+            ui_schedule_sidebar_rebuild();
         }
     } else if (ev->kind == EV_ROOM_MSG) {
         struct dialog_entry *d = get_or_create_dialog(ev->room, 1);
@@ -1323,10 +1528,12 @@ static gboolean ui_handle_event(gpointer user_data) {
             } else {
                 char prefix[MAX_NAME + 8];
                 snprintf(prefix, sizeof(prefix), "%s: ", ev->sender);
-                ui_append_line_to(d->buf, "incoming", prefix, ev->text);
+                ui_append_line_ts(d->buf, (time_t)ev->timestamp, "incoming", prefix, ev->text);
 
                 if (g_active_is_room && strcmp(g_active_peer, d->peer) == 0) {
                     send_read_ack(ev->msg_id, ev->sender);
+
+                    send_mark_read(d->peer, 1);
                 } else {
                     d->unread++;
                     queue_dialog_ack(d, ev->msg_id, ev->sender);
@@ -1336,7 +1543,12 @@ static gboolean ui_handle_event(gpointer user_data) {
             }
         }
     } else if (ev->kind == EV_ACK) {
-        ui_mark_delivered(ev->msg_id);
+
+        if (ev->msg_id == 0) {
+            ui_mark_all_delivered(ev->sender);
+        } else {
+            ui_mark_delivered(ev->msg_id);
+        }
     } else if (ev->kind == EV_WHO) {
         ui_update_users_list(ev->msg_id, ev->text);
     } else if (ev->kind == EV_ROOMS) {
@@ -1383,6 +1595,25 @@ static void *recv_worker(void *arg) {
                 if (ev != NULL) {
                     ev->kind = EV_CHAT;
                     ev->msg_id = msg.msg_id;
+                    ev->timestamp = msg.timestamp;
+                    copy_utf8_safe(ev->sender, sizeof(ev->sender), msg.sender_name);
+                    copy_utf8_safe(ev->text, sizeof(ev->text), msg.text);
+                    g_idle_add(ui_handle_event, ev);
+                }
+            } else if (msg.cmd == CMD_HISTORY_ITEM) {
+                msg.name[MAX_NAME - 1] = '\0';
+                msg.sender_name[MAX_NAME - 1] = '\0';
+                msg.text[MAX_TEXT - 1] = '\0';
+
+                struct ui_event *ev = calloc(1, sizeof(*ev));
+                if (ev != NULL) {
+                    ev->kind = EV_HISTORY_ITEM;
+                    ev->is_room = (msg.target_id != 0);
+                    ev->is_outgoing = (msg.sender_id != 0);
+
+                    ev->msg_id = msg.msg_id;
+                    ev->timestamp = msg.timestamp;
+                    copy_utf8_safe(ev->room, sizeof(ev->room), msg.name);
                     copy_utf8_safe(ev->sender, sizeof(ev->sender), msg.sender_name);
                     copy_utf8_safe(ev->text, sizeof(ev->text), msg.text);
                     g_idle_add(ui_handle_event, ev);
@@ -1396,6 +1627,7 @@ static void *recv_worker(void *arg) {
                 if (ev != NULL) {
                     ev->kind = EV_ROOM_MSG;
                     ev->msg_id = msg.msg_id;
+                    ev->timestamp = msg.timestamp;
                     copy_utf8_safe(ev->room, sizeof(ev->room), msg.name);
                     copy_utf8_safe(ev->sender, sizeof(ev->sender), msg.sender_name);
                     copy_utf8_safe(ev->text, sizeof(ev->text), msg.text);
@@ -1616,6 +1848,16 @@ static void do_auth(int is_login) {
                  is_login ? "Logged in" : "Registered", name,
                  is_dbg ? " [DEBUG]" : "", rep.target_id);
         ui_append_sys("sys", info);
+
+        if (!is_dbg) {
+            struct qmsg hreq;
+            memset(&hreq, 0, sizeof(hreq));
+            hreq.mtype = ARBITER_TYPE;
+            hreq.cmd = CMD_HISTORY;
+            hreq.sender_id = rep.target_id;
+            hreq.reply_type = 0;
+            msgsnd(g_msqid, &hreq, MSG_SIZE, IPC_NOWAIT);
+        }
     } else {
         char info[MAX_TEXT + 32];
         snprintf(info, sizeof(info), "%s", rep.text[0] != '\0' ? rep.text : "Auth failed");
@@ -1749,24 +1991,37 @@ static void on_send_clicked(GtkWidget *widget, gpointer data) {
         return;
     }
 
-    struct qmsg req;
-    memset(&req, 0, sizeof(req));
-    req.mtype = ARBITER_TYPE;
-    req.cmd = CMD_LOOKUP;
-    req.sender_id = cur_id;
-    req.reply_type = g_reply_type;
-    snprintf(req.name, sizeof(req.name), "%.*s", MAX_NAME - 1, target);
+    long msg_id = g_next_msg_id++;
 
-    if (msgsnd(g_msqid, &req, MSG_SIZE, IPC_NOWAIT) < 0) {
+    struct qmsg chat;
+    memset(&chat, 0, sizeof(chat));
+    chat.mtype = ARBITER_TYPE;
+    chat.cmd = CMD_CHAT;
+    chat.sender_id = cur_id;
+    chat.msg_id = msg_id;
+    chat.reply_type = g_reply_type;
+    snprintf(chat.name, sizeof(chat.name), "%.*s", MAX_NAME - 1, target);
+    snprintf(chat.sender_name, sizeof(chat.sender_name), "%.*s", MAX_NAME - 1, cur_name);
+    copy_utf8_safe(chat.text, sizeof(chat.text), text);
+
+    if (msgsnd(g_msqid, &chat, MSG_SIZE, IPC_NOWAIT) < 0) {
         ui_append_error(errno == EAGAIN
             ? "Message queue is full, try again."
-            : "Failed to send request to arbiter.");
+            : "Failed to send message.");
         return;
     }
 
     struct qmsg rep;
     if (wait_reply(g_msqid, g_reply_type, &rep, 200) < 0) {
         ui_append_error("No response from arbiter.");
+        return;
+    }
+    rep.text[MAX_TEXT - 1] = '\0';
+
+    if (rep.target_id < 0) {
+        char err[MAX_TEXT + 32];
+        snprintf(err, sizeof(err), "Send failed: %s", rep.text);
+        ui_append_error(err);
         return;
     }
 
@@ -1782,47 +2037,9 @@ static void on_send_clicked(GtkWidget *widget, gpointer data) {
         ui_update_chat_header();
     }
 
-    long msg_id = g_next_msg_id++;
+    ui_append_outgoing_to(d->buf, msg_id, text);
 
-    if (rep.target_id > 0) {
-        struct qmsg chat;
-        memset(&chat, 0, sizeof(chat));
-        chat.mtype = rep.target_id;
-        chat.cmd = CMD_CHAT;
-        chat.sender_id = cur_id;
-        chat.msg_id = msg_id;
-        snprintf(chat.sender_name, sizeof(chat.sender_name), "%.*s", MAX_NAME - 1, cur_name);
-        copy_utf8_safe(chat.text, sizeof(chat.text), text);
-
-        if (msgsnd(g_msqid, &chat, MSG_SIZE, IPC_NOWAIT) < 0) {
-            ui_append_error(errno == EAGAIN
-                ? "Message queue is full, try again."
-                : "Failed to send message.");
-            return;
-        }
-
-        ui_append_outgoing_to(d->buf, msg_id, text);
-    } else {
-        struct qmsg st;
-        memset(&st, 0, sizeof(st));
-        st.mtype = ARBITER_TYPE;
-        st.cmd = CMD_STORE;
-        st.sender_id = cur_id;
-        st.msg_id = msg_id;
-        snprintf(st.name, sizeof(st.name), "%.*s", MAX_NAME - 1, target);
-        snprintf(st.sender_name, sizeof(st.sender_name), "%.*s", MAX_NAME - 1, cur_name);
-        copy_utf8_safe(st.text, sizeof(st.text), text);
-
-        if (msgsnd(g_msqid, &st, MSG_SIZE, IPC_NOWAIT) < 0) {
-            ui_append_error(errno == EAGAIN
-                ? "Message queue is full, try again."
-                : "Failed to store offline message.");
-            return;
-        }
-
-        ui_append_outgoing_to(d->buf, msg_id, text);
-    }
-
+    record_unacked_id(d, msg_id);
     gtk_entry_set_text(GTK_ENTRY(w_msg_entry), "");
     gtk_widget_grab_focus(w_msg_entry);
 }
@@ -1833,6 +2050,7 @@ static void on_window_destroy(GtkWidget *widget, gpointer data) {
     w_chat_view = NULL;
     w_chat_header = NULL;
     w_leave_btn = NULL;
+    w_delete_btn = NULL;
     w_theme_combo = NULL;
     w_users_list = NULL;
     w_users_lbl = NULL;
@@ -1852,7 +2070,6 @@ static void build_ui(void) {
     g_sys_buf = create_chat_buffer();
 
     w_window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
-
     gtk_window_set_title(GTK_WINDOW(w_window), "DeepSpeak");
     gtk_window_set_default_size(GTK_WINDOW(w_window), 820, 500);
     g_signal_connect(w_window, "destroy", G_CALLBACK(on_window_destroy), NULL);
@@ -1870,7 +2087,6 @@ static void build_ui(void) {
     GtkWidget *auth_card = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
     gtk_widget_set_size_request(auth_card, 340, -1);
     gtk_style_context_add_class(gtk_widget_get_style_context(auth_card), "auth-card");
-
 
     GtkWidget *auth_title = gtk_label_new("DeepSpeak");
     gtk_style_context_add_class(gtk_widget_get_style_context(auth_title), "auth-title");
@@ -1956,10 +2172,15 @@ static void build_ui(void) {
     gtk_widget_set_halign(w_chat_header, GTK_ALIGN_START);
 
     w_leave_btn = gtk_button_new_with_label("Leave");
-    gtk_style_context_add_class(gtk_widget_get_style_context(w_leave_btn), "leave-btn");
+    gtk_style_context_add_class(gtk_widget_get_style_context(w_leave_btn), "tab-btn");
     g_signal_connect(w_leave_btn, "clicked", G_CALLBACK(on_leave_room_clicked), NULL);
 
+    w_delete_btn = gtk_button_new_with_label("Delete Chat");
+    gtk_style_context_add_class(gtk_widget_get_style_context(w_delete_btn), "leave-btn");
+    g_signal_connect(w_delete_btn, "clicked", G_CALLBACK(on_delete_clicked), NULL);
+
     gtk_box_pack_start(GTK_BOX(header_bar), w_chat_header, TRUE, TRUE, 0);
+    gtk_box_pack_end(GTK_BOX(header_bar), w_delete_btn, FALSE, FALSE, 0);
     gtk_box_pack_end(GTK_BOX(header_bar), w_leave_btn, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(chat_col), header_bar, FALSE, FALSE, 0);
 

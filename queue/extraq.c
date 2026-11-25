@@ -24,6 +24,9 @@
 #define BACKLOG_MAGIC 0x51424B4CU
 #define BACKLOG_VERSION 1U
 
+#define MAX_HISTORY_LOAD 64
+#define MAX_ROOM_HISTORY_LOAD 32
+
 #define CLR_RESET   "\033[0m"
 #define CLR_BOLD    "\033[1m"
 #define CLR_DIM     "\033[2m"
@@ -87,6 +90,22 @@ static void get_timestamp(char *buf, size_t size) {
     strftime(buf, size, "%H:%M:%S", &tm_now);
 }
 
+static void format_timestamp_from(time_t ts, char *buf, size_t size) {
+    time_t now = time(NULL);
+    if (ts <= 0) {
+        ts = now;
+    }
+    struct tm tm_ts;
+    struct tm tm_now;
+    localtime_r(&ts, &tm_ts);
+    localtime_r(&now, &tm_now);
+    if (tm_ts.tm_year == tm_now.tm_year && tm_ts.tm_yday == tm_now.tm_yday) {
+        strftime(buf, size, "%H:%M:%S", &tm_ts);
+    } else {
+        strftime(buf, size, "%d.%m %H:%M", &tm_ts);
+    }
+}
+
 static int find_client_by_id(struct client_entry *clients, long id) {
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (clients[i].used && clients[i].id == id) {
@@ -120,8 +139,81 @@ static int alloc_client_slot(struct client_entry *clients) {
     return (free_idx >= 0) ? free_idx : oldest_offline;
 }
 
+static int send_msg_retry(int msqid, const struct qmsg *msg) {
+    for (int i = 0; i < 10; i++) {
+        if (msgsnd(msqid, msg, MSG_SIZE, IPC_NOWAIT) == 0) {
+            return 0;
+        }
+        if (errno == EAGAIN) {
+            usleep(2000);
+            continue;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        return -1;
+    }
+    return -1;
+}
+
+static void restore_user_rooms_in_memory(struct room_info *rooms, const char *username, long client_id) {
+    char saved_rooms[MAX_ROOMS][MAX_NAME];
+    int nrooms = db_load_user_rooms(username, saved_rooms, MAX_ROOMS);
+    for (int r = 0; r < nrooms; r++) {
+        int ridx = -1;
+        int free_idx = -1;
+        for (int i = 0; i < MAX_ROOMS; i++) {
+            if (rooms[i].used && strcmp(rooms[i].name, saved_rooms[r]) == 0) {
+                ridx = i;
+                break;
+            }
+            if (!rooms[i].used && free_idx < 0) {
+                free_idx = i;
+            }
+        }
+        if (ridx < 0) {
+            if (free_idx < 0) {
+                continue;
+            }
+            ridx = free_idx;
+            rooms[ridx].used = 1;
+            rooms[ridx].member_count = 0;
+            snprintf(rooms[ridx].name, sizeof(rooms[ridx].name), "%.*s", MAX_NAME - 2, saved_rooms[r]);
+        }
+        int already = 0;
+        for (int j = 0; j < rooms[ridx].member_count; j++) {
+            if (rooms[ridx].members[j] == client_id) {
+                already = 1;
+                break;
+            }
+        }
+        if (!already && rooms[ridx].member_count < MAX_CLIENTS) {
+            rooms[ridx].members[rooms[ridx].member_count++] = client_id;
+        }
+    }
+}
+
+static void send_history_records(int msqid, long target_id, const char *viewer_name,
+                                 const struct db_msg_record *recs, int count) {
+    for (int i = 0; i < count; i++) {
+        struct qmsg item;
+        memset(&item, 0, sizeof(item));
+        item.mtype = target_id;
+        item.cmd = CMD_HISTORY_ITEM;
+        item.target_id = recs[i].is_room ? 1 : 0;
+        item.sender_id = (strcmp(recs[i].sender, viewer_name) == 0) ? 1 : 0;
+
+        item.msg_id = recs[i].is_unread ? 1 : 0;
+        item.timestamp = recs[i].timestamp;
+        snprintf(item.name, sizeof(item.name), "%.*s", MAX_NAME - 1, recs[i].peer);
+        snprintf(item.sender_name, sizeof(item.sender_name), "%.*s", MAX_NAME - 1, recs[i].sender);
+        copy_utf8_safe(item.text, sizeof(item.text), recs[i].text);
+        send_msg_retry(msqid, &item);
+    }
+}
+
 static int broadcast_to_room(int msqid, struct client_entry *clients, struct room_info *room,
-                             long exclude_id, const char *sender_name, long msg_id, const char *text) {
+                             long exclude_id, const char *sender_name, long msg_id, time_t ts, const char *text) {
     int delivered = 0;
     for (int i = 0; i < room->member_count; i++) {
         long mid = room->members[i];
@@ -136,6 +228,7 @@ static int broadcast_to_room(int msqid, struct client_entry *clients, struct roo
             out.cmd = CMD_ROOM_MSG;
             out.sender_id = exclude_id;
             out.msg_id = msg_id;
+            out.timestamp = (long)ts;
             snprintf(out.name, sizeof(out.name), "%.*s", MAX_NAME - 1, room->name);
             snprintf(out.sender_name, sizeof(out.sender_name), "%.*s", MAX_NAME - 1, sender_name);
             copy_utf8_safe(out.text, sizeof(out.text), text);
@@ -170,7 +263,6 @@ static void print_prompt(void) {
 static void print_client_banner(void) {
     pthread_mutex_lock(&g_io_mtx);
     printf(CLR_CYAN "╔══════════════════════════════════════════════════╗\n");
-
     printf("║" CLR_BOLD "                    DeepSpeak                     " CLR_RESET CLR_CYAN "║\n");
     printf("╠══════════════════════════════════════════════════╣\n");
     printf("║  " CLR_GREEN "#<name> <pass>" CLR_RESET " — register account              " CLR_CYAN "║\n");
@@ -180,6 +272,8 @@ static void print_client_banner(void) {
     printf("║  " CLR_GREEN "/leave <room>" CLR_RESET "  — leave room                    " CLR_CYAN "║\n");
     printf("║  " CLR_GREEN "/rooms" CLR_RESET "         — list active rooms             " CLR_CYAN "║\n");
     printf("║  " CLR_GREEN "/r <room> <tx>" CLR_RESET " — send to room                  " CLR_CYAN "║\n");
+    printf("║  " CLR_GREEN "/history [u|#r]" CLR_RESET "— load chat history             " CLR_CYAN "║\n");
+    printf("║  " CLR_GREEN "/delchat <u|#r>" CLR_RESET "— delete chat or room history   " CLR_CYAN "║\n");
     printf("║  " CLR_CYAN "? / /who" CLR_RESET "       — online users                  " CLR_CYAN "║\n");
     printf("║  " CLR_YELLOW "##" CLR_RESET "             — logout                        " CLR_CYAN "║\n");
     printf("║  " CLR_DIM "Ctrl+D" CLR_RESET "         — exit                          " CLR_CYAN "║\n");
@@ -190,7 +284,6 @@ static void print_client_banner(void) {
 
 static void print_arbiter_banner(int msqid, int restored) {
     printf(CLR_MAGENTA "╔══════════════════════════════════════════════════╗\n");
-
     printf("║" CLR_BOLD "                DeepSpeak Arbiter                 " CLR_RESET CLR_MAGENTA "║\n");
     printf("╚══════════════════════════════════════════════════╝\n" CLR_RESET);
     char ts[16];
@@ -310,8 +403,10 @@ static int salvage_messages(int msqid, long mtype, const char *target_name, stru
         if (tmp.cmd == CMD_CHAT) {
             tmp.sender_name[MAX_NAME - 1] = '\0';
             tmp.text[MAX_TEXT - 1] = '\0';
-            store_pending(pending, tmp.msg_id, tmp.sender_name, target_name, tmp.text);
-            salvaged++;
+            if (db_is_debug_name(tmp.sender_name) || db_is_debug_name(target_name)) {
+                store_pending(pending, tmp.msg_id, tmp.sender_name, target_name, tmp.text);
+                salvaged++;
+            }
         }
     }
     return salvaged;
@@ -337,6 +432,7 @@ static int deliver_pending(int msqid, struct pending_msg *pending, const char *n
             chat.mtype = target_id;
             chat.cmd = CMD_CHAT;
             chat.msg_id = pending[i].msg_id;
+            chat.timestamp = (long)pending[i].created_at;
             snprintf(chat.sender_name, sizeof(chat.sender_name), "%.*s", MAX_NAME - 1, pending[i].from);
             snprintf(chat.text, sizeof(chat.text), "%.*s", MAX_TEXT - 1, pending[i].text);
             if (msgsnd(msqid, &chat, MSG_SIZE, 0) == 0) {
@@ -544,6 +640,7 @@ static int run_arbiter(int msqid) {
                         snprintf(clients[idx].name, sizeof(clients[idx].name), "%.*s", MAX_NAME - 1, msg.name);
                         clients[idx].last_seen = time(NULL);
 
+                        restore_user_rooms_in_memory(rooms, clients[idx].name, clients[idx].id);
                         send_auth_reply(msqid, msg.reply_type, clients[idx].id, 0, theme_id, "ok");
 
                         char ts[16];
@@ -558,12 +655,175 @@ static int run_arbiter(int msqid) {
                     }
                 }
             }
+        } else if (msg.cmd == CMD_CHAT) {
+            msg.name[MAX_NAME - 1] = '\0';
+            msg.text[MAX_TEXT - 1] = '\0';
+
+            int cidx = find_client_by_id(clients, msg.sender_id);
+            if (cidx < 0 || !clients[cidx].active) {
+                if (msg.reply_type > 0) {
+                    send_reply(msqid, msg.reply_type, -1, "not logged in");
+                }
+            } else if (msg.name[0] == '\0' || strcmp(msg.name, clients[cidx].name) == 0 ||
+                       strcasecmp(msg.name, "arbiter") == 0) {
+                if (msg.reply_type > 0) {
+                    send_reply(msqid, msg.reply_type, -1, "invalid recipient");
+                }
+            } else {
+                clients[cidx].last_seen = time(NULL);
+                time_t msg_ts = time(NULL);
+
+                db_save_dm(clients[cidx].name, msg.name, msg.text, msg_ts);
+
+                int tidx = find_client_by_name(clients, msg.name);
+                if (tidx >= 0 && clients[tidx].active) {
+                    struct qmsg out;
+                    memset(&out, 0, sizeof(out));
+                    out.mtype = clients[tidx].id;
+                    out.cmd = CMD_CHAT;
+                    out.sender_id = clients[cidx].id;
+                    out.msg_id = msg.msg_id;
+                    out.timestamp = (long)msg_ts;
+                    snprintf(out.sender_name, sizeof(out.sender_name), "%.*s", MAX_NAME - 1, clients[cidx].name);
+                    copy_utf8_safe(out.text, sizeof(out.text), msg.text);
+                    msgsnd(msqid, &out, MSG_SIZE, IPC_NOWAIT);
+
+                    if (msg.reply_type > 0) {
+                        send_reply(msqid, msg.reply_type, clients[tidx].id, "ok");
+                    }
+                } else {
+                    if (clients[cidx].is_debug || db_is_debug_name(msg.name)) {
+                        store_pending(pending, msg.msg_id, clients[cidx].name, msg.name, msg.text);
+                        save_backlog(pending);
+                    }
+                    if (msg.reply_type > 0) {
+                        send_reply(msqid, msg.reply_type, 0, "offline");
+                    }
+                    char ts[16];
+                    get_timestamp(ts, sizeof(ts));
+                    printf(CLR_DIM "[%s] " CLR_RESET CLR_YELLOW "~ offline msg: %s -> %s (#%ld)\n" CLR_RESET,
+                           ts, clients[cidx].name, msg.name, msg.msg_id);
+                    fflush(stdout);
+                }
+            }
+        } else if (msg.cmd == CMD_HISTORY) {
+            msg.name[MAX_NAME - 1] = '\0';
+            int cidx = find_client_by_id(clients, msg.sender_id);
+            if (cidx >= 0 && clients[cidx].active && !clients[cidx].is_debug) {
+                clients[cidx].last_seen = time(NULL);
+                struct db_msg_record recs[MAX_HISTORY_LOAD];
+
+                if (msg.name[0] == '#') {
+                    const char *rname = msg.name + 1;
+                    int cnt = db_load_room_history(rname, clients[cidx].name, recs, MAX_ROOM_HISTORY_LOAD);
+                    send_history_records(msqid, clients[cidx].id, clients[cidx].name, recs, cnt);
+                } else if (msg.name[0] != '\0') {
+                    int cnt = db_load_dm_history(clients[cidx].name, msg.name, recs, MAX_HISTORY_LOAD);
+                    send_history_records(msqid, clients[cidx].id, clients[cidx].name, recs, cnt);
+                } else {
+                    int cnt = db_load_dm_history(clients[cidx].name, NULL, recs, MAX_HISTORY_LOAD);
+                    send_history_records(msqid, clients[cidx].id, clients[cidx].name, recs, cnt);
+
+                    char saved_rooms[MAX_ROOMS][MAX_NAME];
+                    int nrooms = db_load_user_rooms(clients[cidx].name, saved_rooms, MAX_ROOMS);
+                    for (int r = 0; r < nrooms; r++) {
+                        int rcnt = db_load_room_history(saved_rooms[r], clients[cidx].name, recs, MAX_ROOM_HISTORY_LOAD);
+                        send_history_records(msqid, clients[cidx].id, clients[cidx].name, recs, rcnt);
+                    }
+                }
+            }
+        } else if (msg.cmd == CMD_DELETE_CHAT) {
+            msg.name[MAX_NAME - 1] = '\0';
+            int cidx = find_client_by_id(clients, msg.sender_id);
+            if (cidx < 0 || !clients[cidx].active) {
+                send_reply(msqid, msg.reply_type, -1, "not logged in");
+            } else if (msg.name[0] == '\0') {
+                send_reply(msqid, msg.reply_type, -1, "invalid peer");
+            } else {
+                clients[cidx].last_seen = time(NULL);
+                db_delete_dm_for_user(clients[cidx].name, msg.name);
+                send_reply(msqid, msg.reply_type, 1, "deleted");
+                char ts[16];
+                get_timestamp(ts, sizeof(ts));
+                printf(CLR_DIM "[%s] " CLR_RESET CLR_YELLOW "x chat deleted: %s <-> %s\n" CLR_RESET,
+                       ts, clients[cidx].name, msg.name);
+                fflush(stdout);
+            }
+        } else if (msg.cmd == CMD_DELETE_ROOM) {
+            msg.name[MAX_NAME - 1] = '\0';
+            int cidx = find_client_by_id(clients, msg.sender_id);
+            if (cidx < 0 || !clients[cidx].active) {
+                send_reply(msqid, msg.reply_type, -1, "not logged in");
+            } else if (msg.name[0] == '\0') {
+                send_reply(msqid, msg.reply_type, -1, "invalid room");
+            } else {
+                clients[cidx].last_seen = time(NULL);
+                int remaining = 0;
+                for (int i = 0; i < MAX_ROOMS; i++) {
+                    if (rooms[i].used && strcmp(rooms[i].name, msg.name) == 0) {
+                        int mpos = -1;
+                        for (int j = 0; j < rooms[i].member_count; j++) {
+                            if (rooms[i].members[j] == msg.sender_id) {
+                                mpos = j;
+                                break;
+                            }
+                        }
+                        if (mpos >= 0) {
+                            for (int j = mpos; j < rooms[i].member_count - 1; j++) {
+                                rooms[i].members[j] = rooms[i].members[j + 1];
+                            }
+                            rooms[i].member_count--;
+                            if (rooms[i].member_count > 0) {
+                                char note[MAX_TEXT];
+                                snprintf(note, sizeof(note), "%s left #%s", clients[cidx].name, rooms[i].name);
+                                broadcast_to_room(msqid, clients, &rooms[i], msg.sender_id, "arbiter", 0, time(NULL), note);
+                            } else {
+                                rooms[i].used = 0;
+                            }
+                        }
+                        remaining = rooms[i].used ? rooms[i].member_count : 0;
+                        break;
+                    }
+                }
+                db_delete_room_for_user(clients[cidx].name, msg.name, remaining);
+                send_reply(msqid, msg.reply_type, 1, "deleted");
+                char ts[16];
+                get_timestamp(ts, sizeof(ts));
+                printf(CLR_DIM "[%s] " CLR_RESET CLR_YELLOW "x room deleted for %s: #%s\n" CLR_RESET,
+                       ts, clients[cidx].name, msg.name);
+                fflush(stdout);
+            }
         } else if (msg.cmd == CMD_SET_THEME) {
             int cidx = find_client_by_id(clients, msg.sender_id);
             if (cidx >= 0 && clients[cidx].active) {
                 clients[cidx].last_seen = time(NULL);
                 if (!clients[cidx].is_debug) {
                     db_set_theme(clients[cidx].name, (int)msg.msg_id);
+                }
+            }
+
+        } else if (msg.cmd == CMD_MARK_READ) {
+            msg.name[MAX_NAME - 1] = '\0';
+            int cidx = find_client_by_id(clients, msg.sender_id);
+            if (cidx >= 0 && clients[cidx].active && !clients[cidx].is_debug && msg.name[0] != '\0') {
+                clients[cidx].last_seen = time(NULL);
+                if (msg.target_id != 0) {
+                    db_mark_room_read(clients[cidx].name, msg.name);
+
+                } else {
+                    int updated = db_mark_dm_read(clients[cidx].name, msg.name);
+                    if (updated > 0) {
+                        int tidx = find_client_by_name(clients, msg.name);
+                        if (tidx >= 0 && clients[tidx].active) {
+                            struct qmsg ack;
+                            memset(&ack, 0, sizeof(ack));
+                            ack.mtype = clients[tidx].id;
+                            ack.cmd = CMD_ACK;
+                            ack.msg_id = 0;
+                            snprintf(ack.sender_name, sizeof(ack.sender_name), "%.*s", MAX_NAME - 1, clients[cidx].name);
+                            msgsnd(msqid, &ack, MSG_SIZE, IPC_NOWAIT);
+                        }
+                    }
                 }
             }
         } else if (msg.cmd == CMD_HEARTBEAT) {
@@ -634,7 +894,17 @@ static int run_arbiter(int msqid) {
                         rooms[ridx].member_count = 0;
                         snprintf(rooms[ridx].name, sizeof(rooms[ridx].name), "%.*s", MAX_NAME - 2, msg.name);
                         rooms[ridx].members[rooms[ridx].member_count++] = msg.sender_id;
+                        if (!clients[cidx].is_debug) {
+                            db_room_add_member(rooms[ridx].name, clients[cidx].name);
+                        }
                         send_reply(msqid, msg.reply_type, rooms[ridx].member_count, "created");
+
+                        if (!clients[cidx].is_debug) {
+                            struct db_msg_record recs[MAX_ROOM_HISTORY_LOAD];
+                            int rcnt = db_load_room_history(rooms[ridx].name, clients[cidx].name, recs, MAX_ROOM_HISTORY_LOAD);
+                            send_history_records(msqid, clients[cidx].id, clients[cidx].name, recs, rcnt);
+                        }
+
                         char ts[16];
                         get_timestamp(ts, sizeof(ts));
                         printf(CLR_DIM "[%s] " CLR_RESET CLR_CYAN "# room created: #%s by %s\n" CLR_RESET,
@@ -651,11 +921,19 @@ static int run_arbiter(int msqid) {
                     }
                     if (!already && rooms[ridx].member_count < MAX_CLIENTS) {
                         rooms[ridx].members[rooms[ridx].member_count++] = msg.sender_id;
+                        if (!clients[cidx].is_debug) {
+                            db_room_add_member(rooms[ridx].name, clients[cidx].name);
+                        }
                         char note[MAX_TEXT];
                         snprintf(note, sizeof(note), "%s joined #%s", clients[cidx].name, rooms[ridx].name);
-                        broadcast_to_room(msqid, clients, &rooms[ridx], msg.sender_id, "arbiter", 0, note);
+                        broadcast_to_room(msqid, clients, &rooms[ridx], msg.sender_id, "arbiter", 0, time(NULL), note);
                     }
                     send_reply(msqid, msg.reply_type, rooms[ridx].member_count, "joined");
+                    if (!already && !clients[cidx].is_debug) {
+                        struct db_msg_record recs[MAX_ROOM_HISTORY_LOAD];
+                        int rcnt = db_load_room_history(rooms[ridx].name, clients[cidx].name, recs, MAX_ROOM_HISTORY_LOAD);
+                        send_history_records(msqid, clients[cidx].id, clients[cidx].name, recs, rcnt);
+                    }
                 }
             }
         } else if (msg.cmd == CMD_ROOM_LEAVE) {
@@ -684,10 +962,13 @@ static int run_arbiter(int msqid) {
                         rooms[ridx].members[i] = rooms[ridx].members[i + 1];
                     }
                     rooms[ridx].member_count--;
+                    if (cidx >= 0 && !clients[cidx].is_debug) {
+                        db_room_remove_member(rooms[ridx].name, clients[cidx].name);
+                    }
                     if (cidx >= 0 && rooms[ridx].member_count > 0) {
                         char note[MAX_TEXT];
                         snprintf(note, sizeof(note), "%s left #%s", clients[cidx].name, rooms[ridx].name);
-                        broadcast_to_room(msqid, clients, &rooms[ridx], msg.sender_id, "arbiter", 0, note);
+                        broadcast_to_room(msqid, clients, &rooms[ridx], msg.sender_id, "arbiter", 0, time(NULL), note);
                     }
                     if (rooms[ridx].member_count == 0) {
                         rooms[ridx].used = 0;
@@ -719,8 +1000,10 @@ static int run_arbiter(int msqid) {
                 if (!in_room) {
                     send_reply(msqid, msg.reply_type, -1, "not in room");
                 } else {
+                    time_t msg_ts = time(NULL);
+                    db_save_room_msg(rooms[ridx].name, clients[cidx].name, msg.text, msg_ts);
                     int cnt = broadcast_to_room(msqid, clients, &rooms[ridx],
-                                                msg.sender_id, clients[cidx].name, msg.msg_id, msg.text);
+                                                msg.sender_id, clients[cidx].name, msg.msg_id, msg_ts, msg.text);
                     send_reply(msqid, msg.reply_type, cnt, "ok");
                 }
             }
@@ -848,8 +1131,12 @@ static void *recv_worker(void *arg) {
 
         ssize_t n = msgrcv(g_msqid, &msg, MSG_SIZE, my_id, IPC_NOWAIT);
         if (n >= 0) {
-            char ts[16];
-            get_timestamp(ts, sizeof(ts));
+            char ts[24];
+            if (msg.timestamp > 0) {
+                format_timestamp_from((time_t)msg.timestamp, ts, sizeof(ts));
+            } else {
+                get_timestamp(ts, sizeof(ts));
+            }
 
             if (msg.cmd == CMD_CHAT) {
                 msg.sender_name[MAX_NAME - 1] = '\0';
@@ -871,11 +1158,36 @@ static void *recv_worker(void *arg) {
                     snprintf(ack.sender_name, sizeof(ack.sender_name), "%.*s", MAX_NAME - 1, cur_name);
                     msgsnd(g_msqid, &ack, MSG_SIZE, IPC_NOWAIT);
                 }
+            } else if (msg.cmd == CMD_HISTORY_ITEM) {
+                msg.name[MAX_NAME - 1] = '\0';
+                msg.sender_name[MAX_NAME - 1] = '\0';
+                msg.text[MAX_TEXT - 1] = '\0';
+                pthread_mutex_lock(&g_io_mtx);
+                if (msg.target_id != 0) {
+                    printf("\r\033[K" CLR_DIM "[%s] " CLR_RESET CLR_YELLOW "[#%s] " CLR_CYAN "%s" CLR_RESET ": %s\n",
+                           ts, msg.name, msg.sender_id != 0 ? "you" : msg.sender_name, msg.text);
+                } else {
+                    if (msg.sender_id != 0) {
+                        printf("\r\033[K" CLR_DIM "[%s] " CLR_RESET CLR_GREEN "you -> %s" CLR_RESET ": %s\n",
+                               ts, msg.name, msg.text);
+                    } else {
+                        printf("\r\033[K" CLR_DIM "[%s] " CLR_RESET CLR_CYAN "%s" CLR_RESET ": %s\n",
+                               ts, msg.sender_name, msg.text);
+                    }
+                }
+                print_prompt_unlocked(cur_name);
+                pthread_mutex_unlock(&g_io_mtx);
             } else if (msg.cmd == CMD_ACK) {
                 msg.sender_name[MAX_NAME - 1] = '\0';
                 pthread_mutex_lock(&g_io_mtx);
-                printf("\r\033[K" CLR_DIM "[%s] " CLR_RESET CLR_BLUE "✓ delivered to %s (#%ld)\n" CLR_RESET,
-                       ts, msg.sender_name, msg.msg_id);
+
+                if (msg.msg_id == 0) {
+                    printf("\r\033[K" CLR_DIM "[%s] " CLR_RESET CLR_BLUE "✓✓ %s read your messages\n" CLR_RESET,
+                           ts, msg.sender_name);
+                } else {
+                    printf("\r\033[K" CLR_DIM "[%s] " CLR_RESET CLR_BLUE "✓ delivered to %s (#%ld)\n" CLR_RESET,
+                           ts, msg.sender_name, msg.msg_id);
+                }
                 print_prompt_unlocked(cur_name);
                 pthread_mutex_unlock(&g_io_mtx);
             } else if (msg.cmd == CMD_ROOM_MSG) {
@@ -1027,6 +1339,94 @@ static int run_client(int msqid) {
             pthread_mutex_lock(&g_io_mtx);
             printf(CLR_CYAN "* Online (%ld): %s\n" CLR_RESET,
                    rep.target_id, rep.text[0] != '\0' ? rep.text : "none");
+            pthread_mutex_unlock(&g_io_mtx);
+            print_prompt();
+            continue;
+        }
+
+        if (strcasecmp(line, "/history") == 0 || strncasecmp(line, "/history ", 9) == 0) {
+            pthread_mutex_lock(&g_mtx);
+            long cur_id = g_my_id;
+            pthread_mutex_unlock(&g_mtx);
+
+            if (cur_id <= 0) {
+                pthread_mutex_lock(&g_io_mtx);
+                printf(CLR_RED "! Login first\n" CLR_RESET);
+                pthread_mutex_unlock(&g_io_mtx);
+                print_prompt();
+                continue;
+            }
+
+            const char *filter = (strlen(line) > 9) ? (line + 9) : "";
+            while (*filter == ' ') {
+                filter++;
+            }
+
+            struct qmsg req;
+            memset(&req, 0, sizeof(req));
+            req.mtype = ARBITER_TYPE;
+            req.cmd = CMD_HISTORY;
+            req.sender_id = cur_id;
+            req.reply_type = 0;
+            snprintf(req.name, sizeof(req.name), "%.*s", MAX_NAME - 1, filter);
+            msgsnd(msqid, &req, MSG_SIZE, 0);
+            print_prompt();
+            continue;
+        }
+
+        if (strncasecmp(line, "/delchat ", 9) == 0) {
+            pthread_mutex_lock(&g_mtx);
+            long cur_id = g_my_id;
+            pthread_mutex_unlock(&g_mtx);
+
+            if (cur_id <= 0) {
+                pthread_mutex_lock(&g_io_mtx);
+                printf(CLR_RED "! Login first\n" CLR_RESET);
+                pthread_mutex_unlock(&g_io_mtx);
+                print_prompt();
+                continue;
+            }
+
+            const char *target = line + 9;
+            while (*target == ' ') {
+                target++;
+            }
+            if (*target == '\0') {
+                pthread_mutex_lock(&g_io_mtx);
+                printf(CLR_YELLOW "! Format: /delchat <user|#room>\n" CLR_RESET);
+                pthread_mutex_unlock(&g_io_mtx);
+                print_prompt();
+                continue;
+            }
+
+            int is_room = (*target == '#');
+            if (is_room) {
+                target++;
+            }
+
+            struct qmsg req;
+            memset(&req, 0, sizeof(req));
+            req.mtype = ARBITER_TYPE;
+            req.cmd = is_room ? CMD_DELETE_ROOM : CMD_DELETE_CHAT;
+            req.sender_id = cur_id;
+            req.reply_type = g_reply_type;
+            snprintf(req.name, sizeof(req.name), "%.*s", MAX_NAME - 1, target);
+            if (msgsnd(msqid, &req, MSG_SIZE, 0) < 0) {
+                perror("msgsnd");
+                break;
+            }
+            struct qmsg rep;
+            if (msgrcv(msqid, &rep, MSG_SIZE, g_reply_type, 0) < 0) {
+                perror("msgrcv");
+                break;
+            }
+            rep.text[MAX_TEXT - 1] = '\0';
+            pthread_mutex_lock(&g_io_mtx);
+            if (rep.target_id > 0) {
+                printf(CLR_YELLOW "* Deleted %s %s\n" CLR_RESET, is_room ? "room" : "chat", target);
+            } else {
+                printf(CLR_RED "! Delete failed: %s\n" CLR_RESET, rep.text);
+            }
             pthread_mutex_unlock(&g_io_mtx);
             print_prompt();
             continue;
@@ -1329,15 +1729,22 @@ static int run_client(int msqid) {
                 continue;
             }
 
-            struct qmsg req;
-            memset(&req, 0, sizeof(req));
-            req.mtype = ARBITER_TYPE;
-            req.cmd = CMD_LOOKUP;
-            req.sender_id = cur_id;
-            req.reply_type = g_reply_type;
-            snprintf(req.name, sizeof(req.name), "%.*s", MAX_NAME - 1, target_name);
+            long msg_id = g_next_msg_id++;
+            char ts[16];
+            get_timestamp(ts, sizeof(ts));
 
-            if (msgsnd(msqid, &req, MSG_SIZE, 0) < 0) {
+            struct qmsg chat;
+            memset(&chat, 0, sizeof(chat));
+            chat.mtype = ARBITER_TYPE;
+            chat.cmd = CMD_CHAT;
+            chat.sender_id = cur_id;
+            chat.msg_id = msg_id;
+            chat.reply_type = g_reply_type;
+            snprintf(chat.name, sizeof(chat.name), "%.*s", MAX_NAME - 1, target_name);
+            snprintf(chat.sender_name, sizeof(chat.sender_name), "%.*s", MAX_NAME - 1, cur_name);
+            copy_utf8_safe(chat.text, sizeof(chat.text), text);
+
+            if (msgsnd(msqid, &chat, MSG_SIZE, 0) < 0) {
                 perror("msgsnd");
                 break;
             }
@@ -1346,63 +1753,30 @@ static int run_client(int msqid) {
                 perror("msgrcv");
                 break;
             }
+            rep.text[MAX_TEXT - 1] = '\0';
 
-            long msg_id = g_next_msg_id++;
-            char ts[16];
-            get_timestamp(ts, sizeof(ts));
-
-            if (rep.target_id > 0) {
-                struct qmsg chat;
-                memset(&chat, 0, sizeof(chat));
-                chat.mtype = rep.target_id;
-                chat.cmd = CMD_CHAT;
-                chat.sender_id = cur_id;
-                chat.msg_id = msg_id;
-                snprintf(chat.sender_name, sizeof(chat.sender_name), "%.*s", MAX_NAME - 1, cur_name);
-                copy_utf8_safe(chat.text, sizeof(chat.text), text);
-
-                if (msgsnd(msqid, &chat, MSG_SIZE, 0) < 0) {
-                    perror("msgsnd");
-                    break;
-                }
-
-                pthread_mutex_lock(&g_io_mtx);
-                if (interactive) {
-                    printf("\033[1A\r\033[K");
-                }
-                printf(CLR_DIM "[%s] " CLR_RESET CLR_GREEN "you -> %s (#%ld)" CLR_RESET ": %s\n",
-                       ts, target_name, msg_id, text);
-                pthread_mutex_unlock(&g_io_mtx);
+            pthread_mutex_lock(&g_io_mtx);
+            if (rep.target_id < 0) {
+                printf(CLR_RED "! Send failed: %s\n" CLR_RESET, rep.text);
             } else {
-                struct qmsg st;
-                memset(&st, 0, sizeof(st));
-                st.mtype = ARBITER_TYPE;
-                st.cmd = CMD_STORE;
-                st.sender_id = cur_id;
-                st.msg_id = msg_id;
-                snprintf(st.name, sizeof(st.name), "%.*s", MAX_NAME - 1, target_name);
-                snprintf(st.sender_name, sizeof(st.sender_name), "%.*s", MAX_NAME - 1, cur_name);
-                copy_utf8_safe(st.text, sizeof(st.text), text);
-
-                if (msgsnd(msqid, &st, MSG_SIZE, 0) < 0) {
-                    perror("msgsnd");
-                    break;
-                }
-
-                pthread_mutex_lock(&g_io_mtx);
                 if (interactive) {
                     printf("\033[1A\r\033[K");
                 }
-                printf(CLR_DIM "[%s] " CLR_RESET CLR_YELLOW "you -> %s (#%ld, offline, queued %ds)" CLR_RESET ": %s\n",
-                       ts, target_name, msg_id, OFFLINE_TTL, text);
-                pthread_mutex_unlock(&g_io_mtx);
+                if (rep.target_id > 0) {
+                    printf(CLR_DIM "[%s] " CLR_RESET CLR_GREEN "you -> %s (#%ld)" CLR_RESET ": %s\n",
+                           ts, target_name, msg_id, text);
+                } else {
+                    printf(CLR_DIM "[%s] " CLR_RESET CLR_YELLOW "you -> %s (#%ld, offline, saved)" CLR_RESET ": %s\n",
+                           ts, target_name, msg_id, text);
+                }
             }
+            pthread_mutex_unlock(&g_io_mtx);
             print_prompt();
             continue;
         }
 
         pthread_mutex_lock(&g_io_mtx);
-        printf(CLR_YELLOW "! Format: #<name> <pass> | @<name> <pass> | <name>#<message> | ? | ##\n" CLR_RESET);
+        printf(CLR_YELLOW "! Format: #<name> <pass> | @<name> <pass> | <name>#<message> | /history | /delchat | ? | ##\n" CLR_RESET);
         pthread_mutex_unlock(&g_io_mtx);
         print_prompt();
     }
