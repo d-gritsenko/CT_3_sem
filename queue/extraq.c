@@ -12,6 +12,8 @@
 #include <sys/file.h>
 #include <sys/ipc.h>
 #include <sys/msg.h>
+
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
@@ -83,29 +85,6 @@ static void on_signal(int sig) {
     running = 0;
 }
 
-static void get_timestamp(char *buf, size_t size) {
-    time_t now = time(NULL);
-    struct tm tm_now;
-    localtime_r(&now, &tm_now);
-    strftime(buf, size, "%H:%M:%S", &tm_now);
-}
-
-static void format_timestamp_from(time_t ts, char *buf, size_t size) {
-    time_t now = time(NULL);
-    if (ts <= 0) {
-        ts = now;
-    }
-    struct tm tm_ts;
-    struct tm tm_now;
-    localtime_r(&ts, &tm_ts);
-    localtime_r(&now, &tm_now);
-    if (tm_ts.tm_year == tm_now.tm_year && tm_ts.tm_yday == tm_now.tm_yday) {
-        strftime(buf, size, "%H:%M:%S", &tm_ts);
-    } else {
-        strftime(buf, size, "%d.%m %H:%M", &tm_ts);
-    }
-}
-
 static int find_client_by_id(struct client_entry *clients, long id) {
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (clients[i].used && clients[i].id == id) {
@@ -137,6 +116,27 @@ static int alloc_client_slot(struct client_entry *clients) {
         }
     }
     return (free_idx >= 0) ? free_idx : oldest_offline;
+}
+
+
+static unsigned long g_file_seq = 0;
+
+static int activate_client_slot(struct client_entry *clients, int match_idx, long *next_id,
+                                int is_debug, long reply_type, const char *name) {
+    int idx = (match_idx >= 0) ? match_idx : alloc_client_slot(clients);
+    if (idx < 0) {
+        return -1;
+    }
+    if (match_idx < 0) {
+        clients[idx].id = (*next_id)++;
+    }
+    clients[idx].used = 1;
+    clients[idx].active = 1;
+    clients[idx].is_debug = is_debug;
+    clients[idx].reply_type = reply_type;
+    snprintf(clients[idx].name, sizeof(clients[idx].name), "%.*s", MAX_NAME - 1, name);
+    clients[idx].last_seen = time(NULL);
+    return idx;
 }
 
 static int send_msg_retry(int msqid, const struct qmsg *msg) {
@@ -274,6 +274,9 @@ static void print_client_banner(void) {
     printf("║  " CLR_GREEN "/r <room> <tx>" CLR_RESET " — send to room                  " CLR_CYAN "║\n");
     printf("║  " CLR_GREEN "/history [u|#r]" CLR_RESET "— load chat history             " CLR_CYAN "║\n");
     printf("║  " CLR_GREEN "/delchat <u|#r>" CLR_RESET "— delete chat or room history   " CLR_CYAN "║\n");
+
+    printf("║  " CLR_GREEN "/sendfile <t> <p>" CLR_RESET "— send file (DM or #room)      " CLR_CYAN "║\n");
+    printf("║  " CLR_GREEN "/getfile <id> [p]" CLR_RESET "— download file                " CLR_CYAN "║\n");
     printf("║  " CLR_CYAN "? / /who" CLR_RESET "       — online users                  " CLR_CYAN "║\n");
     printf("║  " CLR_YELLOW "##" CLR_RESET "             — logout                        " CLR_CYAN "║\n");
     printf("║  " CLR_DIM "Ctrl+D" CLR_RESET "         — exit                          " CLR_CYAN "║\n");
@@ -292,12 +295,6 @@ static void print_arbiter_banner(int msqid, int restored) {
            " (msqid=%d, db=%s, heartbeat=%ds, offline_ttl=%ds, restored=%d)\n",
            ts, msqid, USERS_DB_PATH, HEARTBEAT_TIMEOUT, OFFLINE_TTL, restored);
     fflush(stdout);
-}
-
-static void drain_type(int msqid, long mtype) {
-    struct qmsg tmp;
-    while (msgrcv(msqid, &tmp, MSG_SIZE, mtype, IPC_NOWAIT) >= 0) {
-    }
 }
 
 static void save_backlog(const struct pending_msg *pending) {
@@ -541,28 +538,20 @@ static int run_arbiter(int msqid) {
             char err[128] = "";
             int match_idx = find_client_by_name(clients, msg.name);
 
-            if (msg.name[0] == '\0' || strchr(msg.name, '#') != NULL ||
-                strchr(msg.name, ',') != NULL || strchr(msg.name, ' ') != NULL) {
+
+            if (!is_valid_ident(msg.name, MAX_NAME)) {
                 send_auth_reply(msqid, msg.reply_type, -1, 0, 0, "invalid username");
             } else if (match_idx >= 0 && clients[match_idx].active) {
                 send_auth_reply(msqid, msg.reply_type, -1, 0, 0, "already online");
             } else if (db_register_user(msg.name, msg.text, err, sizeof(err)) != 0) {
                 send_auth_reply(msqid, msg.reply_type, -1, 0, 0, err);
             } else {
-                int idx = (match_idx >= 0) ? match_idx : alloc_client_slot(clients);
+
+                int idx = activate_client_slot(clients, match_idx, &next_id, 0, msg.reply_type, msg.name);
+
                 if (idx < 0) {
                     send_auth_reply(msqid, msg.reply_type, -1, 0, 0, "server full");
                 } else {
-                    if (match_idx < 0) {
-                        clients[idx].id = next_id++;
-                    }
-                    clients[idx].used = 1;
-                    clients[idx].active = 1;
-                    clients[idx].is_debug = 0;
-                    clients[idx].reply_type = msg.reply_type;
-                    snprintf(clients[idx].name, sizeof(clients[idx].name), "%.*s", MAX_NAME - 1, msg.name);
-                    clients[idx].last_seen = time(NULL);
-
                     send_auth_reply(msqid, msg.reply_type, clients[idx].id, 0, 0, "ok");
 
                     char ts[16];
@@ -582,8 +571,8 @@ static int run_arbiter(int msqid) {
 
             int match_idx = find_client_by_name(clients, msg.name);
 
-            if (msg.name[0] == '\0' || strchr(msg.name, '#') != NULL ||
-                strchr(msg.name, ',') != NULL || strchr(msg.name, ' ') != NULL) {
+
+            if (!is_valid_ident(msg.name, MAX_NAME)) {
                 send_auth_reply(msqid, msg.reply_type, -1, 0, 0, "invalid username");
             } else if (strcasecmp(msg.name, "arbiter") == 0) {
                 send_auth_reply(msqid, msg.reply_type, -1, 0, 0, "reserved name");
@@ -593,20 +582,12 @@ static int run_arbiter(int msqid) {
                 if (!db_check_debug_pass(msg.text)) {
                     send_auth_reply(msqid, msg.reply_type, -1, 0, 0, "wrong debug password");
                 } else {
-                    int idx = (match_idx >= 0) ? match_idx : alloc_client_slot(clients);
+
+                    int idx = activate_client_slot(clients, match_idx, &next_id, 1, msg.reply_type, msg.name);
+
                     if (idx < 0) {
                         send_auth_reply(msqid, msg.reply_type, -1, 0, 0, "server full");
                     } else {
-                        if (match_idx < 0) {
-                            clients[idx].id = next_id++;
-                        }
-                        clients[idx].used = 1;
-                        clients[idx].active = 1;
-                        clients[idx].is_debug = 1;
-                        clients[idx].reply_type = msg.reply_type;
-                        snprintf(clients[idx].name, sizeof(clients[idx].name), "%.*s", MAX_NAME - 1, msg.name);
-                        clients[idx].last_seen = time(NULL);
-
                         send_auth_reply(msqid, msg.reply_type, clients[idx].id, 1, 0, "ok");
 
                         char ts[16];
@@ -626,20 +607,12 @@ static int run_arbiter(int msqid) {
                 if (db_verify_user(msg.name, msg.text, &theme_id, err, sizeof(err)) != 0) {
                     send_auth_reply(msqid, msg.reply_type, -1, 0, 0, err);
                 } else {
-                    int idx = (match_idx >= 0) ? match_idx : alloc_client_slot(clients);
+
+                    int idx = activate_client_slot(clients, match_idx, &next_id, 0, msg.reply_type, msg.name);
+
                     if (idx < 0) {
                         send_auth_reply(msqid, msg.reply_type, -1, 0, 0, "server full");
                     } else {
-                        if (match_idx < 0) {
-                            clients[idx].id = next_id++;
-                        }
-                        clients[idx].used = 1;
-                        clients[idx].active = 1;
-                        clients[idx].is_debug = 0;
-                        clients[idx].reply_type = msg.reply_type;
-                        snprintf(clients[idx].name, sizeof(clients[idx].name), "%.*s", MAX_NAME - 1, msg.name);
-                        clients[idx].last_seen = time(NULL);
-
                         restore_user_rooms_in_memory(rooms, clients[idx].name, clients[idx].id);
                         send_auth_reply(msqid, msg.reply_type, clients[idx].id, 0, theme_id, "ok");
 
@@ -823,6 +796,163 @@ static int run_arbiter(int msqid) {
                             snprintf(ack.sender_name, sizeof(ack.sender_name), "%.*s", MAX_NAME - 1, clients[cidx].name);
                             msgsnd(msqid, &ack, MSG_SIZE, IPC_NOWAIT);
                         }
+                    }
+                }
+            }
+
+        } else if (msg.cmd == CMD_FILE_SEND) {
+            msg.name[MAX_NAME - 1] = '\0';
+            msg.text[MAX_TEXT - 1] = '\0';
+            int shmid = (int)msg.target_id;
+            long fsize = msg.timestamp;
+
+            int cidx = find_client_by_id(clients, msg.sender_id);
+            if (cidx < 0 || !clients[cidx].active) {
+                if (shmid >= 0) {
+                    shmctl(shmid, IPC_RMID, NULL);
+                }
+                if (msg.reply_type > 0) {
+                    send_reply(msqid, msg.reply_type, -1, "not logged in");
+                }
+            } else if (shmid < 0 || fsize <= 0 || fsize > MAX_FILE_SIZE) {
+                if (shmid >= 0) {
+                    shmctl(shmid, IPC_RMID, NULL);
+                }
+                if (msg.reply_type > 0) {
+                    send_reply(msqid, msg.reply_type, -1, "invalid file size or shm");
+                }
+            } else {
+                clients[cidx].last_seen = time(NULL);
+                int is_room = (msg.name[0] == '#');
+                const char *target = is_room ? (msg.name + 1) : msg.name;
+
+                int ridx = -1;
+                if (is_room) {
+                    for (int i = 0; i < MAX_ROOMS; i++) {
+                        if (rooms[i].used && strcmp(rooms[i].name, target) == 0) {
+                            int in_room = 0;
+                            for (int j = 0; j < rooms[i].member_count; j++) {
+                                if (rooms[i].members[j] == msg.sender_id) {
+                                    in_room = 1;
+                                    break;
+                                }
+                            }
+                            if (in_room) {
+                                ridx = i;
+                            }
+                            break;
+                        }
+                    }
+                    if (ridx < 0) {
+                        shmctl(shmid, IPC_RMID, NULL);
+                        if (msg.reply_type > 0) {
+                            send_reply(msqid, msg.reply_type, -1, "not in room");
+                        }
+                        continue;
+                    }
+                } else if (target[0] == '\0' || strcmp(target, clients[cidx].name) == 0 ||
+                           strcasecmp(target, "arbiter") == 0) {
+                    shmctl(shmid, IPC_RMID, NULL);
+                    if (msg.reply_type > 0) {
+                        send_reply(msqid, msg.reply_type, -1, "invalid recipient");
+                    }
+                    continue;
+                }
+
+                mkdir(UPLOADS_DIR, 0755);
+                char orig_clean[64];
+                char safe_suf[32];
+                sanitize_filename(msg.text, orig_clean, sizeof(orig_clean));
+                make_safe_storage_suffix(orig_clean, safe_suf, sizeof(safe_suf));
+
+                time_t msg_ts = time(NULL);
+                char stored_name[96];
+                snprintf(stored_name, sizeof(stored_name), "%ld_%lu_%s",
+                         (long)msg_ts, ++g_file_seq, safe_suf);
+
+                char disk_path[256];
+                snprintf(disk_path, sizeof(disk_path), "%s/%s", UPLOADS_DIR, stored_name);
+
+                if (shm_save_to_file(shmid, fsize, disk_path) != 0) {
+                    if (msg.reply_type > 0) {
+                        send_reply(msqid, msg.reply_type, -1, "failed to store file");
+                    }
+                    continue;
+                }
+
+                char marker[MAX_TEXT];
+                snprintf(marker, sizeof(marker), "[[FILE:%s|%ld|%s]]", stored_name, fsize, orig_clean);
+
+                char ts[16];
+                get_timestamp(ts, sizeof(ts));
+                printf(CLR_DIM "[%s] " CLR_RESET CLR_CYAN "@ file: %s -> %s (%s, %ld B)\n" CLR_RESET,
+                       ts, clients[cidx].name, msg.name, orig_clean, fsize);
+                fflush(stdout);
+
+                if (is_room) {
+                    db_save_room_msg(rooms[ridx].name, clients[cidx].name, marker, msg_ts);
+                    int cnt = broadcast_to_room(msqid, clients, &rooms[ridx],
+                                                msg.sender_id, clients[cidx].name, msg.msg_id, msg_ts, marker);
+                    if (msg.reply_type > 0) {
+                        send_reply(msqid, msg.reply_type, cnt, marker);
+                    }
+                } else {
+                    db_save_dm(clients[cidx].name, target, marker, msg_ts);
+                    int tidx = find_client_by_name(clients, target);
+                    if (tidx >= 0 && clients[tidx].active) {
+                        struct qmsg out;
+                        memset(&out, 0, sizeof(out));
+                        out.mtype = clients[tidx].id;
+                        out.cmd = CMD_CHAT;
+                        out.sender_id = clients[cidx].id;
+                        out.msg_id = msg.msg_id;
+                        out.timestamp = (long)msg_ts;
+                        snprintf(out.sender_name, sizeof(out.sender_name), "%.*s", MAX_NAME - 1, clients[cidx].name);
+                        copy_utf8_safe(out.text, sizeof(out.text), marker);
+                        msgsnd(msqid, &out, MSG_SIZE, IPC_NOWAIT);
+
+                        if (msg.reply_type > 0) {
+                            send_reply(msqid, msg.reply_type, clients[tidx].id, marker);
+                        }
+                    } else {
+                        if (clients[cidx].is_debug || db_is_debug_name(target)) {
+                            store_pending(pending, msg.msg_id, clients[cidx].name, target, marker);
+                            save_backlog(pending);
+                        }
+                        if (msg.reply_type > 0) {
+                            send_reply(msqid, msg.reply_type, 0, marker);
+                        }
+                    }
+                }
+            }
+        } else if (msg.cmd == CMD_FILE_GET) {
+            msg.text[MAX_TEXT - 1] = '\0';
+            int cidx = find_client_by_id(clients, msg.sender_id);
+            if (cidx < 0 || !clients[cidx].active) {
+                send_reply(msqid, msg.reply_type, -1, "not logged in");
+            } else if (!is_safe_stored_name(msg.text)) {
+                send_reply(msqid, msg.reply_type, -1, "invalid file id");
+            } else {
+                clients[cidx].last_seen = time(NULL);
+                char disk_path[256];
+
+                snprintf(disk_path, sizeof(disk_path), "%s/%.95s", UPLOADS_DIR, msg.text);
+
+                long fsize = 0;
+                char err[64] = "";
+                int shmid = shm_alloc_from_file(disk_path, &fsize, err, sizeof(err));
+                if (shmid < 0) {
+                    send_reply(msqid, msg.reply_type, -1, err);
+                } else {
+                    struct qmsg rep;
+                    memset(&rep, 0, sizeof(rep));
+                    rep.mtype = msg.reply_type;
+                    rep.cmd = CMD_REPLY;
+                    rep.target_id = shmid;
+                    rep.timestamp = fsize;
+                    snprintf(rep.text, sizeof(rep.text), "ok");
+                    if (msgsnd(msqid, &rep, MSG_SIZE, 0) < 0) {
+                        shmctl(shmid, IPC_RMID, NULL);
                     }
                 }
             }
@@ -1113,6 +1243,23 @@ static int run_arbiter(int msqid) {
     return 0;
 }
 
+
+static void format_cli_body(const char *text, char *out, size_t out_size);
+
+
+static void format_cli_body(const char *text, char *out, size_t out_size) {
+    char stored[96];
+    char orig[96];
+    long fsize = 0;
+    if (parse_file_marker(text, stored, sizeof(stored), &fsize, orig, sizeof(orig))) {
+        char sz_str[32];
+        format_file_size(fsize, sz_str, sizeof(sz_str));
+        snprintf(out, out_size, "[FILE] %s (%s) — /getfile %s", orig, sz_str, stored);
+    } else {
+        copy_utf8_safe(out, out_size, text);
+    }
+}
+
 static void *recv_worker(void *arg) {
     (void)arg;
     struct qmsg msg;
@@ -1142,8 +1289,12 @@ static void *recv_worker(void *arg) {
                 msg.sender_name[MAX_NAME - 1] = '\0';
                 msg.text[MAX_TEXT - 1] = '\0';
                 pthread_mutex_lock(&g_io_mtx);
+
+                char body[MAX_TEXT + 64];
+                format_cli_body(msg.text, body, sizeof(body));
                 printf("\r\033[K" CLR_DIM "[%s] " CLR_RESET CLR_BOLD CLR_CYAN "%s" CLR_RESET ": %s\n",
-                       ts, msg.sender_name, msg.text);
+
+                       ts, msg.sender_name, body);
                 print_prompt_unlocked(cur_name);
                 pthread_mutex_unlock(&g_io_mtx);
 
@@ -1164,15 +1315,27 @@ static void *recv_worker(void *arg) {
                 msg.text[MAX_TEXT - 1] = '\0';
                 pthread_mutex_lock(&g_io_mtx);
                 if (msg.target_id != 0) {
+
+                    char body[MAX_TEXT + 64];
+                    format_cli_body(msg.text, body, sizeof(body));
                     printf("\r\033[K" CLR_DIM "[%s] " CLR_RESET CLR_YELLOW "[#%s] " CLR_CYAN "%s" CLR_RESET ": %s\n",
-                           ts, msg.name, msg.sender_id != 0 ? "you" : msg.sender_name, msg.text);
+
+                           ts, msg.name, msg.sender_id != 0 ? "you" : msg.sender_name, body);
                 } else {
                     if (msg.sender_id != 0) {
+
+                        char body[MAX_TEXT + 64];
+                        format_cli_body(msg.text, body, sizeof(body));
                         printf("\r\033[K" CLR_DIM "[%s] " CLR_RESET CLR_GREEN "you -> %s" CLR_RESET ": %s\n",
-                               ts, msg.name, msg.text);
+
+                               ts, msg.name, body);
                     } else {
+
+                        char body[MAX_TEXT + 64];
+                        format_cli_body(msg.text, body, sizeof(body));
                         printf("\r\033[K" CLR_DIM "[%s] " CLR_RESET CLR_CYAN "%s" CLR_RESET ": %s\n",
-                               ts, msg.sender_name, msg.text);
+
+                               ts, msg.sender_name, body);
                     }
                 }
                 print_prompt_unlocked(cur_name);
@@ -1199,8 +1362,12 @@ static void *recv_worker(void *arg) {
                     printf("\r\033[K" CLR_DIM "[%s] " CLR_RESET CLR_CYAN "[#%s] * %s\n" CLR_RESET,
                            ts, msg.name, msg.text);
                 } else {
+
+                    char body[MAX_TEXT + 64];
+                    format_cli_body(msg.text, body, sizeof(body));
                     printf("\r\033[K" CLR_DIM "[%s] " CLR_RESET CLR_YELLOW "[#%s] " CLR_CYAN "%s" CLR_RESET ": %s\n",
-                           ts, msg.name, msg.sender_name, msg.text);
+
+                           ts, msg.name, msg.sender_name, body);
                 }
                 print_prompt_unlocked(cur_name);
                 pthread_mutex_unlock(&g_io_mtx);
@@ -1428,6 +1595,184 @@ static int run_client(int msqid) {
                 printf(CLR_RED "! Delete failed: %s\n" CLR_RESET, rep.text);
             }
             pthread_mutex_unlock(&g_io_mtx);
+            print_prompt();
+            continue;
+        }
+
+
+        if (strncasecmp(line, "/sendfile ", 10) == 0) {
+            pthread_mutex_lock(&g_mtx);
+            long cur_id = g_my_id;
+            char cur_name[MAX_NAME];
+            snprintf(cur_name, sizeof(cur_name), "%.*s", MAX_NAME - 1, g_my_name);
+            pthread_mutex_unlock(&g_mtx);
+
+            if (cur_id <= 0) {
+                pthread_mutex_lock(&g_io_mtx);
+                printf(CLR_RED "! Login first\n" CLR_RESET);
+                pthread_mutex_unlock(&g_io_mtx);
+                print_prompt();
+                continue;
+            }
+
+            const char *p = line + 10;
+            while (*p == ' ') {
+                p++;
+            }
+            const char *sp = strchr(p, ' ');
+            if (sp == NULL || sp == p || sp[1] == '\0') {
+                pthread_mutex_lock(&g_io_mtx);
+                printf(CLR_YELLOW "! Format: /sendfile <user|#room> <filepath>\n" CLR_RESET);
+                pthread_mutex_unlock(&g_io_mtx);
+                print_prompt();
+                continue;
+            }
+
+            char target[MAX_NAME];
+            size_t tlen = (size_t)(sp - p);
+            if (tlen >= MAX_NAME) {
+                tlen = MAX_NAME - 1;
+            }
+            memcpy(target, p, tlen);
+            target[tlen] = '\0';
+
+            const char *fpath = sp + 1;
+            while (*fpath == ' ') {
+                fpath++;
+            }
+
+            long fsize = 0;
+            char err[64] = "";
+            int shmid = shm_alloc_from_file(fpath, &fsize, err, sizeof(err));
+            if (shmid < 0) {
+                pthread_mutex_lock(&g_io_mtx);
+                printf(CLR_RED "! File error: %s\n" CLR_RESET, err);
+                pthread_mutex_unlock(&g_io_mtx);
+                print_prompt();
+                continue;
+            }
+
+            char fname[64];
+            sanitize_filename(fpath, fname, sizeof(fname));
+
+            struct qmsg req;
+            memset(&req, 0, sizeof(req));
+            req.mtype = ARBITER_TYPE;
+            req.cmd = CMD_FILE_SEND;
+            req.sender_id = cur_id;
+            req.msg_id = g_next_msg_id++;
+            req.reply_type = g_reply_type;
+            req.target_id = shmid;
+            req.timestamp = fsize;
+            snprintf(req.name, sizeof(req.name), "%.*s", MAX_NAME - 1, target);
+            snprintf(req.sender_name, sizeof(req.sender_name), "%.*s", MAX_NAME - 1, cur_name);
+            snprintf(req.text, sizeof(req.text), "%.*s", MAX_TEXT - 1, fname);
+
+            if (msgsnd(msqid, &req, MSG_SIZE, 0) < 0) {
+                shmctl(shmid, IPC_RMID, NULL);
+                perror("msgsnd");
+                break;
+            }
+            struct qmsg rep;
+            if (msgrcv(msqid, &rep, MSG_SIZE, g_reply_type, 0) < 0) {
+                perror("msgrcv");
+                break;
+            }
+            rep.text[MAX_TEXT - 1] = '\0';
+            pthread_mutex_lock(&g_io_mtx);
+            if (rep.target_id < 0) {
+                printf(CLR_RED "! Send file failed: %s\n" CLR_RESET, rep.text);
+            } else {
+                char sz_str[32];
+                format_file_size(fsize, sz_str, sizeof(sz_str));
+                printf(CLR_GREEN "* File sent to %s: %s (%s)\n" CLR_RESET, target, fname, sz_str);
+            }
+            pthread_mutex_unlock(&g_io_mtx);
+            print_prompt();
+            continue;
+        }
+
+        if (strncasecmp(line, "/getfile ", 9) == 0) {
+            pthread_mutex_lock(&g_mtx);
+            long cur_id = g_my_id;
+            pthread_mutex_unlock(&g_mtx);
+
+            if (cur_id <= 0) {
+                pthread_mutex_lock(&g_io_mtx);
+                printf(CLR_RED "! Login first\n" CLR_RESET);
+                pthread_mutex_unlock(&g_io_mtx);
+                print_prompt();
+                continue;
+            }
+
+            const char *p = line + 9;
+            while (*p == ' ') {
+                p++;
+            }
+            if (*p == '\0') {
+                pthread_mutex_lock(&g_io_mtx);
+                printf(CLR_YELLOW "! Format: /getfile <file_id> [dest_path]\n" CLR_RESET);
+                pthread_mutex_unlock(&g_io_mtx);
+                print_prompt();
+                continue;
+            }
+
+            char file_id[96];
+            char dest_path[256];
+            const char *sp = strchr(p, ' ');
+            if (sp != NULL) {
+                size_t flen = (size_t)(sp - p);
+                if (flen >= sizeof(file_id)) {
+                    flen = sizeof(file_id) - 1;
+                }
+                memcpy(file_id, p, flen);
+                file_id[flen] = '\0';
+                const char *dp = sp + 1;
+                while (*dp == ' ') {
+                    dp++;
+                }
+                snprintf(dest_path, sizeof(dest_path), "%.*s", (int)sizeof(dest_path) - 1, dp);
+            } else {
+                snprintf(file_id, sizeof(file_id), "%.*s", (int)sizeof(file_id) - 1, p);
+                mkdir(DOWNLOADS_DIR, 0755);
+                snprintf(dest_path, sizeof(dest_path), "%s/%s", DOWNLOADS_DIR, file_id);
+            }
+
+            struct qmsg req;
+            memset(&req, 0, sizeof(req));
+            req.mtype = ARBITER_TYPE;
+            req.cmd = CMD_FILE_GET;
+            req.sender_id = cur_id;
+            req.reply_type = g_reply_type;
+            snprintf(req.text, sizeof(req.text), "%.*s", MAX_TEXT - 1, file_id);
+
+            if (msgsnd(msqid, &req, MSG_SIZE, 0) < 0) {
+                perror("msgsnd");
+                break;
+            }
+            struct qmsg rep;
+            if (msgrcv(msqid, &rep, MSG_SIZE, g_reply_type, 0) < 0) {
+                perror("msgrcv");
+                break;
+            }
+            rep.text[MAX_TEXT - 1] = '\0';
+            if (rep.target_id < 0) {
+                pthread_mutex_lock(&g_io_mtx);
+                printf(CLR_RED "! Download failed: %s\n" CLR_RESET, rep.text);
+                pthread_mutex_unlock(&g_io_mtx);
+            } else {
+                if (shm_save_to_file((int)rep.target_id, rep.timestamp, dest_path) == 0) {
+                    char sz_str[32];
+                    format_file_size(rep.timestamp, sz_str, sizeof(sz_str));
+                    pthread_mutex_lock(&g_io_mtx);
+                    printf(CLR_GREEN "* Saved to %s (%s)\n" CLR_RESET, dest_path, sz_str);
+                    pthread_mutex_unlock(&g_io_mtx);
+                } else {
+                    pthread_mutex_lock(&g_io_mtx);
+                    printf(CLR_RED "! Failed to write %s\n" CLR_RESET, dest_path);
+                    pthread_mutex_unlock(&g_io_mtx);
+                }
+            }
             print_prompt();
             continue;
         }
@@ -1788,6 +2133,7 @@ static int run_client(int msqid) {
     printf("\n");
     return 0;
 }
+
 
 int main(int argc, char *argv[]) {
     if (argc != 2 || (strcasecmp(argv[1], "arbiter") != 0 && strcasecmp(argv[1], "client") != 0)) {

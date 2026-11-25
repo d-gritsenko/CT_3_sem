@@ -10,6 +10,8 @@
 #include <strings.h>
 #include <sys/ipc.h>
 #include <sys/msg.h>
+
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
@@ -18,6 +20,8 @@
 
 #define MAX_DIALOGS (MAX_CLIENTS + MAX_ROOMS + 8)
 #define MAX_PENDING_ACKS 128
+
+#define MAX_FILE_ANCHORS 64
 
 enum ui_event_kind {
     EV_CHAT = 1,
@@ -59,6 +63,9 @@ struct dialog_entry {
     int pending_ack_count;
     long unacked_ids[MAX_PENDING_ACKS];
     int unacked_count;
+
+    GtkTextChildAnchor *file_anchors[MAX_FILE_ANCHORS];
+    int file_anchor_count;
 };
 
 struct room_list_item {
@@ -208,46 +215,23 @@ static GtkWidget *w_target_entry = NULL;
 static GtkWidget *w_msg_entry = NULL;
 static GtkWidget *w_send_btn = NULL;
 
+static GtkWidget *w_file_btn = NULL;
+
 static void ui_rebuild_users_list(void);
 static void ui_rebuild_rooms_list(void);
 static void ui_update_tab_labels(void);
 static void ui_update_chat_header(void);
 static void ui_switch_dialog(const char *peer, int is_room, int set_target);
 
+static void ui_append_sys(const char *tag_name, const char *text);
+static void ui_append_error(const char *text);
+
+
 static const struct ui_theme *current_theme(void) {
     if (g_theme_idx < 0 || g_theme_idx >= THEME_COUNT) {
         return &g_themes[0];
     }
     return &g_themes[g_theme_idx];
-}
-
-static void get_timestamp(char *buf, size_t size) {
-    time_t now = time(NULL);
-    struct tm tm_now;
-    localtime_r(&now, &tm_now);
-    strftime(buf, size, "%H:%M:%S", &tm_now);
-}
-
-static void format_timestamp_from(time_t ts, char *buf, size_t size) {
-    time_t now = time(NULL);
-    if (ts <= 0) {
-        ts = now;
-    }
-    struct tm tm_ts;
-    struct tm tm_now;
-    localtime_r(&ts, &tm_ts);
-    localtime_r(&now, &tm_now);
-    if (tm_ts.tm_year == tm_now.tm_year && tm_ts.tm_yday == tm_now.tm_yday) {
-        strftime(buf, size, "%H:%M:%S", &tm_ts);
-    } else {
-        strftime(buf, size, "%d.%m %H:%M", &tm_ts);
-    }
-}
-
-static void drain_type(int msqid, long mtype) {
-    struct qmsg tmp;
-    while (msgrcv(msqid, &tmp, MSG_SIZE, mtype, IPC_NOWAIT) >= 0) {
-    }
 }
 
 static int wait_reply(int msqid, long reply_type, struct qmsg *rep, int max_tries) {
@@ -431,7 +415,11 @@ static void apply_css(void) {
         "list { background-color: %s; color: %s; font-size: %dpt; }\n"
         "list row { padding: 2px 4px; }\n"
         "list row:hover { background-color: %s; }\n"
-        "list row:selected { background-color: %s; color: %s; }\n",
+
+        "list row:selected { background-color: %s; color: %s; }\n"
+        "button.file-btn { background-image: none; background-color: %s; border: 1px solid %s; border-radius: 6px; padding: 3px 10px; }\n"
+        "button.file-btn, button.file-btn label { color: %s; font-weight: bold; }\n"
+        "button.file-btn:hover { background-image: none; background-color: %s; }\n",
         t->win_bg, t->fg, ui_pt,
         t->fg, ui_pt,
         t->chat_bg, t->border,
@@ -461,7 +449,9 @@ static void apply_css(void) {
         t->border,
         t->chat_bg, t->fg, ui_pt,
         t->row_hover,
-        t->row_sel_bg, t->row_sel_fg
+
+        t->row_sel_bg, t->row_sel_fg,
+        t->entry_bg, t->border, t->accent, t->row_hover
     );
 
     gtk_css_provider_load_from_data(g_css_provider, css_data, -1, NULL);
@@ -638,6 +628,175 @@ static void ui_append_line_ts(GtkTextBuffer *buf, time_t ts_val, const char *tag
     ui_scroll_if_active(buf);
 }
 
+
+static void on_file_download_clicked(GtkWidget *btn, gpointer data) {
+    (void)data;
+    const char *stored = g_object_get_data(G_OBJECT(btn), "stored");
+    const char *orig = g_object_get_data(G_OBJECT(btn), "orig");
+    if (stored == NULL || stored[0] == '\0') {
+        return;
+    }
+
+    pthread_mutex_lock(&g_mtx);
+    long cur_id = g_my_id;
+    pthread_mutex_unlock(&g_mtx);
+    if (cur_id <= 0) {
+        ui_append_error("Login first.");
+        return;
+    }
+
+    GtkWidget *dlg = gtk_file_chooser_dialog_new(
+        "Save File",
+        GTK_WINDOW(w_window),
+        GTK_FILE_CHOOSER_ACTION_SAVE,
+        "_Cancel", GTK_RESPONSE_CANCEL,
+        "_Save", GTK_RESPONSE_ACCEPT,
+        NULL
+    );
+    gtk_file_chooser_set_do_overwrite_confirmation(GTK_FILE_CHOOSER(dlg), TRUE);
+    gtk_file_chooser_set_current_name(GTK_FILE_CHOOSER(dlg), (orig != NULL && orig[0] != '\0') ? orig : stored);
+
+    char *save_path = NULL;
+    if (gtk_dialog_run(GTK_DIALOG(dlg)) == GTK_RESPONSE_ACCEPT) {
+        save_path = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dlg));
+    }
+    gtk_widget_destroy(dlg);
+
+    if (save_path == NULL) {
+        return;
+    }
+
+    drain_type(g_msqid, g_reply_type);
+
+    struct qmsg req;
+    memset(&req, 0, sizeof(req));
+    req.mtype = ARBITER_TYPE;
+    req.cmd = CMD_FILE_GET;
+    req.sender_id = cur_id;
+    req.reply_type = g_reply_type;
+    snprintf(req.text, sizeof(req.text), "%.*s", MAX_TEXT - 1, stored);
+
+    if (msgsnd(g_msqid, &req, MSG_SIZE, IPC_NOWAIT) < 0) {
+        g_free(save_path);
+        ui_append_error("Failed to request file from arbiter.");
+        return;
+    }
+
+    struct qmsg rep;
+    if (wait_reply(g_msqid, g_reply_type, &rep, 200) < 0) {
+        g_free(save_path);
+        ui_append_error("No response from arbiter.");
+        return;
+    }
+    rep.text[MAX_TEXT - 1] = '\0';
+
+    if (rep.target_id < 0) {
+        char err[MAX_TEXT + 32];
+        snprintf(err, sizeof(err), "Download failed: %s", rep.text);
+        ui_append_error(err);
+    } else if (shm_save_to_file((int)rep.target_id, rep.timestamp, save_path) == 0) {
+        char note[320];
+        snprintf(note, sizeof(note), "Saved file to %s", save_path);
+        ui_append_sys("sys", note);
+    } else {
+        ui_append_error("Failed to save file to disk.");
+    }
+    g_free(save_path);
+}
+
+static void ui_attach_file_widget(GtkTextChildAnchor *anchor) {
+    if (w_chat_view == NULL || anchor == NULL) {
+        return;
+    }
+    GList *widgets = gtk_text_child_anchor_get_widgets(anchor);
+    if (widgets != NULL) {
+        g_list_free(widgets);
+        return;
+    }
+    const char *stored = g_object_get_data(G_OBJECT(anchor), "stored");
+    const char *orig = g_object_get_data(G_OBJECT(anchor), "orig");
+    long fsize = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(anchor), "fsize"));
+    if (stored == NULL || orig == NULL) {
+        return;
+    }
+
+    char sz_str[32];
+    format_file_size(fsize, sz_str, sizeof(sz_str));
+    char label[160];
+    snprintf(label, sizeof(label), "File: %s (%s)", orig, sz_str);
+
+    GtkWidget *btn = gtk_button_new_with_label(label);
+    gtk_style_context_add_class(gtk_widget_get_style_context(btn), "file-btn");
+    g_object_set_data_full(G_OBJECT(btn), "stored", g_strdup(stored), g_free);
+    g_object_set_data_full(G_OBJECT(btn), "orig", g_strdup(orig), g_free);
+    g_signal_connect(btn, "clicked", G_CALLBACK(on_file_download_clicked), NULL);
+
+    gtk_text_view_add_child_at_anchor(GTK_TEXT_VIEW(w_chat_view), btn, anchor);
+    gtk_widget_show(btn);
+}
+
+static void ui_attach_dialog_widgets(struct dialog_entry *d) {
+    if (d == NULL || w_chat_view == NULL) {
+        return;
+    }
+    if (gtk_text_view_get_buffer(GTK_TEXT_VIEW(w_chat_view)) != d->buf) {
+        return;
+    }
+    for (int i = 0; i < d->file_anchor_count; i++) {
+        ui_attach_file_widget(d->file_anchors[i]);
+    }
+}
+
+static void ui_insert_file_or_text(struct dialog_entry *d, GtkTextBuffer *buf, GtkTextIter *end, const char *body) {
+    char stored[96];
+    char orig[96];
+    long fsize = 0;
+    if (d != NULL && parse_file_marker(body, stored, sizeof(stored), &fsize, orig, sizeof(orig))) {
+        GtkTextChildAnchor *anchor = gtk_text_buffer_create_child_anchor(buf, end);
+        g_object_set_data_full(G_OBJECT(anchor), "stored", g_strdup(stored), g_free);
+        g_object_set_data_full(G_OBJECT(anchor), "orig", g_strdup(orig), g_free);
+        g_object_set_data(G_OBJECT(anchor), "fsize", GINT_TO_POINTER((int)fsize));
+        if (d->file_anchor_count < MAX_FILE_ANCHORS) {
+            d->file_anchors[d->file_anchor_count++] = anchor;
+        }
+        if (w_chat_view != NULL && gtk_text_view_get_buffer(GTK_TEXT_VIEW(w_chat_view)) == buf) {
+            ui_attach_file_widget(anchor);
+        }
+    } else if (body != NULL && body[0] != '\0') {
+        gtk_text_buffer_insert(buf, end, body, -1);
+    }
+}
+
+
+static void ui_append_dialog_line_ts(struct dialog_entry *d, time_t ts_val, const char *tag_name, const char *prefix, const char *body) {
+    if (d == NULL || d->buf == NULL) {
+        return;
+    }
+
+    char ts[24];
+    if (ts_val > 0) {
+        format_timestamp_from(ts_val, ts, sizeof(ts));
+    } else {
+        get_timestamp(ts, sizeof(ts));
+    }
+
+    GtkTextIter end;
+    gtk_text_buffer_get_end_iter(d->buf, &end);
+
+    char ts_str[32];
+    snprintf(ts_str, sizeof(ts_str), "[%s] ", ts);
+    gtk_text_buffer_insert_with_tags_by_name(d->buf, &end, ts_str, -1, "time", NULL);
+
+    if (prefix != NULL && prefix[0] != '\0') {
+        gtk_text_buffer_insert_with_tags_by_name(d->buf, &end, prefix, -1, tag_name, NULL);
+    }
+
+    ui_insert_file_or_text(d, d->buf, &end, body);
+
+    gtk_text_buffer_insert(d->buf, &end, "\n", -1);
+    ui_scroll_if_active(d->buf);
+}
+
 static void ui_append_line_to(GtkTextBuffer *buf, const char *tag_name, const char *prefix, const char *body) {
     ui_append_line_ts(buf, 0, tag_name, prefix, body);
 }
@@ -651,8 +810,10 @@ static void ui_append_error(const char *text) {
     ui_append_line_to(cur != NULL ? cur : g_sys_buf, "err", text, NULL);
 }
 
-static void ui_append_outgoing_to(GtkTextBuffer *buf, long msg_id, const char *body) {
-    if (buf == NULL) {
+
+static void ui_append_outgoing_to(struct dialog_entry *d, long msg_id, const char *body) {
+
+    if (d == NULL || d->buf == NULL) {
         return;
     }
 
@@ -660,30 +821,39 @@ static void ui_append_outgoing_to(GtkTextBuffer *buf, long msg_id, const char *b
     get_timestamp(ts, sizeof(ts));
 
     GtkTextIter end;
-    gtk_text_buffer_get_end_iter(buf, &end);
+
+    gtk_text_buffer_get_end_iter(d->buf, &end);
 
     char ts_str[24];
     snprintf(ts_str, sizeof(ts_str), "[%s] ", ts);
-    gtk_text_buffer_insert_with_tags_by_name(buf, &end, ts_str, -1, "time", NULL);
-    gtk_text_buffer_insert_with_tags_by_name(buf, &end, "you: ", -1, "outgoing", NULL);
 
-    if (body != NULL && body[0] != '\0') {
-        gtk_text_buffer_insert(buf, &end, body, -1);
-    }
+    gtk_text_buffer_insert_with_tags_by_name(d->buf, &end, ts_str, -1, "time", NULL);
+
+    gtk_text_buffer_insert_with_tags_by_name(d->buf, &end, "you: ", -1, "outgoing", NULL);
+
+
+    ui_insert_file_or_text(d, d->buf, &end, body);
 
     char m_start[32];
     char m_end[32];
     snprintf(m_start, sizeof(m_start), "ms_%ld", msg_id);
     snprintf(m_end, sizeof(m_end), "me_%ld", msg_id);
 
-    gtk_text_buffer_get_end_iter(buf, &end);
-    gtk_text_buffer_create_mark(buf, m_start, &end, TRUE);
-    gtk_text_buffer_insert_with_tags_by_name(buf, &end, " ✓", -1, "time", NULL);
-    gtk_text_buffer_get_end_iter(buf, &end);
-    gtk_text_buffer_create_mark(buf, m_end, &end, TRUE);
-    gtk_text_buffer_insert(buf, &end, "\n", -1);
 
-    ui_scroll_if_active(buf);
+    gtk_text_buffer_get_end_iter(d->buf, &end);
+
+    gtk_text_buffer_create_mark(d->buf, m_start, &end, TRUE);
+
+    gtk_text_buffer_insert_with_tags_by_name(d->buf, &end, " ✓", -1, "time", NULL);
+
+    gtk_text_buffer_get_end_iter(d->buf, &end);
+
+    gtk_text_buffer_create_mark(d->buf, m_end, &end, TRUE);
+
+    gtk_text_buffer_insert(d->buf, &end, "\n", -1);
+
+
+    ui_scroll_if_active(d->buf);
 }
 
 
@@ -893,6 +1063,8 @@ static void ui_switch_dialog(const char *peer, int is_room, int set_target) {
     send_mark_read(d->peer, is_room);
 
     gtk_text_view_set_buffer(GTK_TEXT_VIEW(w_chat_view), d->buf);
+
+    ui_attach_dialog_widgets(d);
     ui_scroll_if_active(d->buf);
     ui_update_chat_header();
 
@@ -1496,7 +1668,8 @@ static gboolean ui_handle_event(gpointer user_data) {
         if (d != NULL) {
             char prefix[MAX_NAME + 8];
             snprintf(prefix, sizeof(prefix), "%s: ", ev->sender);
-            ui_append_line_ts(d->buf, (time_t)ev->timestamp, "incoming", prefix, ev->text);
+
+            ui_append_dialog_line_ts(d, (time_t)ev->timestamp, "incoming", prefix, ev->text);
 
             if (!g_active_is_room && strcmp(g_active_peer, d->peer) == 0) {
                 send_read_ack(ev->msg_id, ev->sender);
@@ -1516,11 +1689,13 @@ static gboolean ui_handle_event(gpointer user_data) {
                 d->joined = 1;
             }
             if (ev->is_outgoing) {
-                ui_append_line_ts(d->buf, (time_t)ev->timestamp, "outgoing", "you: ", ev->text);
+
+                ui_append_dialog_line_ts(d, (time_t)ev->timestamp, "outgoing", "you: ", ev->text);
             } else {
                 char prefix[MAX_NAME + 8];
                 snprintf(prefix, sizeof(prefix), "%s: ", ev->sender);
-                ui_append_line_ts(d->buf, (time_t)ev->timestamp, "incoming", prefix, ev->text);
+
+                ui_append_dialog_line_ts(d, (time_t)ev->timestamp, "incoming", prefix, ev->text);
 
             if (!ev->is_outgoing && ev->msg_id != 0) {
                 if (g_active_is_room == ev->is_room && strcmp(g_active_peer, d->peer) == 0) {
@@ -1542,7 +1717,8 @@ static gboolean ui_handle_event(gpointer user_data) {
             } else {
                 char prefix[MAX_NAME + 8];
                 snprintf(prefix, sizeof(prefix), "%s: ", ev->sender);
-                ui_append_line_ts(d->buf, (time_t)ev->timestamp, "incoming", prefix, ev->text);
+
+                ui_append_dialog_line_ts(d, (time_t)ev->timestamp, "incoming", prefix, ev->text);
 
                 if (g_active_is_room && strcmp(g_active_peer, d->peer) == 0) {
                     send_read_ack(ev->msg_id, ev->sender);
@@ -1985,7 +2161,8 @@ static void on_send_clicked(GtkWidget *widget, gpointer data) {
         if (!g_active_is_room || strcmp(g_active_peer, d->peer) != 0) {
             ui_switch_dialog(d->peer, 1, 0);
         }
-        ui_append_outgoing_to(d->buf, msg_id, text);
+
+        ui_append_outgoing_to(d, msg_id, text);
         gtk_entry_set_text(GTK_ENTRY(w_msg_entry), "");
         gtk_widget_grab_focus(w_msg_entry);
         return;
@@ -2051,10 +2228,140 @@ static void on_send_clicked(GtkWidget *widget, gpointer data) {
         ui_update_chat_header();
     }
 
-    ui_append_outgoing_to(d->buf, msg_id, text);
+
+    ui_append_outgoing_to(d, msg_id, text);
 
     record_unacked_id(d, msg_id);
     gtk_entry_set_text(GTK_ENTRY(w_msg_entry), "");
+    gtk_widget_grab_focus(w_msg_entry);
+}
+
+
+static void on_send_file_clicked(GtkWidget *widget, gpointer data) {
+    (void)widget;
+    (void)data;
+
+    pthread_mutex_lock(&g_mtx);
+    long cur_id = g_my_id;
+    char cur_name[MAX_NAME];
+    snprintf(cur_name, sizeof(cur_name), "%.*s", MAX_NAME - 1, g_my_name);
+    pthread_mutex_unlock(&g_mtx);
+
+    if (cur_id <= 0) {
+        ui_append_error("Login first.");
+        return;
+    }
+
+    const char *target = gtk_entry_get_text(GTK_ENTRY(w_target_entry));
+    if (target == NULL || target[0] == '\0' || strlen(target) >= MAX_NAME + 1) {
+        ui_append_error("Enter a valid recipient or #room.");
+        gtk_widget_grab_focus(w_target_entry);
+        return;
+    }
+
+    int is_room = (target[0] == '#');
+    const char *peer = is_room ? (target + 1) : target;
+    if (peer[0] == '\0' || strlen(peer) >= MAX_NAME) {
+        ui_append_error("Enter a valid recipient or #room.");
+        return;
+    }
+    if (!is_room && (strcmp(peer, cur_name) == 0 || strcasecmp(peer, "arbiter") == 0)) {
+        ui_append_error("Cannot send file to yourself or arbiter.");
+        return;
+    }
+
+    GtkWidget *dlg = gtk_file_chooser_dialog_new(
+        "Send File",
+        GTK_WINDOW(w_window),
+        GTK_FILE_CHOOSER_ACTION_OPEN,
+        "_Cancel", GTK_RESPONSE_CANCEL,
+        "_Send", GTK_RESPONSE_ACCEPT,
+        NULL
+    );
+
+    char *fpath = NULL;
+    if (gtk_dialog_run(GTK_DIALOG(dlg)) == GTK_RESPONSE_ACCEPT) {
+        fpath = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dlg));
+    }
+    gtk_widget_destroy(dlg);
+
+    if (fpath == NULL) {
+        return;
+    }
+
+    long fsize = 0;
+    char err[64] = "";
+    int shmid = shm_alloc_from_file(fpath, &fsize, err, sizeof(err));
+    if (shmid < 0) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "File error: %s", err);
+        ui_append_error(msg);
+        g_free(fpath);
+        return;
+    }
+
+    char fname[64];
+    sanitize_filename(fpath, fname, sizeof(fname));
+    g_free(fpath);
+
+    long msg_id = g_next_msg_id++;
+    drain_type(g_msqid, g_reply_type);
+
+    struct qmsg req;
+    memset(&req, 0, sizeof(req));
+    req.mtype = ARBITER_TYPE;
+    req.cmd = CMD_FILE_SEND;
+    req.sender_id = cur_id;
+    req.msg_id = msg_id;
+    req.reply_type = g_reply_type;
+    req.target_id = shmid;
+    req.timestamp = fsize;
+    snprintf(req.name, sizeof(req.name), "%.*s", MAX_NAME - 1, target);
+    snprintf(req.sender_name, sizeof(req.sender_name), "%.*s", MAX_NAME - 1, cur_name);
+    snprintf(req.text, sizeof(req.text), "%.*s", MAX_TEXT - 1, fname);
+
+    if (msgsnd(g_msqid, &req, MSG_SIZE, IPC_NOWAIT) < 0) {
+        shmctl(shmid, IPC_RMID, NULL);
+        ui_append_error(errno == EAGAIN
+            ? "Message queue is full, try again."
+            : "Failed to send file.");
+        return;
+    }
+
+    struct qmsg rep;
+    if (wait_reply(g_msqid, g_reply_type, &rep, 200) < 0) {
+        ui_append_error("No response from arbiter.");
+        return;
+    }
+    rep.text[MAX_TEXT - 1] = '\0';
+
+    if (rep.target_id < 0) {
+        char emsg[MAX_TEXT + 32];
+        snprintf(emsg, sizeof(emsg), "File send failed: %s", rep.text);
+        ui_append_error(emsg);
+        return;
+    }
+
+    struct dialog_entry *d = get_or_create_dialog(peer, is_room);
+    if (d == NULL) {
+        return;
+    }
+    if (is_room) {
+        d->joined = 1;
+    } else {
+        d->online = (rep.target_id > 0);
+    }
+
+    if (g_active_is_room != is_room || strcmp(g_active_peer, d->peer) != 0) {
+        ui_switch_dialog(d->peer, is_room, 0);
+    } else {
+        ui_update_chat_header();
+    }
+
+    ui_append_outgoing_to(d, msg_id, rep.text);
+    if (!is_room) {
+        record_unacked_id(d, msg_id);
+    }
     gtk_widget_grab_focus(w_msg_entry);
 }
 
@@ -2339,8 +2646,16 @@ static void build_ui(void) {
     w_send_btn = gtk_button_new_with_label("Send");
     g_signal_connect(w_send_btn, "clicked", G_CALLBACK(on_send_clicked), NULL);
 
+
+
+    w_file_btn = gtk_button_new_with_label("File");
+    gtk_style_context_add_class(gtk_widget_get_style_context(w_file_btn), "tab-btn");
+    g_signal_connect(w_file_btn, "clicked", G_CALLBACK(on_send_file_clicked), NULL);
+
     gtk_box_pack_start(GTK_BOX(bottom_bar), w_target_entry, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(bottom_bar), w_msg_entry, TRUE, TRUE, 0);
+
+    gtk_box_pack_start(GTK_BOX(bottom_bar), w_file_btn, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(bottom_bar), w_send_btn, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(root), bottom_bar, FALSE, FALSE, 0);
 
