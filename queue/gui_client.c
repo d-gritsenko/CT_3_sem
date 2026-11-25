@@ -141,14 +141,15 @@ static volatile sig_atomic_t g_running = 1;
 static volatile sig_atomic_t g_who_force = 0;
 static int g_msqid = -1;
 static long g_my_id = 0;
+static int g_is_debug = 0;
 static long g_reply_type = 0;
 static long g_who_reply_type = 0;
 static long g_next_msg_id = 1;
 static char g_my_name[MAX_NAME];
 static pthread_mutex_t g_mtx = PTHREAD_MUTEX_INITIALIZER;
 
-static int g_was_connected = 0;
 static int g_suppress_select = 0;
+static int g_suppress_theme_save = 0;
 static int g_theme_idx = 0;
 static GtkCssProvider *g_css_provider = NULL;
 
@@ -164,9 +165,14 @@ static struct room_list_item g_rooms_cache[MAX_ROOMS];
 static int g_rooms_cache_count = 0;
 
 static GtkWidget *w_window = NULL;
-static GtkWidget *w_nick_entry = NULL;
+static GtkWidget *w_main_stack = NULL;
+
+static GtkWidget *w_auth_user = NULL;
+static GtkWidget *w_auth_pass = NULL;
+static GtkWidget *w_login_btn = NULL;
 static GtkWidget *w_reg_btn = NULL;
-static GtkWidget *w_reconn_btn = NULL;
+static GtkWidget *w_auth_err = NULL;
+
 static GtkWidget *w_logout_btn = NULL;
 static GtkWidget *w_status_lbl = NULL;
 static GtkWidget *w_theme_combo = NULL;
@@ -238,6 +244,7 @@ static void send_logout(void) {
     pthread_mutex_lock(&g_mtx);
     long my_id = g_my_id;
     g_my_id = 0;
+    g_is_debug = 0;
     g_my_name[0] = '\0';
     pthread_mutex_unlock(&g_mtx);
 
@@ -342,6 +349,10 @@ static void apply_theme(int idx) {
     snprintf(css_data, sizeof(css_data),
         "window { background-color: %s; color: %s; }\n"
         "label { color: %s; }\n"
+        ".auth-card { background-color: %s; border: 1px solid %s; border-radius: 10px; padding: 24px 28px; }\n"
+        ".auth-title { font-size: 18pt; font-weight: bold; color: %s; }\n"
+        ".auth-hint { font-size: 9pt; color: %s; }\n"
+        ".auth-err { font-weight: bold; color: %s; }\n"
         "entry { background-color: %s; color: %s; border: 1px solid %s; border-radius: 6px; padding: 6px 10px; }\n"
         "entry:focus { border-color: %s; }\n"
         "button { background-image: none; background-color: %s; border-radius: 6px; padding: 6px 14px; border: none; }\n"
@@ -369,6 +380,10 @@ static void apply_theme(int idx) {
         "list row:selected { background-color: %s; color: %s; }\n",
         t->win_bg, t->fg,
         t->fg,
+        t->chat_bg, t->border,
+        t->accent,
+        t->muted,
+        t->err,
         t->entry_bg, t->fg, t->border,
         t->accent,
         t->accent,
@@ -411,8 +426,28 @@ static void apply_theme(int idx) {
 static void on_theme_changed(GtkComboBox *combo, gpointer data) {
     (void)data;
     int idx = gtk_combo_box_get_active(combo);
-    if (idx >= 0 && idx < THEME_COUNT) {
-        apply_theme(idx);
+    if (idx < 0 || idx >= THEME_COUNT) {
+        return;
+    }
+    apply_theme(idx);
+
+    if (g_suppress_theme_save) {
+        return;
+    }
+
+    pthread_mutex_lock(&g_mtx);
+    long my_id = g_my_id;
+    int is_dbg = g_is_debug;
+    pthread_mutex_unlock(&g_mtx);
+
+    if (my_id > 0 && !is_dbg && g_msqid >= 0) {
+        struct qmsg req;
+        memset(&req, 0, sizeof(req));
+        req.mtype = ARBITER_TYPE;
+        req.cmd = CMD_SET_THEME;
+        req.sender_id = my_id;
+        req.msg_id = idx;
+        msgsnd(g_msqid, &req, MSG_SIZE, IPC_NOWAIT);
     }
 }
 
@@ -1009,6 +1044,9 @@ static void clear_all_dialogs(void) {
             memset(&g_dialogs[i], 0, sizeof(g_dialogs[i]));
         }
     }
+    if (g_sys_buf != NULL) {
+        gtk_text_buffer_set_text(g_sys_buf, "", -1);
+    }
 }
 
 static int do_join_room(const char *raw_name) {
@@ -1017,7 +1055,7 @@ static int do_join_room(const char *raw_name) {
     pthread_mutex_unlock(&g_mtx);
 
     if (cur_id <= 0) {
-        ui_append_error("Register first.");
+        ui_append_error("Login first.");
         return 0;
     }
 
@@ -1222,39 +1260,32 @@ static void on_tab_rooms_clicked(GtkWidget *widget, gpointer data) {
     ui_select_sidebar_tab("rooms");
 }
 
-static void ui_set_connected_state(int connected, const char *name, long id) {
-    gtk_widget_set_sensitive(w_nick_entry, !connected);
-    gtk_widget_set_visible(w_reg_btn, !connected);
-    gtk_widget_set_visible(w_reconn_btn, !connected);
-    gtk_widget_set_visible(w_logout_btn, connected);
-    gtk_widget_set_sensitive(w_target_entry, connected);
-    gtk_widget_set_sensitive(w_msg_entry, connected);
-    gtk_widget_set_sensitive(w_send_btn, connected);
-    gtk_widget_set_sensitive(w_users_list, connected);
-    gtk_widget_set_sensitive(w_rooms_list, connected);
-    gtk_widget_set_sensitive(w_room_entry, connected);
-    gtk_widget_set_sensitive(w_join_btn, connected);
-    gtk_widget_set_sensitive(w_tab_users, connected);
-    gtk_widget_set_sensitive(w_tab_rooms, connected);
-
+static void ui_set_connected_state(int connected, const char *name, long id, int is_debug) {
     if (connected) {
         char status[128];
         char title[128];
-        snprintf(status, sizeof(status), "Online: %s (id=%ld)", name, id);
-        snprintf(title, sizeof(title), "Queue Messenger — %s", name);
+        snprintf(status, sizeof(status), "Online: %s%s (id=%ld)",
+                 name, is_debug ? " [DEBUG]" : "", id);
+
+        snprintf(title, sizeof(title), "DeepSpeak — %s%s",
+                 name, is_debug ? " [DEBUG]" : "");
         gtk_label_set_text(GTK_LABEL(w_status_lbl), status);
         gtk_window_set_title(GTK_WINDOW(w_window), title);
+        gtk_label_set_text(GTK_LABEL(w_auth_err), "");
+        gtk_entry_set_text(GTK_ENTRY(w_auth_pass), "");
+        gtk_stack_set_visible_child_name(GTK_STACK(w_main_stack), "chat");
         gtk_widget_grab_focus(w_target_entry);
     } else {
-        gtk_label_set_text(GTK_LABEL(w_status_lbl), "Disconnected");
-        gtk_window_set_title(GTK_WINDOW(w_window), "Queue Messenger");
+
+        gtk_window_set_title(GTK_WINDOW(w_window), "DeepSpeak");
         clear_all_dialogs();
         if (w_target_entry != NULL) {
             gtk_entry_set_text(GTK_ENTRY(w_target_entry), "");
         }
         ui_update_users_list(0, "");
         ui_update_rooms_list(0, "");
-        gtk_widget_grab_focus(w_nick_entry);
+        gtk_stack_set_visible_child_name(GTK_STACK(w_main_stack), "auth");
+        gtk_widget_grab_focus(w_auth_user);
     }
 }
 
@@ -1313,14 +1344,15 @@ static gboolean ui_handle_event(gpointer user_data) {
     } else if (ev->kind == EV_LOST) {
         pthread_mutex_lock(&g_mtx);
         g_my_id = 0;
+        g_is_debug = 0;
         g_my_name[0] = '\0';
         pthread_mutex_unlock(&g_mtx);
-        ui_set_connected_state(0, "", 0);
+        ui_set_connected_state(0, "", 0, 0);
+        gtk_widget_set_sensitive(w_auth_user, FALSE);
+        gtk_widget_set_sensitive(w_auth_pass, FALSE);
+        gtk_widget_set_sensitive(w_login_btn, FALSE);
         gtk_widget_set_sensitive(w_reg_btn, FALSE);
-        gtk_widget_set_sensitive(w_reconn_btn, FALSE);
-        gtk_widget_set_sensitive(w_logout_btn, FALSE);
-        gtk_widget_set_sensitive(w_nick_entry, FALSE);
-        ui_append_sys("err", "Connection lost (arbiter stopped).");
+        gtk_label_set_text(GTK_LABEL(w_auth_err), "Connection lost (arbiter stopped).");
     }
 
     free(ev);
@@ -1509,7 +1541,7 @@ static void *heartbeat_worker(void *arg) {
     return NULL;
 }
 
-static void do_auth(int is_reconnect) {
+static void do_auth(int is_login) {
     pthread_mutex_lock(&g_mtx);
     long cur_id = g_my_id;
     pthread_mutex_unlock(&g_mtx);
@@ -1518,21 +1550,33 @@ static void do_auth(int is_reconnect) {
         return;
     }
 
-    const char *name = gtk_entry_get_text(GTK_ENTRY(w_nick_entry));
-    if (name == NULL || name[0] == '\0' || strchr(name, '#') != NULL || strchr(name, ',') != NULL || strlen(name) >= MAX_NAME) {
-        ui_append_sys("err", "Invalid name (1..31 chars, no '#' or ',').");
+    const char *name = gtk_entry_get_text(GTK_ENTRY(w_auth_user));
+    const char *pass = gtk_entry_get_text(GTK_ENTRY(w_auth_pass));
+
+    if (name == NULL || name[0] == '\0' || strchr(name, '#') != NULL ||
+        strchr(name, ',') != NULL || strchr(name, ' ') != NULL || strlen(name) >= MAX_NAME) {
+        gtk_label_set_text(GTK_LABEL(w_auth_err), "Invalid username (1..31 chars, no spaces, '#' or ',').");
+        gtk_widget_grab_focus(w_auth_user);
         return;
     }
+    if (pass == NULL || pass[0] == '\0' || strlen(pass) >= MAX_PASS) {
+        gtk_label_set_text(GTK_LABEL(w_auth_err), "Enter password.");
+        gtk_widget_grab_focus(w_auth_pass);
+        return;
+    }
+
+    drain_type(g_msqid, g_reply_type);
 
     struct qmsg req;
     memset(&req, 0, sizeof(req));
     req.mtype = ARBITER_TYPE;
-    req.cmd = is_reconnect ? CMD_RECONNECT : CMD_REGISTER;
+    req.cmd = is_login ? CMD_LOGIN : CMD_REGISTER;
     req.reply_type = g_reply_type;
     snprintf(req.name, sizeof(req.name), "%.*s", MAX_NAME - 1, name);
+    snprintf(req.text, sizeof(req.text), "%.*s", MAX_PASS - 1, pass);
 
     if (msgsnd(g_msqid, &req, MSG_SIZE, IPC_NOWAIT) < 0) {
-        ui_append_sys("err", errno == EAGAIN
+        gtk_label_set_text(GTK_LABEL(w_auth_err), errno == EAGAIN
             ? "Message queue is full, try again."
             : "Failed to send request to arbiter.");
         return;
@@ -1540,32 +1584,49 @@ static void do_auth(int is_reconnect) {
 
     struct qmsg rep;
     if (wait_reply(g_msqid, g_reply_type, &rep, 200) < 0) {
-        ui_append_sys("err", "No response from arbiter.");
+        gtk_label_set_text(GTK_LABEL(w_auth_err), "No response from arbiter.");
         return;
     }
+    rep.text[MAX_TEXT - 1] = '\0';
 
     if (rep.target_id > 0) {
+        int is_dbg = (rep.sender_id != 0);
+        int saved_theme = (int)rep.msg_id;
+        if (saved_theme < 0 || saved_theme >= THEME_COUNT) {
+            saved_theme = 0;
+        }
+
         pthread_mutex_lock(&g_mtx);
         g_my_id = rep.target_id;
+        g_is_debug = is_dbg;
         g_next_msg_id = 1;
         snprintf(g_my_name, sizeof(g_my_name), "%.*s", MAX_NAME - 1, name);
         pthread_mutex_unlock(&g_mtx);
 
-        g_was_connected = 1;
-        ui_set_connected_state(1, name, rep.target_id);
+        g_suppress_theme_save = 1;
+        gtk_combo_box_set_active(GTK_COMBO_BOX(w_theme_combo), saved_theme);
+        apply_theme(saved_theme);
+        g_suppress_theme_save = 0;
+
+        ui_set_connected_state(1, name, rep.target_id, is_dbg);
         g_who_force = 1;
 
         char info[128];
-        snprintf(info, sizeof(info), "%s as %s (id=%ld).",
-                 is_reconnect ? "Reconnected" : "Registered", name, rep.target_id);
+        snprintf(info, sizeof(info), "%s as %s%s (id=%ld).",
+                 is_login ? "Logged in" : "Registered", name,
+                 is_dbg ? " [DEBUG]" : "", rep.target_id);
         ui_append_sys("sys", info);
     } else {
-        char info[MAX_TEXT + 64];
-        rep.text[MAX_TEXT - 1] = '\0';
-        snprintf(info, sizeof(info), "%s failed: %s",
-                 is_reconnect ? "Reconnect" : "Registration", rep.text);
-        ui_append_sys("err", info);
+        char info[MAX_TEXT + 32];
+        snprintf(info, sizeof(info), "%s", rep.text[0] != '\0' ? rep.text : "Auth failed");
+        gtk_label_set_text(GTK_LABEL(w_auth_err), info);
     }
+}
+
+static void on_login_clicked(GtkWidget *widget, gpointer data) {
+    (void)widget;
+    (void)data;
+    do_auth(1);
 }
 
 static void on_register_clicked(GtkWidget *widget, gpointer data) {
@@ -1574,7 +1635,13 @@ static void on_register_clicked(GtkWidget *widget, gpointer data) {
     do_auth(0);
 }
 
-static void on_reconnect_clicked(GtkWidget *widget, gpointer data) {
+static void on_auth_user_activate(GtkWidget *widget, gpointer data) {
+    (void)widget;
+    (void)data;
+    gtk_widget_grab_focus(w_auth_pass);
+}
+
+static void on_auth_pass_activate(GtkWidget *widget, gpointer data) {
     (void)widget;
     (void)data;
     do_auth(1);
@@ -1584,14 +1651,7 @@ static void on_logout_clicked(GtkWidget *widget, gpointer data) {
     (void)widget;
     (void)data;
     send_logout();
-    ui_set_connected_state(0, "", 0);
-    ui_append_sys("warn", "Logged out.");
-}
-
-static void on_nick_activate(GtkWidget *widget, gpointer data) {
-    (void)widget;
-    (void)data;
-    do_auth(g_was_connected);
+    ui_set_connected_state(0, "", 0, 0);
 }
 
 static void on_send_clicked(GtkWidget *widget, gpointer data) {
@@ -1605,7 +1665,7 @@ static void on_send_clicked(GtkWidget *widget, gpointer data) {
     pthread_mutex_unlock(&g_mtx);
 
     if (cur_id <= 0) {
-        ui_append_error("Register first.");
+        ui_append_error("Login first.");
         return;
     }
 
@@ -1792,28 +1852,85 @@ static void build_ui(void) {
     g_sys_buf = create_chat_buffer();
 
     w_window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
-    gtk_window_set_title(GTK_WINDOW(w_window), "Queue Messenger");
+
+    gtk_window_set_title(GTK_WINDOW(w_window), "DeepSpeak");
     gtk_window_set_default_size(GTK_WINDOW(w_window), 820, 500);
     g_signal_connect(w_window, "destroy", G_CALLBACK(on_window_destroy), NULL);
 
+    w_main_stack = gtk_stack_new();
+    gtk_stack_set_transition_type(GTK_STACK(w_main_stack), GTK_STACK_TRANSITION_TYPE_CROSSFADE);
+    gtk_stack_set_transition_duration(GTK_STACK(w_main_stack), 150);
+    gtk_container_add(GTK_CONTAINER(w_window), w_main_stack);
+
+    /* Auth screen */
+    GtkWidget *auth_outer = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_widget_set_halign(auth_outer, GTK_ALIGN_CENTER);
+    gtk_widget_set_valign(auth_outer, GTK_ALIGN_CENTER);
+
+    GtkWidget *auth_card = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
+    gtk_widget_set_size_request(auth_card, 340, -1);
+    gtk_style_context_add_class(gtk_widget_get_style_context(auth_card), "auth-card");
+
+
+    GtkWidget *auth_title = gtk_label_new("DeepSpeak");
+    gtk_style_context_add_class(gtk_widget_get_style_context(auth_title), "auth-title");
+    gtk_box_pack_start(GTK_BOX(auth_card), auth_title, FALSE, FALSE, 0);
+
+    GtkWidget *auth_sub = gtk_label_new("Sign in or create a new account");
+    gtk_style_context_add_class(gtk_widget_get_style_context(auth_sub), "auth-hint");
+    gtk_box_pack_start(GTK_BOX(auth_card), auth_sub, FALSE, FALSE, 4);
+
+    w_auth_user = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(w_auth_user), "Username");
+    gtk_entry_set_max_length(GTK_ENTRY(w_auth_user), MAX_NAME - 1);
+    g_signal_connect(w_auth_user, "activate", G_CALLBACK(on_auth_user_activate), NULL);
+    gtk_box_pack_start(GTK_BOX(auth_card), w_auth_user, FALSE, FALSE, 0);
+
+    w_auth_pass = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(w_auth_pass), "Password");
+    gtk_entry_set_max_length(GTK_ENTRY(w_auth_pass), MAX_PASS - 1);
+    gtk_entry_set_visibility(GTK_ENTRY(w_auth_pass), FALSE);
+    gtk_entry_set_invisible_char(GTK_ENTRY(w_auth_pass), 0x2022);
+    g_signal_connect(w_auth_pass, "activate", G_CALLBACK(on_auth_pass_activate), NULL);
+    gtk_box_pack_start(GTK_BOX(auth_card), w_auth_pass, FALSE, FALSE, 0);
+
+    GtkWidget *auth_btns = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_box_set_homogeneous(GTK_BOX(auth_btns), TRUE);
+
+    w_login_btn = gtk_button_new_with_label("Log In");
+    g_signal_connect(w_login_btn, "clicked", G_CALLBACK(on_login_clicked), NULL);
+
+    w_reg_btn = gtk_button_new_with_label("Register");
+    gtk_style_context_add_class(gtk_widget_get_style_context(w_reg_btn), "tab-btn");
+    g_signal_connect(w_reg_btn, "clicked", G_CALLBACK(on_register_clicked), NULL);
+
+    gtk_box_pack_start(GTK_BOX(auth_btns), w_login_btn, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(auth_btns), w_reg_btn, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(auth_card), auth_btns, FALSE, FALSE, 4);
+
+    w_auth_err = gtk_label_new("");
+    gtk_label_set_line_wrap(GTK_LABEL(w_auth_err), TRUE);
+    gtk_style_context_add_class(gtk_widget_get_style_context(w_auth_err), "auth-err");
+    gtk_box_pack_start(GTK_BOX(auth_card), w_auth_err, FALSE, FALSE, 0);
+
+    GtkWidget *dbg_hint = gtk_label_new("Debug accounts: user* with debug password");
+    gtk_style_context_add_class(gtk_widget_get_style_context(dbg_hint), "auth-hint");
+    gtk_box_pack_start(GTK_BOX(auth_card), dbg_hint, FALSE, FALSE, 0);
+
+    gtk_box_pack_start(GTK_BOX(auth_outer), auth_card, FALSE, FALSE, 0);
+    gtk_stack_add_named(GTK_STACK(w_main_stack), auth_outer, "auth");
+
+    /* Chat screen */
     GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
     gtk_widget_set_margin_top(root, 12);
     gtk_widget_set_margin_bottom(root, 12);
     gtk_widget_set_margin_start(root, 12);
     gtk_widget_set_margin_end(root, 12);
-    gtk_container_add(GTK_CONTAINER(w_window), root);
 
     GtkWidget *top_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    w_nick_entry = gtk_entry_new();
-    gtk_entry_set_placeholder_text(GTK_ENTRY(w_nick_entry), "Username");
-    gtk_entry_set_max_length(GTK_ENTRY(w_nick_entry), MAX_NAME - 1);
-    g_signal_connect(w_nick_entry, "activate", G_CALLBACK(on_nick_activate), NULL);
 
-    w_reg_btn = gtk_button_new_with_label("Register");
-    g_signal_connect(w_reg_btn, "clicked", G_CALLBACK(on_register_clicked), NULL);
-
-    w_reconn_btn = gtk_button_new_with_label("Reconnect");
-    g_signal_connect(w_reconn_btn, "clicked", G_CALLBACK(on_reconnect_clicked), NULL);
+    w_status_lbl = gtk_label_new("Disconnected");
+    gtk_widget_set_halign(w_status_lbl, GTK_ALIGN_START);
 
     w_logout_btn = gtk_button_new_with_label("Logout");
     g_signal_connect(w_logout_btn, "clicked", G_CALLBACK(on_logout_clicked), NULL);
@@ -1825,15 +1942,9 @@ static void build_ui(void) {
     gtk_combo_box_set_active(GTK_COMBO_BOX(w_theme_combo), g_theme_idx);
     g_signal_connect(w_theme_combo, "changed", G_CALLBACK(on_theme_changed), NULL);
 
-    w_status_lbl = gtk_label_new("Disconnected");
-    gtk_widget_set_halign(w_status_lbl, GTK_ALIGN_END);
-
-    gtk_box_pack_start(GTK_BOX(top_bar), w_nick_entry, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(top_bar), w_reg_btn, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(top_bar), w_reconn_btn, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(top_bar), w_logout_btn, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(top_bar), w_status_lbl, TRUE, TRUE, 0);
+    gtk_box_pack_end(GTK_BOX(top_bar), w_logout_btn, FALSE, FALSE, 0);
     gtk_box_pack_end(GTK_BOX(top_bar), w_theme_combo, FALSE, FALSE, 0);
-    gtk_box_pack_end(GTK_BOX(top_bar), w_status_lbl, TRUE, TRUE, 0);
     gtk_box_pack_start(GTK_BOX(root), top_bar, FALSE, FALSE, 0);
 
     GtkWidget *mid_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
@@ -1889,7 +2000,6 @@ static void build_ui(void) {
     w_sidebar_stack = gtk_stack_new();
     gtk_stack_set_transition_type(GTK_STACK(w_sidebar_stack), GTK_STACK_TRANSITION_TYPE_NONE);
 
-    /* Users tab page */
     GtkWidget *users_page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
     w_users_lbl = gtk_label_new("Online (0)");
     gtk_widget_set_halign(w_users_lbl, GTK_ALIGN_START);
@@ -1906,7 +2016,6 @@ static void build_ui(void) {
     gtk_box_pack_start(GTK_BOX(users_page), users_scroll, TRUE, TRUE, 0);
     gtk_stack_add_named(GTK_STACK(w_sidebar_stack), users_page, "users");
 
-    /* Rooms tab page */
     GtkWidget *rooms_page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
     GtkWidget *join_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
 
@@ -1962,10 +2071,12 @@ static void build_ui(void) {
     gtk_box_pack_start(GTK_BOX(bottom_bar), w_send_btn, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(root), bottom_bar, FALSE, FALSE, 0);
 
+    gtk_stack_add_named(GTK_STACK(w_main_stack), root, "chat");
+
     apply_theme(g_theme_idx);
     gtk_widget_show_all(w_window);
     ui_select_sidebar_tab("users");
-    ui_set_connected_state(0, "", 0);
+    ui_set_connected_state(0, "", 0, 0);
 }
 
 int main(int argc, char *argv[]) {
