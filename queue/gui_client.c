@@ -169,6 +169,7 @@ static GtkCssProvider *g_css_provider = NULL;
 
 static int g_font_size = 11;
 
+static int g_manual_font_size = 0;
 static GtkTextBuffer *g_sys_buf = NULL;
 static struct dialog_entry g_dialogs[MAX_DIALOGS];
 static char g_active_peer[MAX_NAME] = "";
@@ -189,18 +190,23 @@ static GtkWidget *w_login_btn = NULL;
 static GtkWidget *w_reg_btn = NULL;
 static GtkWidget *w_auth_err = NULL;
 
+static GtkWidget *w_menu_btn = NULL;
+static GtkWidget *w_menu_popover = NULL;
+static GtkWidget *w_acct_info_lbl = NULL;
+static GtkWidget *w_scale_combo = NULL;
 static GtkWidget *w_logout_btn = NULL;
 static GtkWidget *w_status_lbl = NULL;
 static GtkWidget *w_theme_combo = NULL;
 static GtkWidget *w_chat_header = NULL;
-static GtkWidget *w_leave_btn = NULL;
-static GtkWidget *w_delete_btn = NULL;
+static GtkWidget *w_chat_menu_btn = NULL;
+static GtkWidget *w_chat_menu = NULL;
+static GtkWidget *w_mi_leave = NULL;
+static GtkWidget *w_mi_delete = NULL;
 static GtkWidget *w_chat_view = NULL;
 
 static GtkWidget *w_tab_users = NULL;
 static GtkWidget *w_tab_rooms = NULL;
 static GtkWidget *w_sidebar_stack = NULL;
-
 static GtkWidget *w_sidebar = NULL;
 
 static GtkWidget *w_users_lbl = NULL;
@@ -211,13 +217,10 @@ static GtkWidget *w_join_btn = NULL;
 static GtkWidget *w_rooms_lbl = NULL;
 static GtkWidget *w_rooms_list = NULL;
 
-static GtkWidget *w_target_entry = NULL;
+static GtkWidget *w_new_chat_btn = NULL;
 static GtkWidget *w_msg_entry = NULL;
 static GtkWidget *w_send_btn = NULL;
-
 static GtkWidget *w_file_btn = NULL;
-
-
 static GtkWidget *w_attach_menu = NULL;
 static void ui_rebuild_users_list(void);
 static void ui_rebuild_rooms_list(void);
@@ -386,7 +389,8 @@ static void apply_css(void) {
     }
 
 
-    char css_data[6144];
+
+    char css_data[8192];
     snprintf(css_data, sizeof(css_data),
         "window { background-color: %s; color: %s; font-size: %dpt; }\n"
         "label { color: %s; font-size: %dpt; }\n"
@@ -429,7 +433,10 @@ static void apply_css(void) {
         "button.photo-btn:hover { background-image: none; background-color: %s; border-color: %s; }\n"
         "menu { background-color: %s; color: %s; border: 1px solid %s; padding: 4px; }\n"
         "menuitem { padding: 6px 14px; color: %s; }\n"
-        "menuitem:hover { background-color: %s; color: %s; }\n",
+
+        "menuitem:hover { background-color: %s; color: %s; }\n"
+        "popover, popover.background { background-color: %s; color: %s; border: 1px solid %s; border-radius: 8px; padding: 12px; }\n"
+        ".acct-info { font-weight: bold; color: %s; }\n",
         t->win_bg, t->fg, ui_pt,
         t->fg, ui_pt,
         t->chat_bg, t->border,
@@ -468,7 +475,10 @@ static void apply_css(void) {
         t->row_hover, t->accent,
         t->entry_bg, t->fg, t->border,
         t->fg,
-        t->row_sel_bg, t->row_sel_fg
+
+        t->row_sel_bg, t->row_sel_fg,
+        t->chat_bg, t->fg, t->border,
+        t->accent
     );
 
     gtk_css_provider_load_from_data(g_css_provider, css_data, -1, NULL);
@@ -521,6 +531,65 @@ static void on_theme_changed(GtkComboBox *combo, gpointer data) {
     }
 }
 
+
+static void apply_font_size(int new_size) {
+    if (new_size < 10) {
+        new_size = 10;
+    } else if (new_size > 18) {
+        new_size = 18;
+    }
+    if (new_size != g_font_size) {
+        g_font_size = new_size;
+        apply_css();
+        if (w_sidebar != NULL) {
+            int sb_w = 210 + (g_font_size > 11 ? (g_font_size - 11) * 16 : 0);
+            gtk_widget_set_size_request(w_sidebar, sb_w, -1);
+        }
+    }
+}
+
+static int compute_auto_font_size(int width, int height) {
+    if (width <= 0 || height <= 0) {
+        return 11;
+    }
+    double scale_w = (double)width / 820.0;
+    double scale_h = (double)height / 500.0;
+    double scale = (scale_w < scale_h) ? scale_w : scale_h;
+    double delta = (scale - 1.0) * 4.5;
+    int sz = 11 + (int)(delta >= 0.0 ? (delta + 0.5) : (delta - 0.5));
+    if (sz < 10) {
+        sz = 10;
+    } else if (sz > 18) {
+        sz = 18;
+    }
+    return sz;
+}
+
+static void on_scale_changed(GtkComboBox *combo, gpointer data) {
+    (void)data;
+    int idx = gtk_combo_box_get_active(combo);
+    static const int sizes[] = { 0, 10, 12, 14, 16, 18 };
+    if (idx < 0 || idx >= (int)(sizeof(sizes) / sizeof(sizes[0]))) {
+        return;
+    }
+    g_manual_font_size = sizes[idx];
+    if (g_manual_font_size > 0) {
+        apply_font_size(g_manual_font_size);
+    } else if (w_window != NULL) {
+        int w = 0;
+        int h = 0;
+        gtk_window_get_size(GTK_WINDOW(w_window), &w, &h);
+        apply_font_size(compute_auto_font_size(w, h));
+    }
+}
+
+static void on_menu_btn_clicked(GtkWidget *widget, gpointer data) {
+    (void)widget;
+    (void)data;
+    if (w_menu_popover != NULL) {
+        gtk_popover_popup(GTK_POPOVER(w_menu_popover));
+    }
+}
 static int is_user_online(const char *name) {
     for (int i = 0; i < g_online_count; i++) {
         if (strcmp(g_online_users[i], name) == 0) {
@@ -1070,6 +1139,7 @@ static void ui_mark_all_delivered(const char *peer) {
         }
     }
 }
+
 static void ui_update_chat_header(void) {
     if (w_chat_header == NULL) {
         return;
@@ -1077,11 +1147,8 @@ static void ui_update_chat_header(void) {
 
     if (g_active_peer[0] == '\0') {
         gtk_label_set_text(GTK_LABEL(w_chat_header), "★ System");
-        if (w_leave_btn != NULL) {
-            gtk_widget_set_visible(w_leave_btn, FALSE);
-        }
-        if (w_delete_btn != NULL) {
-            gtk_widget_set_visible(w_delete_btn, FALSE);
+        if (w_chat_menu_btn != NULL) {
+            gtk_widget_set_visible(w_chat_menu_btn, FALSE);
         }
         return;
     }
@@ -1092,24 +1159,14 @@ static void ui_update_chat_header(void) {
         int members = (d != NULL && d->member_count > 0) ? d->member_count : 1;
         snprintf(header, sizeof(header), "#%s (%d %s)", g_active_peer, members, members == 1 ? "member" : "members");
         gtk_label_set_text(GTK_LABEL(w_chat_header), header);
-        if (w_leave_btn != NULL) {
-            gtk_widget_set_visible(w_leave_btn, (d != NULL && d->joined) ? TRUE : FALSE);
-        }
-        if (w_delete_btn != NULL) {
-            gtk_button_set_label(GTK_BUTTON(w_delete_btn), "Delete Room");
-            gtk_widget_set_visible(w_delete_btn, TRUE);
-        }
     } else {
         int online = is_user_online(g_active_peer);
         snprintf(header, sizeof(header), "Chat with %s (%s)", g_active_peer, online ? "online" : "offline");
         gtk_label_set_text(GTK_LABEL(w_chat_header), header);
-        if (w_leave_btn != NULL) {
-            gtk_widget_set_visible(w_leave_btn, FALSE);
-        }
-        if (w_delete_btn != NULL) {
-            gtk_button_set_label(GTK_BUTTON(w_delete_btn), "Delete Chat");
-            gtk_widget_set_visible(w_delete_btn, TRUE);
-        }
+    }
+
+    if (w_chat_menu_btn != NULL) {
+        gtk_widget_set_visible(w_chat_menu_btn, TRUE);
     }
 }
 
@@ -1186,7 +1243,9 @@ static void ui_schedule_sidebar_rebuild(void) {
     }
 }
 
+
 static void ui_switch_dialog(const char *peer, int is_room, int set_target) {
+    (void)set_target;
     if (w_chat_view == NULL) {
         return;
     }
@@ -1197,6 +1256,19 @@ static void ui_switch_dialog(const char *peer, int is_room, int set_target) {
         gtk_text_view_set_buffer(GTK_TEXT_VIEW(w_chat_view), g_sys_buf);
         ui_scroll_if_active(g_sys_buf);
         ui_update_chat_header();
+        if (w_new_chat_btn != NULL) {
+            gtk_widget_set_visible(w_new_chat_btn, TRUE);
+        }
+        if (w_file_btn != NULL) {
+            gtk_widget_set_visible(w_file_btn, FALSE);
+        }
+        if (w_msg_entry != NULL) {
+            gtk_widget_set_sensitive(w_msg_entry, FALSE);
+            gtk_entry_set_placeholder_text(GTK_ENTRY(w_msg_entry), "Select a chat or click '+' to start...");
+        }
+        if (w_send_btn != NULL) {
+            gtk_widget_set_sensitive(w_send_btn, FALSE);
+        }
         return;
     }
 
@@ -1209,27 +1281,30 @@ static void ui_switch_dialog(const char *peer, int is_room, int set_target) {
     g_active_is_room = is_room;
     d->unread = 0;
     flush_dialog_acks(d);
-
     send_mark_read(d->peer, is_room);
 
     gtk_text_view_set_buffer(GTK_TEXT_VIEW(w_chat_view), d->buf);
-
     ui_attach_dialog_widgets(d);
     ui_scroll_if_active(d->buf);
     ui_update_chat_header();
 
-    if (set_target && w_target_entry != NULL) {
-        if (is_room) {
-            char room_target[MAX_NAME + 2];
-            snprintf(room_target, sizeof(room_target), "#%s", d->peer);
-            gtk_entry_set_text(GTK_ENTRY(w_target_entry), room_target);
-        } else {
-            gtk_entry_set_text(GTK_ENTRY(w_target_entry), d->peer);
-        }
+    if (w_new_chat_btn != NULL) {
+        gtk_widget_set_visible(w_new_chat_btn, FALSE);
+    }
+    if (w_file_btn != NULL) {
+        gtk_widget_set_visible(w_file_btn, TRUE);
+    }
+    if (w_msg_entry != NULL) {
+        gtk_widget_set_sensitive(w_msg_entry, TRUE);
+        gtk_entry_set_placeholder_text(GTK_ENTRY(w_msg_entry), "Message...");
+    }
+    if (w_send_btn != NULL) {
+        gtk_widget_set_sensitive(w_send_btn, TRUE);
     }
 
     ui_schedule_sidebar_rebuild();
 }
+
 
 static void destroy_row_cb(GtkWidget *widget, gpointer data) {
     (void)data;
@@ -1636,9 +1711,8 @@ static void on_leave_room_clicked(GtkWidget *widget, gpointer data) {
         ui_append_sys("warn", note);
         g_who_force = 1;
         ui_switch_dialog("", 0, 0);
-        if (w_target_entry != NULL) {
-            gtk_entry_set_text(GTK_ENTRY(w_target_entry), "");
-        }
+
+
     } else {
         char err[MAX_TEXT + 32];
         snprintf(err, sizeof(err), "Leave failed: %s", rep.text);
@@ -1661,10 +1735,33 @@ static void on_delete_clicked(GtkWidget *widget, gpointer data) {
         return;
     }
 
+
     char peer[MAX_NAME];
     int is_room = g_active_is_room;
     snprintf(peer, sizeof(peer), "%.*s", MAX_NAME - 1, g_active_peer);
 
+    GtkWidget *confirm = gtk_message_dialog_new(
+        GTK_WINDOW(w_window),
+        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+        GTK_MESSAGE_QUESTION,
+        GTK_BUTTONS_NONE,
+        is_room ? "Delete room #%s?" : "Delete chat with %s?",
+        peer
+    );
+    gtk_message_dialog_format_secondary_text(
+        GTK_MESSAGE_DIALOG(confirm),
+        is_room ? "You will leave this room and clear its history for yourself."
+                : "Chat history will be removed for you."
+    );
+    gtk_dialog_add_buttons(GTK_DIALOG(confirm),
+                           "_Cancel", GTK_RESPONSE_CANCEL,
+                           "_Delete", GTK_RESPONSE_ACCEPT,
+                           NULL);
+    gint cresp = gtk_dialog_run(GTK_DIALOG(confirm));
+    gtk_widget_destroy(confirm);
+    if (cresp != GTK_RESPONSE_ACCEPT) {
+        return;
+    }
     struct qmsg req;
     memset(&req, 0, sizeof(req));
     req.mtype = ARBITER_TYPE;
@@ -1689,9 +1786,8 @@ static void on_delete_clicked(GtkWidget *widget, gpointer data) {
 
     if (rep.target_id > 0) {
         remove_dialog(peer, is_room);
-        if (w_target_entry != NULL) {
-            gtk_entry_set_text(GTK_ENTRY(w_target_entry), "");
-        }
+
+
         char note[MAX_NAME + 48];
         if (is_room) {
             snprintf(note, sizeof(note), "Deleted room #%s.", peer);
@@ -1707,6 +1803,117 @@ static void on_delete_clicked(GtkWidget *widget, gpointer data) {
         char err[MAX_TEXT + 32];
         snprintf(err, sizeof(err), "Delete failed: %s", rep.text);
         ui_append_error(err);
+    }
+
+}
+
+static void on_chat_menu_clicked(GtkWidget *widget, gpointer data) {
+    (void)data;
+    if (w_chat_menu == NULL || g_active_peer[0] == '\0') {
+        return;
+    }
+    if (g_active_is_room) {
+        struct dialog_entry *d = find_dialog(g_active_peer, 1);
+        gtk_widget_set_visible(w_mi_leave, (d != NULL && d->joined) ? TRUE : FALSE);
+        gtk_menu_item_set_label(GTK_MENU_ITEM(w_mi_delete), "Delete Room");
+    } else {
+        gtk_widget_set_visible(w_mi_leave, FALSE);
+        gtk_menu_item_set_label(GTK_MENU_ITEM(w_mi_delete), "Delete Chat");
+    }
+    gtk_widget_show(w_mi_delete);
+    gtk_menu_popup_at_widget(
+        GTK_MENU(w_chat_menu),
+        widget,
+        GDK_GRAVITY_SOUTH_EAST,
+        GDK_GRAVITY_NORTH_EAST,
+        NULL
+    );
+}
+
+static void on_new_chat_clicked(GtkWidget *widget, gpointer data) {
+    (void)widget;
+    (void)data;
+
+    pthread_mutex_lock(&g_mtx);
+    long cur_id = g_my_id;
+    char cur_name[MAX_NAME];
+    snprintf(cur_name, sizeof(cur_name), "%.*s", MAX_NAME - 1, g_my_name);
+    pthread_mutex_unlock(&g_mtx);
+
+    if (cur_id <= 0) {
+        ui_append_error("Login first.");
+        return;
+    }
+
+    GtkWidget *dlg = gtk_dialog_new_with_buttons(
+        "New Chat",
+        GTK_WINDOW(w_window),
+        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+        "_Cancel", GTK_RESPONSE_CANCEL,
+        "_Open", GTK_RESPONSE_ACCEPT,
+        NULL
+    );
+    gtk_dialog_set_default_response(GTK_DIALOG(dlg), GTK_RESPONSE_ACCEPT);
+
+    GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dlg));
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_widget_set_margin_top(box, 12);
+    gtk_widget_set_margin_bottom(box, 12);
+    gtk_widget_set_margin_start(box, 14);
+    gtk_widget_set_margin_end(box, 14);
+
+    GtkWidget *lbl = gtk_label_new("Enter username or #room:");
+    gtk_widget_set_halign(lbl, GTK_ALIGN_START);
+
+    GtkWidget *entry = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(entry), "alice or #general");
+    gtk_entry_set_max_length(GTK_ENTRY(entry), MAX_NAME);
+    gtk_entry_set_activates_default(GTK_ENTRY(entry), TRUE);
+
+    gtk_box_pack_start(GTK_BOX(box), lbl, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(box), entry, FALSE, FALSE, 0);
+    gtk_container_add(GTK_CONTAINER(content), box);
+    gtk_widget_show_all(dlg);
+
+    char input[MAX_NAME + 2] = "";
+    if (gtk_dialog_run(GTK_DIALOG(dlg)) == GTK_RESPONSE_ACCEPT) {
+        const char *txt = gtk_entry_get_text(GTK_ENTRY(entry));
+        if (txt != NULL) {
+            snprintf(input, sizeof(input), "%.*s", MAX_NAME, txt);
+        }
+    }
+    gtk_widget_destroy(dlg);
+
+    const char *p = input;
+    while (*p == ' ') {
+        p++;
+    }
+    if (*p == '\0') {
+        return;
+    }
+
+    if (*p == '#') {
+        do_join_room(p);
+        return;
+    }
+
+    if (!is_valid_ident(p, MAX_NAME)) {
+        ui_append_error("Invalid username (no spaces, '#' or ',').");
+        return;
+    }
+    if (strcmp(p, cur_name) == 0) {
+        ui_append_error("Cannot start chat with yourself.");
+        return;
+    }
+    if (strcasecmp(p, "arbiter") == 0) {
+        ui_append_error("Cannot start chat with arbiter.");
+        return;
+    }
+
+    ui_switch_dialog(p, 0, 1);
+    ui_select_sidebar_tab("users");
+    if (w_msg_entry != NULL) {
+        gtk_widget_grab_focus(w_msg_entry);
     }
 }
 
@@ -1782,8 +1989,10 @@ static void ui_set_connected_state(int connected, const char *name, long id, int
     if (connected) {
         char status[128];
         char title[128];
-        snprintf(status, sizeof(status), "Online: %s%s (id=%ld)",
-                 name, is_debug ? " [DEBUG]" : "", id);
+
+        snprintf(status, sizeof(status), "%s%s",
+
+                 name, is_debug ? " [DEBUG]" : "");
         snprintf(title, sizeof(title), "DeepSpeak — %s%s",
                  name, is_debug ? " [DEBUG]" : "");
         gtk_label_set_text(GTK_LABEL(w_status_lbl), status);
@@ -1791,13 +2000,19 @@ static void ui_set_connected_state(int connected, const char *name, long id, int
         gtk_label_set_text(GTK_LABEL(w_auth_err), "");
         gtk_entry_set_text(GTK_ENTRY(w_auth_pass), "");
         gtk_stack_set_visible_child_name(GTK_STACK(w_main_stack), "chat");
-        gtk_widget_grab_focus(w_target_entry);
-    } else {
-        gtk_window_set_title(GTK_WINDOW(w_window), "DeepSpeak");
-        clear_all_dialogs();
-        if (w_target_entry != NULL) {
-            gtk_entry_set_text(GTK_ENTRY(w_target_entry), "");
+
+        if (w_acct_info_lbl != NULL) {
+            char acct[128];
+            snprintf(acct, sizeof(acct), "%s%s\nID: %ld", name, is_debug ? " [DEBUG]" : "", id);
+            gtk_label_set_text(GTK_LABEL(w_acct_info_lbl), acct);
         }
+        ui_switch_dialog("", 0, 0);
+    } else {
+
+        if (w_menu_popover != NULL) {
+            gtk_popover_popdown(GTK_POPOVER(w_menu_popover));
+        }
+        clear_all_dialogs();
         ui_update_users_list(0, "");
         ui_update_rooms_list(0, "");
         gtk_stack_set_visible_child_name(GTK_STACK(w_main_stack), "auth");
@@ -2232,6 +2447,10 @@ static void on_auth_pass_activate(GtkWidget *widget, gpointer data) {
 static void on_logout_clicked(GtkWidget *widget, gpointer data) {
     (void)widget;
     (void)data;
+
+    if (w_menu_popover != NULL) {
+        gtk_popover_popdown(GTK_POPOVER(w_menu_popover));
+    }
     send_logout();
     ui_set_connected_state(0, "", 0, 0);
 }
@@ -2251,25 +2470,18 @@ static void on_send_clicked(GtkWidget *widget, gpointer data) {
         return;
     }
 
-    const char *target = gtk_entry_get_text(GTK_ENTRY(w_target_entry));
-    const char *text = gtk_entry_get_text(GTK_ENTRY(w_msg_entry));
 
-    if (target == NULL || target[0] == '\0' || strlen(target) >= MAX_NAME + 1) {
-        ui_append_error("Enter a valid recipient or #room.");
-        gtk_widget_grab_focus(w_target_entry);
+    if (g_active_peer[0] == '\0') {
+        ui_append_error("Select a chat or click '+' to start a new one.");
         return;
     }
+    const char *text = gtk_entry_get_text(GTK_ENTRY(w_msg_entry));
     if (text == NULL || text[0] == '\0') {
         return;
     }
 
-    if (target[0] == '#') {
-        const char *rname = target + 1;
-        if (rname[0] == '\0' || strlen(rname) >= MAX_NAME - 1) {
-            ui_append_error("Enter a valid #room name.");
-            return;
-        }
-
+    if (g_active_is_room) {
+        const char *rname = g_active_peer;
         long msg_id = g_next_msg_id++;
 
         struct qmsg req;
@@ -2318,11 +2530,8 @@ static void on_send_clicked(GtkWidget *widget, gpointer data) {
         return;
     }
 
-    if (strlen(target) >= MAX_NAME) {
-        ui_append_error("Enter a valid recipient.");
-        gtk_widget_grab_focus(w_target_entry);
-        return;
-    }
+
+    const char *target = g_active_peer;
     if (strcmp(target, cur_name) == 0) {
         ui_append_error("Cannot send message to yourself.");
         return;
@@ -2400,18 +2609,18 @@ static void do_send_attachment(int images_only) {
         return;
     }
 
-    const char *target = gtk_entry_get_text(GTK_ENTRY(w_target_entry));
-    if (target == NULL || target[0] == '\0' || strlen(target) >= MAX_NAME + 1) {
-        ui_append_error("Enter a valid recipient or #room.");
-        gtk_widget_grab_focus(w_target_entry);
+
+    if (g_active_peer[0] == '\0') {
+        ui_append_error("Select a chat or click '+' to start a new one.");
         return;
     }
-
-    int is_room = (target[0] == '#');
-    const char *peer = is_room ? (target + 1) : target;
-    if (peer[0] == '\0' || strlen(peer) >= MAX_NAME) {
-        ui_append_error("Enter a valid recipient or #room.");
-        return;
+    int is_room = g_active_is_room;
+    const char *peer = g_active_peer;
+    char target[MAX_NAME + 2];
+    if (is_room) {
+        snprintf(target, sizeof(target), "#%s", peer);
+    } else {
+        snprintf(target, sizeof(target), "%s", peer);
     }
     if (!is_room && (strcmp(peer, cur_name) == 0 || strcasecmp(peer, "arbiter") == 0)) {
         ui_append_error("Cannot send file to yourself or arbiter.");
@@ -2553,33 +2762,14 @@ static void on_attach_clicked(GtkWidget *widget, gpointer data) {
 }
 
 
+
 static gboolean on_window_configure(GtkWidget *widget, GdkEventConfigure *event, gpointer data) {
     (void)widget;
     (void)data;
-    if (event == NULL || event->width <= 0 || event->height <= 0) {
+    if (g_manual_font_size > 0 || event == NULL || event->width <= 0 || event->height <= 0) {
         return FALSE;
     }
-
-    double scale_w = (double)event->width / 820.0;
-    double scale_h = (double)event->height / 500.0;
-    double scale = (scale_w < scale_h) ? scale_w : scale_h;
-
-    double delta = (scale - 1.0) * 4.5;
-    int new_size = 11 + (int)(delta >= 0.0 ? (delta + 0.5) : (delta - 0.5));
-    if (new_size < 10) {
-        new_size = 10;
-    } else if (new_size > 18) {
-        new_size = 18;
-    }
-
-    if (new_size != g_font_size) {
-        g_font_size = new_size;
-        apply_css();
-        if (w_sidebar != NULL) {
-            int sb_w = 210 + (g_font_size > 11 ? (g_font_size - 11) * 16 : 0);
-            gtk_widget_set_size_request(w_sidebar, sb_w, -1);
-        }
-    }
+    apply_font_size(compute_auto_font_size(event->width, event->height));
     return FALSE;
 }
 
@@ -2588,8 +2778,18 @@ static void on_window_destroy(GtkWidget *widget, gpointer data) {
     (void)data;
     w_chat_view = NULL;
     w_chat_header = NULL;
-    w_leave_btn = NULL;
-    w_delete_btn = NULL;
+
+    w_menu_btn = NULL;
+    w_menu_popover = NULL;
+    w_acct_info_lbl = NULL;
+    w_scale_combo = NULL;
+    w_chat_menu_btn = NULL;
+    w_mi_leave = NULL;
+    w_mi_delete = NULL;
+    w_new_chat_btn = NULL;
+    w_msg_entry = NULL;
+    w_send_btn = NULL;
+    w_file_btn = NULL;
     w_theme_combo = NULL;
     w_users_list = NULL;
     w_users_lbl = NULL;
@@ -2605,6 +2805,11 @@ static void on_window_destroy(GtkWidget *widget, gpointer data) {
     w_sidebar = NULL;
     send_logout();
 
+
+    if (w_chat_menu != NULL) {
+        gtk_widget_destroy(w_chat_menu);
+        w_chat_menu = NULL;
+    }
     if (w_attach_menu != NULL) {
         gtk_widget_destroy(w_attach_menu);
         w_attach_menu = NULL;
@@ -2692,13 +2897,46 @@ static void build_ui(void) {
     gtk_widget_set_margin_start(root, 12);
     gtk_widget_set_margin_end(root, 12);
 
+
     GtkWidget *top_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
 
-    w_status_lbl = gtk_label_new("Disconnected");
-    gtk_widget_set_halign(w_status_lbl, GTK_ALIGN_START);
+    w_menu_btn = gtk_button_new_with_label("☰");
+    gtk_widget_set_tooltip_text(w_menu_btn, "Menu");
+    gtk_style_context_add_class(gtk_widget_get_style_context(w_menu_btn), "tab-btn");
+    g_signal_connect(w_menu_btn, "clicked", G_CALLBACK(on_menu_btn_clicked), NULL);
 
-    w_logout_btn = gtk_button_new_with_label("Logout");
-    g_signal_connect(w_logout_btn, "clicked", G_CALLBACK(on_logout_clicked), NULL);
+    w_menu_popover = gtk_popover_new(w_menu_btn);
+    GtkWidget *pop_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    gtk_widget_set_size_request(pop_box, 220, -1);
+
+    /* 1. Account info */
+    w_acct_info_lbl = gtk_label_new("Not logged in");
+    gtk_widget_set_halign(w_acct_info_lbl, GTK_ALIGN_START);
+    gtk_style_context_add_class(gtk_widget_get_style_context(w_acct_info_lbl), "acct-info");
+    gtk_box_pack_start(GTK_BOX(pop_box), w_acct_info_lbl, FALSE, FALSE, 0);
+
+    gtk_box_pack_start(GTK_BOX(pop_box), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 0);
+
+    /* 2. Scale selector */
+    GtkWidget *scale_lbl = gtk_label_new("Scale");
+    gtk_widget_set_halign(scale_lbl, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(pop_box), scale_lbl, FALSE, FALSE, 0);
+
+    w_scale_combo = gtk_combo_box_text_new();
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(w_scale_combo), "Auto");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(w_scale_combo), "Small (10pt)");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(w_scale_combo), "Normal (12pt)");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(w_scale_combo), "Large (14pt)");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(w_scale_combo), "XL (16pt)");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(w_scale_combo), "XXL (18pt)");
+    gtk_combo_box_set_active(GTK_COMBO_BOX(w_scale_combo), 0);
+    g_signal_connect(w_scale_combo, "changed", G_CALLBACK(on_scale_changed), NULL);
+    gtk_box_pack_start(GTK_BOX(pop_box), w_scale_combo, FALSE, FALSE, 0);
+
+    /* Theme selector */
+    GtkWidget *theme_lbl = gtk_label_new("Theme");
+    gtk_widget_set_halign(theme_lbl, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(pop_box), theme_lbl, FALSE, FALSE, 0);
 
     w_theme_combo = gtk_combo_box_text_new();
     for (int i = 0; i < THEME_COUNT; i++) {
@@ -2706,31 +2944,49 @@ static void build_ui(void) {
     }
     gtk_combo_box_set_active(GTK_COMBO_BOX(w_theme_combo), g_theme_idx);
     g_signal_connect(w_theme_combo, "changed", G_CALLBACK(on_theme_changed), NULL);
+    gtk_box_pack_start(GTK_BOX(pop_box), w_theme_combo, FALSE, FALSE, 0);
 
+    gtk_box_pack_start(GTK_BOX(pop_box), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 0);
+
+    /* 3. Logout */
+    w_logout_btn = gtk_button_new_with_label("Logout");
+    gtk_style_context_add_class(gtk_widget_get_style_context(w_logout_btn), "leave-btn");
+    g_signal_connect(w_logout_btn, "clicked", G_CALLBACK(on_logout_clicked), NULL);
+    gtk_box_pack_start(GTK_BOX(pop_box), w_logout_btn, FALSE, FALSE, 0);
+
+    gtk_widget_show_all(pop_box);
+    gtk_container_add(GTK_CONTAINER(w_menu_popover), pop_box);
+
+    w_status_lbl = gtk_label_new("DeepSpeak");
+    gtk_widget_set_halign(w_status_lbl, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(top_bar), w_menu_btn, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(top_bar), w_status_lbl, TRUE, TRUE, 0);
-    gtk_box_pack_end(GTK_BOX(top_bar), w_logout_btn, FALSE, FALSE, 0);
-    gtk_box_pack_end(GTK_BOX(top_bar), w_theme_combo, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(root), top_bar, FALSE, FALSE, 0);
 
     GtkWidget *mid_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
 
     GtkWidget *chat_col = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
 
+
     GtkWidget *header_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     w_chat_header = gtk_label_new("★ System");
     gtk_widget_set_halign(w_chat_header, GTK_ALIGN_START);
 
-    w_leave_btn = gtk_button_new_with_label("Leave");
-    gtk_style_context_add_class(gtk_widget_get_style_context(w_leave_btn), "tab-btn");
-    g_signal_connect(w_leave_btn, "clicked", G_CALLBACK(on_leave_room_clicked), NULL);
+    w_chat_menu = gtk_menu_new();
+    w_mi_leave = gtk_menu_item_new_with_label("Leave Room");
+    w_mi_delete = gtk_menu_item_new_with_label("Delete Chat");
+    g_signal_connect(w_mi_leave, "activate", G_CALLBACK(on_leave_room_clicked), NULL);
+    g_signal_connect(w_mi_delete, "activate", G_CALLBACK(on_delete_clicked), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(w_chat_menu), w_mi_leave);
+    gtk_menu_shell_append(GTK_MENU_SHELL(w_chat_menu), w_mi_delete);
 
-    w_delete_btn = gtk_button_new_with_label("Delete Chat");
-    gtk_style_context_add_class(gtk_widget_get_style_context(w_delete_btn), "leave-btn");
-    g_signal_connect(w_delete_btn, "clicked", G_CALLBACK(on_delete_clicked), NULL);
+    w_chat_menu_btn = gtk_button_new_with_label("⋮");
+    gtk_widget_set_tooltip_text(w_chat_menu_btn, "Chat options");
+    gtk_style_context_add_class(gtk_widget_get_style_context(w_chat_menu_btn), "tab-btn");
+    g_signal_connect(w_chat_menu_btn, "clicked", G_CALLBACK(on_chat_menu_clicked), NULL);
 
     gtk_box_pack_start(GTK_BOX(header_bar), w_chat_header, TRUE, TRUE, 0);
-    gtk_box_pack_end(GTK_BOX(header_bar), w_delete_btn, FALSE, FALSE, 0);
-    gtk_box_pack_end(GTK_BOX(header_bar), w_leave_btn, FALSE, FALSE, 0);
+    gtk_box_pack_end(GTK_BOX(header_bar), w_chat_menu_btn, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(chat_col), header_bar, FALSE, FALSE, 0);
 
     GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
@@ -2824,22 +3080,13 @@ static void build_ui(void) {
 
     gtk_box_pack_start(GTK_BOX(root), mid_box, TRUE, TRUE, 0);
 
+
     GtkWidget *bottom_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    w_target_entry = gtk_entry_new();
-    gtk_entry_set_placeholder_text(GTK_ENTRY(w_target_entry), "To / #room");
-    gtk_entry_set_max_length(GTK_ENTRY(w_target_entry), MAX_NAME);
-    gtk_entry_set_width_chars(GTK_ENTRY(w_target_entry), 14);
 
-    w_msg_entry = gtk_entry_new();
-    gtk_entry_set_placeholder_text(GTK_ENTRY(w_msg_entry), "Message...");
-    gtk_entry_set_max_length(GTK_ENTRY(w_msg_entry), MAX_TEXT - 1);
-    g_signal_connect(w_msg_entry, "activate", G_CALLBACK(on_send_clicked), NULL);
-
-    w_send_btn = gtk_button_new_with_label("Send");
-    g_signal_connect(w_send_btn, "clicked", G_CALLBACK(on_send_clicked), NULL);
-
-
-
+    w_new_chat_btn = gtk_button_new_with_label("+");
+    gtk_widget_set_tooltip_text(w_new_chat_btn, "New chat or #room");
+    gtk_style_context_add_class(gtk_widget_get_style_context(w_new_chat_btn), "tab-btn");
+    g_signal_connect(w_new_chat_btn, "clicked", G_CALLBACK(on_new_chat_clicked), NULL);
 
     w_attach_menu = gtk_menu_new();
     GtkWidget *mi_photo = gtk_menu_item_new_with_label("📷  Photo");
@@ -2852,16 +3099,21 @@ static void build_ui(void) {
     w_file_btn = gtk_button_new_with_label("📎");
     gtk_widget_set_tooltip_text(w_file_btn, "Attach photo or file");
     gtk_style_context_add_class(gtk_widget_get_style_context(w_file_btn), "tab-btn");
-
     g_signal_connect(w_file_btn, "clicked", G_CALLBACK(on_attach_clicked), NULL);
 
-    gtk_box_pack_start(GTK_BOX(bottom_bar), w_target_entry, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(bottom_bar), w_msg_entry, TRUE, TRUE, 0);
+    w_msg_entry = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(w_msg_entry), "Select a chat or click '+' to start...");
+    gtk_entry_set_max_length(GTK_ENTRY(w_msg_entry), MAX_TEXT - 1);
+    g_signal_connect(w_msg_entry, "activate", G_CALLBACK(on_send_clicked), NULL);
 
+    w_send_btn = gtk_button_new_with_label("Send");
+    g_signal_connect(w_send_btn, "clicked", G_CALLBACK(on_send_clicked), NULL);
+
+    gtk_box_pack_start(GTK_BOX(bottom_bar), w_new_chat_btn, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(bottom_bar), w_file_btn, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(bottom_bar), w_msg_entry, TRUE, TRUE, 0);
     gtk_box_pack_start(GTK_BOX(bottom_bar), w_send_btn, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(root), bottom_bar, FALSE, FALSE, 0);
-
     gtk_stack_add_named(GTK_STACK(w_main_stack), root, "chat");
 
     apply_theme(g_theme_idx);
