@@ -1,23 +1,25 @@
-CC := gcc
-CFLAGS := -Wall -Wextra -pthread
-GTK_CFLAGS := $(shell pkg-config --cflags gtk+-3.0)
-GTK_LIBS := $(shell pkg-config --libs gtk+-3.0)
+CC = gcc
+CFLAGS = -Wall -Wextra -pthread
+GTK_CFLAGS = $(shell pkg-config --cflags gtk+-3.0)
+GTK_LIBS = $(shell pkg-config --libs gtk+-3.0)
 
-CONSOLE_SRCS := $(filter-out gui_client.c,$(wildcard *.c))
-CONSOLE_TARGETS := $(CONSOLE_SRCS:.c=)
-GUI_TARGET := gui_client
+SRCS = $(filter-out gui_client.c db.c extraq.c, $(wildcard *.c))
+BINS = $(SRCS:.c=)
 
 .PHONY: all gui clean
 
-all: $(CONSOLE_TARGETS) $(GUI_TARGET)
+all: $(BINS) extraq gui_client
 
-$(CONSOLE_TARGETS): %: %.c protocol.h
+$(BINS): %: %.c
 	$(CC) $(CFLAGS) $< -o $@
 
-$(GUI_TARGET): gui_client.c protocol.h
-	$(CC) $(CFLAGS) $(GTK_CFLAGS) $< -o $@ $(GTK_LIBS)
+extraq: extraq.c db.c db.h protocol.h
+	$(CC) $(CFLAGS) extraq.c db.c -o extraq -lsqlite3
 
-gui: $(GUI_TARGET)
+gui: gui_client
+
+gui_client: gui_client.c protocol.h
+	$(CC) $(CFLAGS) $(GTK_CFLAGS) gui_client.c -o gui_client $(GTK_LIBS)
 
 clean:
-	rm -f $(CONSOLE_TARGETS) $(GUI_TARGET)
+	rm -f $(BINS) extraq gui_client

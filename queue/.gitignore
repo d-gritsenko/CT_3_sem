@@ -9,3 +9,8 @@ vgcore.*
 *~
 chat_backlog.dat
 chat_backlog.dat.tmp
+# SQLite user database
+users.db
+users.db-journal
+users.db-wal
+users.db-shm
