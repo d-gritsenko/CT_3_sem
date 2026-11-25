@@ -160,6 +160,8 @@ static int g_suppress_theme_save = 0;
 static int g_theme_idx = 0;
 static GtkCssProvider *g_css_provider = NULL;
 
+static int g_font_size = 11;
+
 static GtkTextBuffer *g_sys_buf = NULL;
 static struct dialog_entry g_dialogs[MAX_DIALOGS];
 static char g_active_peer[MAX_NAME] = "";
@@ -191,6 +193,8 @@ static GtkWidget *w_chat_view = NULL;
 static GtkWidget *w_tab_users = NULL;
 static GtkWidget *w_tab_rooms = NULL;
 static GtkWidget *w_sidebar_stack = NULL;
+
+static GtkWidget *w_sidebar = NULL;
 
 static GtkWidget *w_users_lbl = NULL;
 static GtkWidget *w_users_list = NULL;
@@ -378,12 +382,13 @@ static GtkTextBuffer *create_chat_buffer(void) {
     return buf;
 }
 
-static void apply_theme(int idx) {
-    if (idx < 0 || idx >= THEME_COUNT) {
-        idx = 0;
-    }
-    g_theme_idx = idx;
+
+static void apply_css(void) {
     const struct ui_theme *t = current_theme();
+    int chat_pt = g_font_size;
+    int ui_pt = (chat_pt > 10) ? (chat_pt - 1) : 9;
+    int title_pt = chat_pt + 7;
+    int hint_pt = (chat_pt > 10) ? (chat_pt - 2) : 8;
 
     if (g_css_provider == NULL) {
         g_css_provider = gtk_css_provider_new();
@@ -396,15 +401,15 @@ static void apply_theme(int idx) {
 
     char css_data[4096];
     snprintf(css_data, sizeof(css_data),
-        "window { background-color: %s; color: %s; }\n"
-        "label { color: %s; }\n"
+        "window { background-color: %s; color: %s; font-size: %dpt; }\n"
+        "label { color: %s; font-size: %dpt; }\n"
         ".auth-card { background-color: %s; border: 1px solid %s; border-radius: 10px; padding: 24px 28px; }\n"
-        ".auth-title { font-size: 18pt; font-weight: bold; color: %s; }\n"
-        ".auth-hint { font-size: 9pt; color: %s; }\n"
+        ".auth-title { font-size: %dpt; font-weight: bold; color: %s; }\n"
+        ".auth-hint { font-size: %dpt; color: %s; }\n"
         ".auth-err { font-weight: bold; color: %s; }\n"
-        "entry { background-color: %s; color: %s; border: 1px solid %s; border-radius: 6px; padding: 6px 10px; }\n"
+        "entry { background-color: %s; color: %s; border: 1px solid %s; border-radius: 6px; padding: 6px 10px; font-size: %dpt; }\n"
         "entry:focus { border-color: %s; }\n"
-        "button { background-image: none; background-color: %s; border-radius: 6px; padding: 6px 14px; border: none; }\n"
+        "button { background-image: none; background-color: %s; border-radius: 6px; padding: 6px 14px; border: none; font-size: %dpt; }\n"
         "button, button label { color: %s; font-weight: bold; }\n"
         "button:hover { background-image: none; background-color: %s; }\n"
         "button:disabled { background-image: none; background-color: %s; }\n"
@@ -421,21 +426,21 @@ static void apply_theme(int idx) {
         "combobox button { background-image: none; background-color: %s; border: 1px solid %s; border-radius: 6px; padding: 4px 10px; }\n"
         "combobox button, combobox button label, combobox button cellview { color: %s; font-weight: normal; }\n"
         "combobox button:hover { background-image: none; background-color: %s; }\n"
-        "textview text { background-color: %s; color: %s; font-family: monospace; font-size: 11pt; }\n"
+        "textview text { background-color: %s; color: %s; font-family: monospace; font-size: %dpt; }\n"
         "scrolledwindow { border: 1px solid %s; border-radius: 6px; }\n"
-        "list { background-color: %s; color: %s; }\n"
+        "list { background-color: %s; color: %s; font-size: %dpt; }\n"
         "list row { padding: 2px 4px; }\n"
         "list row:hover { background-color: %s; }\n"
         "list row:selected { background-color: %s; color: %s; }\n",
-        t->win_bg, t->fg,
-        t->fg,
+        t->win_bg, t->fg, ui_pt,
+        t->fg, ui_pt,
         t->chat_bg, t->border,
-        t->accent,
-        t->muted,
+        title_pt, t->accent,
+        hint_pt, t->muted,
         t->err,
-        t->entry_bg, t->fg, t->border,
+        t->entry_bg, t->fg, t->border, ui_pt,
         t->accent,
-        t->accent,
+        t->accent, ui_pt,
         t->btn_fg,
         t->accent_hover,
         t->disabled_bg,
@@ -452,14 +457,23 @@ static void apply_theme(int idx) {
         t->entry_bg, t->border,
         t->fg,
         t->row_hover,
-        t->chat_bg, t->fg,
+        t->chat_bg, t->fg, chat_pt,
         t->border,
-        t->chat_bg, t->fg,
+        t->chat_bg, t->fg, ui_pt,
         t->row_hover,
         t->row_sel_bg, t->row_sel_fg
     );
 
     gtk_css_provider_load_from_data(g_css_provider, css_data, -1, NULL);
+}
+
+static void apply_theme(int idx) {
+    if (idx < 0 || idx >= THEME_COUNT) {
+        idx = 0;
+    }
+    g_theme_idx = idx;
+
+    apply_css();
 
     apply_buffer_theme(g_sys_buf);
     for (int i = 0; i < MAX_DIALOGS; i++) {
@@ -2044,6 +2058,37 @@ static void on_send_clicked(GtkWidget *widget, gpointer data) {
     gtk_widget_grab_focus(w_msg_entry);
 }
 
+
+static gboolean on_window_configure(GtkWidget *widget, GdkEventConfigure *event, gpointer data) {
+    (void)widget;
+    (void)data;
+    if (event == NULL || event->width <= 0 || event->height <= 0) {
+        return FALSE;
+    }
+
+    double scale_w = (double)event->width / 820.0;
+    double scale_h = (double)event->height / 500.0;
+    double scale = (scale_w < scale_h) ? scale_w : scale_h;
+
+    double delta = (scale - 1.0) * 4.5;
+    int new_size = 11 + (int)(delta >= 0.0 ? (delta + 0.5) : (delta - 0.5));
+    if (new_size < 10) {
+        new_size = 10;
+    } else if (new_size > 18) {
+        new_size = 18;
+    }
+
+    if (new_size != g_font_size) {
+        g_font_size = new_size;
+        apply_css();
+        if (w_sidebar != NULL) {
+            int sb_w = 210 + (g_font_size > 11 ? (g_font_size - 11) * 16 : 0);
+            gtk_widget_set_size_request(w_sidebar, sb_w, -1);
+        }
+    }
+    return FALSE;
+}
+
 static void on_window_destroy(GtkWidget *widget, gpointer data) {
     (void)widget;
     (void)data;
@@ -2061,6 +2106,9 @@ static void on_window_destroy(GtkWidget *widget, gpointer data) {
     w_tab_users = NULL;
     w_tab_rooms = NULL;
     w_sidebar_stack = NULL;
+
+
+    w_sidebar = NULL;
     send_logout();
     g_running = 0;
     gtk_main_quit();
@@ -2073,6 +2121,8 @@ static void build_ui(void) {
     gtk_window_set_title(GTK_WINDOW(w_window), "DeepSpeak");
     gtk_window_set_default_size(GTK_WINDOW(w_window), 820, 500);
     g_signal_connect(w_window, "destroy", G_CALLBACK(on_window_destroy), NULL);
+
+    g_signal_connect(w_window, "configure-event", G_CALLBACK(on_window_configure), NULL);
 
     w_main_stack = gtk_stack_new();
     gtk_stack_set_transition_type(GTK_STACK(w_main_stack), GTK_STACK_TRANSITION_TYPE_CROSSFADE);
@@ -2201,6 +2251,8 @@ static void build_ui(void) {
     gtk_box_pack_start(GTK_BOX(mid_box), chat_col, TRUE, TRUE, 0);
 
     GtkWidget *sidebar = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+
+    w_sidebar = sidebar;
     gtk_widget_set_size_request(sidebar, 210, -1);
 
     GtkWidget *tab_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
