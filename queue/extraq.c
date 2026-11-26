@@ -33,6 +33,13 @@
 #define MAX_HISTORY_LOAD 64
 #define MAX_ROOM_HISTORY_LOAD 32
 
+#define FLOOD_WINDOW_SEC 5
+#define FLOOD_MAX_MSGS 8
+#define FLOOD_MUTE_SEC 10
+#define MAX_AUTH_TRACK 64
+#define AUTH_MAX_FAILS 5
+#define AUTH_LOCK_SEC 30
+
 #define CLR_RESET   "\033[0m"
 #define CLR_BOLD    "\033[1m"
 #define CLR_DIM     "\033[2m"
@@ -48,9 +55,15 @@ struct client_entry {
     int active;
     int is_debug;
     long id;
+
+    uint64_t session_token;
     long reply_type;
     char name[MAX_NAME];
     time_t last_seen;
+
+    time_t flood_win_start;
+    int flood_count;
+    time_t mute_until;
 };
 
 struct pending_msg {
@@ -79,9 +92,19 @@ struct backlog_header {
     uint32_t count;
 };
 
+struct auth_limit_entry {
+    int used;
+    char name[MAX_NAME];
+    int fails;
+    time_t locked_until;
+    time_t last_try;
+};
+
 static volatile sig_atomic_t running = 1;
 static int g_msqid = -1;
 static long g_my_id = 0;
+
+static uint64_t g_session_token = 0;
 static long g_reply_type = 0;
 static long g_next_msg_id = 1;
 static char g_my_name[MAX_NAME];
@@ -93,6 +116,139 @@ static void on_signal(int sig) {
     running = 0;
 }
 
+static void secure_zero(void *ptr, size_t len) {
+    volatile unsigned char *p = (volatile unsigned char *)ptr;
+    while (len > 0) {
+        *p++ = 0;
+        len--;
+    }
+}
+
+static int check_flood_limit(struct client_entry *c, char *err, size_t err_sz) {
+    time_t now = time(NULL);
+    if (c->mute_until > now) {
+        long left = (long)(c->mute_until - now);
+        snprintf(err, err_sz, "rate limited, wait %lds", left);
+        return 1;
+    }
+    if (c->flood_win_start == 0 || (now - c->flood_win_start) >= FLOOD_WINDOW_SEC) {
+        c->flood_win_start = now;
+        c->flood_count = 1;
+        return 0;
+    }
+    c->flood_count++;
+    if (c->flood_count > FLOOD_MAX_MSGS) {
+        c->mute_until = now + FLOOD_MUTE_SEC;
+        c->flood_count = 0;
+        c->flood_win_start = 0;
+        char ts[16];
+        get_timestamp(ts, sizeof(ts));
+        printf(CLR_DIM "[%s] " CLR_RESET CLR_RED "! flood mute: %s (id=%ld) for %ds\n" CLR_RESET,
+               ts, c->name, c->id, FLOOD_MUTE_SEC);
+        fflush(stdout);
+        snprintf(err, err_sz, "flood detected, muted for %ds", FLOOD_MUTE_SEC);
+        return 1;
+    }
+    return 0;
+}
+
+static int auth_is_locked(struct auth_limit_entry *tab, const char *name, char *err, size_t err_sz) {
+    time_t now = time(NULL);
+    for (int i = 0; i < MAX_AUTH_TRACK; i++) {
+        if (tab[i].used && strcmp(tab[i].name, name) == 0) {
+            if (tab[i].locked_until > now) {
+                long left = (long)(tab[i].locked_until - now);
+                snprintf(err, err_sz, "too many attempts, wait %lds", left);
+                return 1;
+            }
+            if (tab[i].locked_until > 0 && tab[i].locked_until <= now) {
+                tab[i].fails = 0;
+                tab[i].locked_until = 0;
+            }
+            break;
+        }
+    }
+    return 0;
+}
+
+static void auth_record_fail(struct auth_limit_entry *tab, const char *name) {
+    time_t now = time(NULL);
+    int slot = -1;
+    int oldest = 0;
+    for (int i = 0; i < MAX_AUTH_TRACK; i++) {
+        if (tab[i].used && strcmp(tab[i].name, name) == 0) {
+            slot = i;
+            break;
+        }
+        if (!tab[i].used && slot < 0) {
+            slot = i;
+        }
+        if (tab[i].last_try < tab[oldest].last_try) {
+            oldest = i;
+        }
+    }
+    if (slot < 0) {
+        slot = oldest;
+        tab[slot].fails = 0;
+        tab[slot].locked_until = 0;
+    }
+    if (!tab[slot].used || strcmp(tab[slot].name, name) != 0) {
+        tab[slot].used = 1;
+        snprintf(tab[slot].name, sizeof(tab[slot].name), "%.*s", MAX_NAME - 1, name);
+        tab[slot].fails = 0;
+        tab[slot].locked_until = 0;
+    }
+    tab[slot].last_try = now;
+    tab[slot].fails++;
+    if (tab[slot].fails >= AUTH_MAX_FAILS) {
+        tab[slot].locked_until = now + AUTH_LOCK_SEC;
+        char ts[16];
+        get_timestamp(ts, sizeof(ts));
+        printf(CLR_DIM "[%s] " CLR_RESET CLR_RED "! auth lock: %s (%d fails, %ds)\n" CLR_RESET,
+               ts, name, tab[slot].fails, AUTH_LOCK_SEC);
+        fflush(stdout);
+    }
+}
+
+static void auth_clear_fail(struct auth_limit_entry *tab, const char *name) {
+    for (int i = 0; i < MAX_AUTH_TRACK; i++) {
+        if (tab[i].used && strcmp(tab[i].name, name) == 0) {
+            tab[i].used = 0;
+            tab[i].fails = 0;
+            tab[i].locked_until = 0;
+            return;
+        }
+    }
+}
+
+
+static uint64_t gen_session_token(void) {
+    uint64_t tok = 0;
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd >= 0) {
+        size_t got = 0;
+        while (got < sizeof(tok)) {
+            ssize_t r = read(fd, ((unsigned char *)&tok) + got, sizeof(tok) - got);
+            if (r <= 0) {
+                break;
+            }
+            got += (size_t)r;
+        }
+        close(fd);
+    }
+    if (tok == 0) {
+        static uint64_t seq = 0;
+        uint64_t z = ((uint64_t)time(NULL) << 32) ^ (uint64_t)getpid() ^ (++seq * 0x9e3779b97f4a7c15ULL);
+        z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+        z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+        tok = z ^ (z >> 31);
+        if (tok == 0) {
+            tok = 1;
+        }
+    }
+    return tok;
+}
+
 static int find_client_by_id(struct client_entry *clients, long id) {
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (clients[i].used && clients[i].id == id) {
@@ -100,6 +256,26 @@ static int find_client_by_id(struct client_entry *clients, long id) {
         }
     }
     return -1;
+}
+
+
+static int find_authed_client(struct client_entry *clients, long id, uint64_t token, int cmd) {
+    if (id <= 0 || token == 0) {
+        return -1;
+    }
+    int idx = find_client_by_id(clients, id);
+    if (idx < 0 || !clients[idx].active) {
+        return -1;
+    }
+    if (clients[idx].session_token == 0 || clients[idx].session_token != token) {
+        char ts[16];
+        get_timestamp(ts, sizeof(ts));
+        printf(CLR_DIM "[%s] " CLR_RESET CLR_RED "! invalid session token for %s (id=%ld, cmd=%d)\n" CLR_RESET,
+               ts, clients[idx].name, id, cmd);
+        fflush(stdout);
+        return -1;
+    }
+    return idx;
 }
 
 static int find_client_by_name(struct client_entry *clients, const char *name) {
@@ -169,10 +345,16 @@ static int activate_client_slot(struct client_entry *clients, int match_idx, lon
     }
     clients[idx].used = 1;
     clients[idx].active = 1;
+
+    clients[idx].session_token = gen_session_token();
     clients[idx].is_debug = is_debug;
     clients[idx].reply_type = reply_type;
     snprintf(clients[idx].name, sizeof(clients[idx].name), "%.*s", MAX_NAME - 1, name);
     clients[idx].last_seen = time(NULL);
+
+    clients[idx].flood_win_start = 0;
+    clients[idx].flood_count = 0;
+    clients[idx].mute_until = 0;
     return idx;
 }
 
@@ -626,7 +808,8 @@ static int send_reply_id(int msqid, long reply_type, long target_id, long msg_id
     return msgsnd(msqid, &rep, MSG_SIZE, 0);
 }
 
-static int send_auth_reply(int msqid, long reply_type, long target_id, long is_debug, long theme_id, const char *text) {
+
+static int send_auth_reply(int msqid, long reply_type, long target_id, long is_debug, long theme_id, uint64_t token, const char *text) {
     struct qmsg rep;
     memset(&rep, 0, sizeof(rep));
     rep.mtype = reply_type;
@@ -634,6 +817,8 @@ static int send_auth_reply(int msqid, long reply_type, long target_id, long is_d
     rep.target_id = target_id;
     rep.sender_id = is_debug;
     rep.msg_id = theme_id;
+
+    rep.session_token = token;
     if (text != NULL) {
         snprintf(rep.text, sizeof(rep.text), "%.*s", MAX_TEXT - 1, text);
     }
@@ -652,6 +837,9 @@ static int run_arbiter(int msqid) {
     memset(rooms, 0, sizeof(rooms));
     memset(clients, 0, sizeof(clients));
     memset(pending, 0, sizeof(pending));
+
+    struct auth_limit_entry auth_limits[MAX_AUTH_TRACK];
+    memset(auth_limits, 0, sizeof(auth_limits));
 
     long next_id = 2;
     int restored = load_backlog(pending);
@@ -680,6 +868,8 @@ static int run_arbiter(int msqid) {
                     save_backlog(pending);
                 }
                 drain_type(msqid, clients[i].reply_type);
+
+                clients[i].session_token = 0;
                 clients[i].active = 0;
             }
         }
@@ -706,19 +896,24 @@ static int run_arbiter(int msqid) {
 
 
             if (!is_valid_ident(msg.name, MAX_NAME)) {
-                send_auth_reply(msqid, msg.reply_type, -1, 0, 0, "invalid username");
+
+                send_auth_reply(msqid, msg.reply_type, -1, 0, 0, 0, "invalid username");
             } else if (match_idx >= 0 && clients[match_idx].active) {
-                send_auth_reply(msqid, msg.reply_type, -1, 0, 0, "already online");
+
+                send_auth_reply(msqid, msg.reply_type, -1, 0, 0, 0, "already online");
             } else if (db_register_user(msg.name, msg.text, err, sizeof(err)) != 0) {
-                send_auth_reply(msqid, msg.reply_type, -1, 0, 0, err);
+
+                send_auth_reply(msqid, msg.reply_type, -1, 0, 0, 0, err);
             } else {
 
                 int idx = activate_client_slot(clients, match_idx, &next_id, 0, msg.reply_type, msg.name);
 
                 if (idx < 0) {
-                    send_auth_reply(msqid, msg.reply_type, -1, 0, 0, "server full");
+
+                    send_auth_reply(msqid, msg.reply_type, -1, 0, 0, 0, "server full");
                 } else {
-                    send_auth_reply(msqid, msg.reply_type, clients[idx].id, 0, 0, "ok");
+
+                    send_auth_reply(msqid, msg.reply_type, clients[idx].id, 0, 0, clients[idx].session_token, "ok");
 
                     char ts[16];
                     get_timestamp(ts, sizeof(ts));
@@ -730,6 +925,8 @@ static int run_arbiter(int msqid) {
                         save_backlog(pending);
                     }
                 }
+
+            secure_zero(msg.text, sizeof(msg.text));
             }
         } else if (msg.cmd == CMD_LOGIN || msg.cmd == CMD_RECONNECT) {
             msg.name[MAX_NAME - 1] = '\0';
@@ -737,24 +934,39 @@ static int run_arbiter(int msqid) {
 
             int match_idx = find_client_by_name(clients, msg.name);
 
+            char lock_err[64] = "";
+
 
             if (!is_valid_ident(msg.name, MAX_NAME)) {
-                send_auth_reply(msqid, msg.reply_type, -1, 0, 0, "invalid username");
+
+                send_auth_reply(msqid, msg.reply_type, -1, 0, 0, 0, "invalid username");
             } else if (strcasecmp(msg.name, "arbiter") == 0) {
-                send_auth_reply(msqid, msg.reply_type, -1, 0, 0, "reserved name");
+
+                send_auth_reply(msqid, msg.reply_type, -1, 0, 0, 0, "reserved name");
             } else if (match_idx >= 0 && clients[match_idx].active) {
-                send_auth_reply(msqid, msg.reply_type, -1, 0, 0, "already online");
+
+                send_auth_reply(msqid, msg.reply_type, -1, 0, 0, 0, "already online");
+
+            } else if (auth_is_locked(auth_limits, msg.name, lock_err, sizeof(lock_err))) {
+                send_auth_reply(msqid, msg.reply_type, -1, 0, 0, 0, lock_err);
             } else if (db_is_debug_name(msg.name)) {
                 if (!db_check_debug_pass(msg.text)) {
-                    send_auth_reply(msqid, msg.reply_type, -1, 0, 0, "wrong debug password");
+
+
+                    auth_record_fail(auth_limits, msg.name);
+                    send_auth_reply(msqid, msg.reply_type, -1, 0, 0, 0, "wrong debug password");
                 } else {
 
                     int idx = activate_client_slot(clients, match_idx, &next_id, 1, msg.reply_type, msg.name);
 
+
+                    auth_clear_fail(auth_limits, msg.name);
                     if (idx < 0) {
-                        send_auth_reply(msqid, msg.reply_type, -1, 0, 0, "server full");
+
+                        send_auth_reply(msqid, msg.reply_type, -1, 0, 0, 0, "server full");
                     } else {
-                        send_auth_reply(msqid, msg.reply_type, clients[idx].id, 1, 0, "ok");
+
+                        send_auth_reply(msqid, msg.reply_type, clients[idx].id, 1, 0, clients[idx].session_token, "ok");
 
                         char ts[16];
                         get_timestamp(ts, sizeof(ts));
@@ -771,16 +983,23 @@ static int run_arbiter(int msqid) {
                 int theme_id = 0;
                 char err[128] = "";
                 if (db_verify_user(msg.name, msg.text, &theme_id, err, sizeof(err)) != 0) {
-                    send_auth_reply(msqid, msg.reply_type, -1, 0, 0, err);
+
+
+                    auth_record_fail(auth_limits, msg.name);
+                    send_auth_reply(msqid, msg.reply_type, -1, 0, 0, 0, err);
                 } else {
 
                     int idx = activate_client_slot(clients, match_idx, &next_id, 0, msg.reply_type, msg.name);
 
+                    auth_clear_fail(auth_limits, msg.name);
+
                     if (idx < 0) {
-                        send_auth_reply(msqid, msg.reply_type, -1, 0, 0, "server full");
+
+                        send_auth_reply(msqid, msg.reply_type, -1, 0, 0, 0, "server full");
                     } else {
                         restore_user_rooms_in_memory(rooms, clients[idx].name, clients[idx].id);
-                        send_auth_reply(msqid, msg.reply_type, clients[idx].id, 0, theme_id, "ok");
+
+                        send_auth_reply(msqid, msg.reply_type, clients[idx].id, 0, theme_id, clients[idx].session_token, "ok");
 
                         char ts[16];
                         get_timestamp(ts, sizeof(ts));
@@ -794,11 +1013,14 @@ static int run_arbiter(int msqid) {
                     }
                 }
             }
+
+            secure_zero(msg.text, sizeof(msg.text));
         } else if (msg.cmd == CMD_CHAT) {
             msg.name[MAX_NAME - 1] = '\0';
             msg.text[MAX_TEXT - 1] = '\0';
 
-            int cidx = find_client_by_id(clients, msg.sender_id);
+
+            int cidx = find_authed_client(clients, msg.sender_id, msg.session_token, msg.cmd);
             if (cidx < 0 || !clients[cidx].active) {
                 if (msg.reply_type > 0) {
                     send_reply(msqid, msg.reply_type, -1, "not logged in");
@@ -810,7 +1032,14 @@ static int run_arbiter(int msqid) {
                 }
             } else {
                 clients[cidx].last_seen = time(NULL);
+
                 time_t msg_ts = time(NULL);
+                char ferr[64];
+                if (check_flood_limit(&clients[cidx], ferr, sizeof(ferr))) {
+                    if (msg.reply_type > 0) {
+                        send_reply(msqid, msg.reply_type, -1, ferr);
+                    }
+                } else {
 
 
                 long db_id = db_save_dm(clients[cidx].name, msg.name, msg.text, msg_ts);
@@ -850,11 +1079,14 @@ static int run_arbiter(int msqid) {
 
                            ts, clients[cidx].name, msg.name, eff_id);
                     fflush(stdout);
+
+                }
                 }
             }
         } else if (msg.cmd == CMD_HISTORY) {
             msg.name[MAX_NAME - 1] = '\0';
-            int cidx = find_client_by_id(clients, msg.sender_id);
+
+            int cidx = find_authed_client(clients, msg.sender_id, msg.session_token, msg.cmd);
             if (cidx >= 0 && clients[cidx].active && !clients[cidx].is_debug) {
                 clients[cidx].last_seen = time(NULL);
                 struct db_msg_record recs[MAX_HISTORY_LOAD];
@@ -883,7 +1115,6 @@ static int run_arbiter(int msqid) {
                         if (ri >= 0) {
 
                             send_room_meta_to_client(msqid, clients[cidx].id, &rooms[ri]);
-                            send_room_meta_to_client(msqid, clients[cidx].id, &rooms[ri]);
 
                         }
 
@@ -897,7 +1128,8 @@ static int run_arbiter(int msqid) {
 
             msg.name[MAX_NAME - 1] = '\0';
 
-            int cidx = find_client_by_id(clients, msg.sender_id);
+
+            int cidx = find_authed_client(clients, msg.sender_id, msg.session_token, msg.cmd);
             if (cidx < 0 || !clients[cidx].active) {
                 send_reply(msqid, msg.reply_type, -1, "not logged in");
             } else if (msg.name[0] == '\0') {
@@ -914,7 +1146,8 @@ static int run_arbiter(int msqid) {
             }
         } else if (msg.cmd == CMD_DELETE_ROOM) {
             msg.name[MAX_NAME - 1] = '\0';
-            int cidx = find_client_by_id(clients, msg.sender_id);
+
+            int cidx = find_authed_client(clients, msg.sender_id, msg.session_token, msg.cmd);
             if (cidx < 0 || !clients[cidx].active) {
                 send_reply(msqid, msg.reply_type, -1, "not logged in");
             } else if (msg.name[0] == '\0') {
@@ -962,7 +1195,8 @@ static int run_arbiter(int msqid) {
                 fflush(stdout);
             }
         } else if (msg.cmd == CMD_SET_THEME) {
-            int cidx = find_client_by_id(clients, msg.sender_id);
+
+            int cidx = find_authed_client(clients, msg.sender_id, msg.session_token, msg.cmd);
             if (cidx >= 0 && clients[cidx].active) {
                 clients[cidx].last_seen = time(NULL);
                 if (!clients[cidx].is_debug) {
@@ -972,7 +1206,8 @@ static int run_arbiter(int msqid) {
 
         } else if (msg.cmd == CMD_MARK_READ) {
             msg.name[MAX_NAME - 1] = '\0';
-            int cidx = find_client_by_id(clients, msg.sender_id);
+
+            int cidx = find_authed_client(clients, msg.sender_id, msg.session_token, msg.cmd);
             if (cidx >= 0 && clients[cidx].active && !clients[cidx].is_debug && msg.name[0] != '\0') {
                 clients[cidx].last_seen = time(NULL);
                 if (msg.target_id != 0) {
@@ -997,7 +1232,8 @@ static int run_arbiter(int msqid) {
 
         } else if (msg.cmd == CMD_TYPING) {
             msg.name[MAX_NAME - 1] = '\0';
-            int cidx = find_client_by_id(clients, msg.sender_id);
+
+            int cidx = find_authed_client(clients, msg.sender_id, msg.session_token, msg.cmd);
             if (cidx >= 0 && clients[cidx].active && msg.name[0] != '\0') {
                 clients[cidx].last_seen = time(NULL);
 
@@ -1061,7 +1297,8 @@ static int run_arbiter(int msqid) {
             msg.name[MAX_NAME - 1] = '\0';
             msg.text[MAX_TEXT - 1] = '\0';
             int is_room = (msg.target_id != 0);
-            int cidx = find_client_by_id(clients, msg.sender_id);
+
+            int cidx = find_authed_client(clients, msg.sender_id, msg.session_token, msg.cmd);
             if (cidx < 0 || !clients[cidx].active) {
                 if (msg.reply_type > 0) {
                     send_reply(msqid, msg.reply_type, -1, "not logged in");
@@ -1146,7 +1383,8 @@ static int run_arbiter(int msqid) {
         } else if (msg.cmd == CMD_MSG_DELETE) {
             msg.name[MAX_NAME - 1] = '\0';
             int is_room = (msg.target_id != 0);
-            int cidx = find_client_by_id(clients, msg.sender_id);
+
+            int cidx = find_authed_client(clients, msg.sender_id, msg.session_token, msg.cmd);
             if (cidx < 0 || !clients[cidx].active) {
                 if (msg.reply_type > 0) {
                     send_reply(msqid, msg.reply_type, -1, "not logged in");
@@ -1232,7 +1470,8 @@ static int run_arbiter(int msqid) {
             int shmid = (int)msg.target_id;
             long fsize = msg.timestamp;
 
-            int cidx = find_client_by_id(clients, msg.sender_id);
+
+            int cidx = find_authed_client(clients, msg.sender_id, msg.session_token, msg.cmd);
             if (cidx < 0 || !clients[cidx].active) {
                 if (shmid >= 0) {
                     shmctl(shmid, IPC_RMID, NULL);
@@ -1278,6 +1517,15 @@ static int run_arbiter(int msqid) {
                     continue;
                 }
 
+
+                char ferr[64];
+                if (check_flood_limit(&clients[cidx], ferr, sizeof(ferr))) {
+                    shmctl(shmid, IPC_RMID, NULL);
+                    if (msg.reply_type > 0) {
+                        send_reply(msqid, msg.reply_type, -1, ferr);
+                    }
+                    continue;
+                }
                 mkdir(UPLOADS_DIR, 0755);
                 char orig_clean[64];
                 char safe_suf[32];
@@ -1353,7 +1601,8 @@ static int run_arbiter(int msqid) {
             }
         } else if (msg.cmd == CMD_FILE_GET) {
             msg.text[MAX_TEXT - 1] = '\0';
-            int cidx = find_client_by_id(clients, msg.sender_id);
+
+            int cidx = find_authed_client(clients, msg.sender_id, msg.session_token, msg.cmd);
             if (cidx < 0 || !clients[cidx].active) {
                 send_reply(msqid, msg.reply_type, -1, "not logged in");
             } else if (!is_safe_stored_name(msg.text)) {
@@ -1383,35 +1632,55 @@ static int run_arbiter(int msqid) {
                 }
             }
         } else if (msg.cmd == CMD_HEARTBEAT) {
-            for (int i = 0; i < MAX_CLIENTS; i++) {
-                if (clients[i].active && clients[i].id == msg.sender_id) {
-                    clients[i].last_seen = time(NULL);
-                    break;
-                }
+
+            int cidx = find_authed_client(clients, msg.sender_id, msg.session_token, msg.cmd);
+            if (cidx >= 0) {
+                clients[cidx].last_seen = time(NULL);
             }
         } else if (msg.cmd == CMD_LOOKUP) {
-            long found_id = -1;
-            for (int i = 0; i < MAX_CLIENTS; i++) {
-                if (clients[i].active) {
-                    if (clients[i].id == msg.sender_id) {
-                        clients[i].last_seen = time(NULL);
-                    }
-                    if (strcmp(clients[i].name, msg.name) == 0) {
+
+            int cidx = find_authed_client(clients, msg.sender_id, msg.session_token, msg.cmd);
+            if (cidx < 0) {
+                send_reply(msqid, msg.reply_type, -1, "not logged in");
+            } else {
+                clients[cidx].last_seen = time(NULL);
+                long found_id = -1;
+                for (int i = 0; i < MAX_CLIENTS; i++) {
+                    if (clients[i].active && strcmp(clients[i].name, msg.name) == 0) {
                         found_id = clients[i].id;
                     }
                 }
+                send_reply(msqid, msg.reply_type, found_id, found_id > 0 ? "ok" : "offline");
+
             }
-            send_reply(msqid, msg.reply_type, found_id, found_id > 0 ? "ok" : "offline");
+
         } else if (msg.cmd == CMD_WHO) {
+
+            if (msg.sender_id > 0) {
+
+                int cidx = find_authed_client(clients, msg.sender_id, msg.session_token, msg.cmd);
+
+                if (cidx >= 0) {
+
+                    clients[cidx].last_seen = time(NULL);
+
+                }
+
+            }
+
             char list[MAX_TEXT];
+
             size_t pos = 0;
+
             long count = 0;
+
             list[0] = '\0';
+
             for (int i = 0; i < MAX_CLIENTS; i++) {
+
                 if (clients[i].active) {
-                    if (clients[i].id == msg.sender_id) {
-                        clients[i].last_seen = time(NULL);
-                    }
+
+
                     int written = snprintf(list + pos, sizeof(list) - pos, "%s%s",
                                            count > 0 ? ", " : "", clients[i].name);
                     if (written > 0 && pos + (size_t)written < sizeof(list)) {
@@ -1422,7 +1691,8 @@ static int run_arbiter(int msqid) {
             }
             send_reply(msqid, msg.reply_type, count, list);
         } else if (msg.cmd == CMD_ROOM_JOIN) {
-            int cidx = find_client_by_id(clients, msg.sender_id);
+
+            int cidx = find_authed_client(clients, msg.sender_id, msg.session_token, msg.cmd);
             if (cidx < 0 || !clients[cidx].active) {
                 send_reply(msqid, msg.reply_type, -1, "not logged in");
             } else if (msg.name[0] == '\0' || strchr(msg.name, '#') != NULL ||
@@ -1497,9 +1767,14 @@ static int run_arbiter(int msqid) {
                 }
             }
         } else if (msg.cmd == CMD_ROOM_LEAVE) {
-            int cidx = find_client_by_id(clients, msg.sender_id);
+
+            int cidx = find_authed_client(clients, msg.sender_id, msg.session_token, msg.cmd);
 
             int ridx = find_room_by_name(rooms, msg.name);
+
+            if (cidx < 0) {
+                send_reply(msqid, msg.reply_type, -1, "not logged in");
+            } else 
             if (ridx < 0) {
                 send_reply(msqid, msg.reply_type, -1, "room not found");
             } else {
@@ -1525,7 +1800,8 @@ static int run_arbiter(int msqid) {
                 }
             }
         } else if (msg.cmd == CMD_ROOM_MSG) {
-            int cidx = find_client_by_id(clients, msg.sender_id);
+
+            int cidx = find_authed_client(clients, msg.sender_id, msg.session_token, msg.cmd);
 
             int ridx = find_room_by_name(rooms, msg.name);
             if (cidx < 0 || !clients[cidx].active) {
@@ -1539,40 +1815,52 @@ static int run_arbiter(int msqid) {
                     send_reply(msqid, msg.reply_type, -1, "not in room");
                 } else {
 
+                    char ferr[64];
+                    if (check_flood_limit(&clients[cidx], ferr, sizeof(ferr))) {
+                        send_reply(msqid, msg.reply_type, -1, ferr);
+                    } else {
                     time_t msg_ts = time(NULL);
                     long db_id = db_save_room_msg(rooms[ridx].name, clients[cidx].name, msg.text, msg_ts);
                     long eff_id = (db_id > 0) ? db_id : msg.msg_id;
                     int cnt = broadcast_to_room(msqid, clients, &rooms[ridx],
                                                 msg.sender_id, clients[cidx].name, eff_id, msg_ts, msg.text);
                     send_reply_id(msqid, msg.reply_type, cnt, eff_id, "ok");
+
+                    }
                 }
             }
+
         } else if (msg.cmd == CMD_ROOM_LIST) {
-            char list[MAX_TEXT];
-            list[0] = '\0';
-            size_t pos = 0;
-            long count = 0;
-            for (int i = 0; i < MAX_ROOMS; i++) {
-                if (!rooms[i].used) {
-                    continue;
+            int cidx = find_authed_client(clients, msg.sender_id, msg.session_token, msg.cmd);
+            if (cidx < 0) {
+                send_reply(msqid, msg.reply_type, -1, "not logged in");
+            } else {
+                clients[cidx].last_seen = time(NULL);
+                char list[MAX_TEXT];
+                list[0] = '\0';
+                size_t pos = 0;
+                long count = 0;
+                for (int i = 0; i < MAX_ROOMS; i++) {
+                    if (!rooms[i].used) {
+                        continue;
+                    }
+                    int is_member = (find_room_member_pos(&rooms[i], msg.sender_id) >= 0);
+                    int written = snprintf(list + pos, sizeof(list) - pos, "%s%s%s(%d)",
+                                           count > 0 ? ", " : "",
+                                           is_member ? "*" : "",
+                                           rooms[i].name,
+                                           rooms[i].member_count);
+                    if (written > 0 && pos + (size_t)written < sizeof(list)) {
+                        pos += (size_t)written;
+                    }
+                    count++;
                 }
-
-                int is_member = (find_room_member_pos(&rooms[i], msg.sender_id) >= 0);
-                int written = snprintf(list + pos, sizeof(list) - pos, "%s%s%s(%d)",
-                                       count > 0 ? ", " : "",
-                                       is_member ? "*" : "",
-                                       rooms[i].name,
-                                       rooms[i].member_count);
-                if (written > 0 && pos + (size_t)written < sizeof(list)) {
-                    pos += (size_t)written;
-                }
-                count++;
+                send_reply(msqid, msg.reply_type, count, list);
             }
-            send_reply(msqid, msg.reply_type, count, list);
-
         } else if (msg.cmd == CMD_ROOM_INFO) {
             msg.name[MAX_NAME - 1] = '\0';
-            int cidx = find_client_by_id(clients, msg.sender_id);
+
+            int cidx = find_authed_client(clients, msg.sender_id, msg.session_token, msg.cmd);
 
             int ridx = find_room_by_name(rooms, msg.name);
             if (cidx < 0 || !clients[cidx].active) {
@@ -1602,7 +1890,8 @@ static int run_arbiter(int msqid) {
         } else if (msg.cmd == CMD_ROOM_KICK) {
             msg.name[MAX_NAME - 1] = '\0';
             msg.text[MAX_TEXT - 1] = '\0';
-            int cidx = find_client_by_id(clients, msg.sender_id);
+
+            int cidx = find_authed_client(clients, msg.sender_id, msg.session_token, msg.cmd);
 
             int ridx = find_room_by_name(rooms, msg.name);
             if (cidx < 0 || !clients[cidx].active) {
@@ -1662,7 +1951,8 @@ static int run_arbiter(int msqid) {
         } else if (msg.cmd == CMD_ROOM_PIN) {
             msg.name[MAX_NAME - 1] = '\0';
             msg.text[MAX_TEXT - 1] = '\0';
-            int cidx = find_client_by_id(clients, msg.sender_id);
+
+            int cidx = find_authed_client(clients, msg.sender_id, msg.session_token, msg.cmd);
 
             int ridx = find_room_by_name(rooms, msg.name);
             if (cidx < 0 || !clients[cidx].active) {
@@ -1695,7 +1985,8 @@ static int run_arbiter(int msqid) {
         } else if (msg.cmd == CMD_ROOM_TOPIC) {
             msg.name[MAX_NAME - 1] = '\0';
             msg.text[MAX_TEXT - 1] = '\0';
-            int cidx = find_client_by_id(clients, msg.sender_id);
+
+            int cidx = find_authed_client(clients, msg.sender_id, msg.session_token, msg.cmd);
 
             int ridx = find_room_by_name(rooms, msg.name);
             if (cidx < 0 || !clients[cidx].active) {
@@ -1724,67 +2015,67 @@ static int run_arbiter(int msqid) {
                 snprintf(note, sizeof(note), "%s updated room topic", clients[cidx].name);
                 broadcast_to_room(msqid, clients, &rooms[ridx], -1, "arbiter", 0, time(NULL), note);
             }
+
         } else if (msg.cmd == CMD_STORE) {
-            for (int i = 0; i < MAX_CLIENTS; i++) {
-                if (clients[i].active && clients[i].id == msg.sender_id) {
-                    clients[i].last_seen = time(NULL);
-                    break;
-                }
+            int cidx = find_authed_client(clients, msg.sender_id, msg.session_token, msg.cmd);
+            if (cidx >= 0) {
+                clients[cidx].last_seen = time(NULL);
+                msg.sender_name[MAX_NAME - 1] = '\0';
+                msg.name[MAX_NAME - 1] = '\0';
+                msg.text[MAX_TEXT - 1] = '\0';
+                store_pending(pending, msg.msg_id, msg.sender_name, msg.name, msg.text);
+                save_backlog(pending);
+                char ts[16];
+                get_timestamp(ts, sizeof(ts));
+                printf(CLR_DIM "[%s] " CLR_RESET CLR_YELLOW "~ stored offline: %s -> %s (#%ld)\n" CLR_RESET,
+                       ts, msg.sender_name, msg.name, msg.msg_id);
+                fflush(stdout);
             }
-            msg.sender_name[MAX_NAME - 1] = '\0';
-            msg.name[MAX_NAME - 1] = '\0';
-            msg.text[MAX_TEXT - 1] = '\0';
-            store_pending(pending, msg.msg_id, msg.sender_name, msg.name, msg.text);
-            save_backlog(pending);
-            char ts[16];
-            get_timestamp(ts, sizeof(ts));
-            printf(CLR_DIM "[%s] " CLR_RESET CLR_YELLOW "~ stored offline: %s -> %s (#%ld)\n" CLR_RESET,
-                   ts, msg.sender_name, msg.name, msg.msg_id);
-            fflush(stdout);
+
         } else if (msg.cmd == CMD_ACK) {
-            msg.name[MAX_NAME - 1] = '\0';
-            msg.sender_name[MAX_NAME - 1] = '\0';
-            long sender_target = -1;
-            for (int i = 0; i < MAX_CLIENTS; i++) {
-                if (clients[i].active) {
-                    if (clients[i].id == msg.sender_id) {
-                        clients[i].last_seen = time(NULL);
-                    }
-                    if (strcmp(clients[i].name, msg.name) == 0) {
+            int cidx = find_authed_client(clients, msg.sender_id, msg.session_token, msg.cmd);
+            if (cidx >= 0) {
+                clients[cidx].last_seen = time(NULL);
+                msg.name[MAX_NAME - 1] = '\0';
+                msg.sender_name[MAX_NAME - 1] = '\0';
+                long sender_target = -1;
+                for (int i = 0; i < MAX_CLIENTS; i++) {
+                    if (clients[i].active && strcmp(clients[i].name, msg.name) == 0) {
                         sender_target = clients[i].id;
                     }
                 }
-            }
-            if (sender_target > 0) {
-                struct qmsg ack;
-                memset(&ack, 0, sizeof(ack));
-                ack.mtype = sender_target;
-                ack.cmd = CMD_ACK;
-                ack.msg_id = msg.msg_id;
-                snprintf(ack.sender_name, sizeof(ack.sender_name), "%.*s", MAX_NAME - 1, msg.sender_name);
-                msgsnd(msqid, &ack, MSG_SIZE, IPC_NOWAIT);
-            }
-            char ts[16];
-            get_timestamp(ts, sizeof(ts));
-            printf(CLR_DIM "[%s] " CLR_RESET CLR_BLUE "✓ ack: %s -> %s (#%ld)\n" CLR_RESET,
-                   ts, msg.sender_name, msg.name, msg.msg_id);
-            fflush(stdout);
-        } else if (msg.cmd == CMD_LOGOUT) {
-            for (int i = 0; i < MAX_CLIENTS; i++) {
-                if (clients[i].active && clients[i].id == msg.sender_id) {
-                    char ts[16];
-                    get_timestamp(ts, sizeof(ts));
-                    printf(CLR_DIM "[%s] " CLR_RESET CLR_YELLOW "- logout: %s (id=%ld)\n" CLR_RESET,
-                           ts, clients[i].name, clients[i].id);
-                    fflush(stdout);
-                    if (salvage_messages(msqid, clients[i].id, clients[i].name, pending) > 0) {
-                        save_backlog(pending);
-                    }
-                    drain_type(msqid, clients[i].reply_type);
-                    clients[i].active = 0;
-                    break;
+                if (sender_target > 0) {
+                    struct qmsg ack;
+                    memset(&ack, 0, sizeof(ack));
+                    ack.mtype = sender_target;
+                    ack.cmd = CMD_ACK;
+                    ack.msg_id = msg.msg_id;
+                    snprintf(ack.sender_name, sizeof(ack.sender_name), "%.*s", MAX_NAME - 1, msg.sender_name);
+                    msgsnd(msqid, &ack, MSG_SIZE, IPC_NOWAIT);
                 }
+                char ts[16];
+                get_timestamp(ts, sizeof(ts));
+                printf(CLR_DIM "[%s] " CLR_RESET CLR_BLUE "✓ ack: %s -> %s (#%ld)\n" CLR_RESET,
+                       ts, msg.sender_name, msg.name, msg.msg_id);
+                fflush(stdout);
             }
+
+        } else if (msg.cmd == CMD_LOGOUT) {
+            int cidx = find_authed_client(clients, msg.sender_id, msg.session_token, msg.cmd);
+            if (cidx >= 0) {
+                char ts[16];
+                get_timestamp(ts, sizeof(ts));
+                printf(CLR_DIM "[%s] " CLR_RESET CLR_YELLOW "- logout: %s (id=%ld)\n" CLR_RESET,
+                       ts, clients[cidx].name, clients[cidx].id);
+                fflush(stdout);
+                if (salvage_messages(msqid, clients[cidx].id, clients[cidx].name, pending) > 0) {
+                    save_backlog(pending);
+                }
+                drain_type(msqid, clients[cidx].reply_type);
+                clients[cidx].session_token = 0;
+                clients[cidx].active = 0;
+            }
+
         }
     }
 
@@ -1834,6 +2125,8 @@ static void *recv_worker(void *arg) {
         char cur_name[MAX_NAME];
         pthread_mutex_lock(&g_mtx);
         long my_id = g_my_id;
+
+        uint64_t my_tok = g_session_token;
         snprintf(cur_name, sizeof(cur_name), "%.*s", MAX_NAME - 1, g_my_name);
         pthread_mutex_unlock(&g_mtx);
 
@@ -1870,6 +2163,8 @@ static void *recv_worker(void *arg) {
                     ack.mtype = ARBITER_TYPE;
                     ack.cmd = CMD_ACK;
                     ack.sender_id = my_id;
+
+                    ack.session_token = my_tok;
                     ack.msg_id = msg.msg_id;
                     snprintf(ack.name, sizeof(ack.name), "%.*s", MAX_NAME - 1, msg.sender_name);
                     snprintf(ack.sender_name, sizeof(ack.sender_name), "%.*s", MAX_NAME - 1, cur_name);
@@ -1937,6 +2232,8 @@ static void *recv_worker(void *arg) {
                     ack.mtype = ARBITER_TYPE;
                     ack.cmd = CMD_ACK;
                     ack.sender_id = my_id;
+
+                    ack.session_token = my_tok;
                     ack.msg_id = msg.msg_id;
                     snprintf(ack.name, sizeof(ack.name), "%.*s", MAX_NAME - 1, msg.sender_name);
                     snprintf(ack.sender_name, sizeof(ack.sender_name), "%.*s", MAX_NAME - 1, cur_name);
@@ -1987,12 +2284,16 @@ static void *heartbeat_worker(void *arg) {
 
         pthread_mutex_lock(&g_mtx);
         long my_id = g_my_id;
+
+        uint64_t my_tok = g_session_token;
         pthread_mutex_unlock(&g_mtx);
 
         if (my_id > 0) {
             memset(&hb, 0, sizeof(hb));
             hb.mtype = ARBITER_TYPE;
             hb.cmd = CMD_HEARTBEAT;
+
+            hb.session_token = my_tok;
             hb.sender_id = my_id;
             if (msgsnd(g_msqid, &hb, MSG_SIZE, 0) < 0 && errno != EINTR) {
                 running = 0;
@@ -2007,6 +2308,9 @@ static void *heartbeat_worker(void *arg) {
 static void send_logout(void) {
     pthread_mutex_lock(&g_mtx);
     long my_id = g_my_id;
+
+    uint64_t my_tok = g_session_token;
+    g_session_token = 0;
     g_my_id = 0;
     g_my_name[0] = '\0';
     pthread_mutex_unlock(&g_mtx);
@@ -2017,6 +2321,8 @@ static void send_logout(void) {
         msg.mtype = ARBITER_TYPE;
         msg.cmd = CMD_LOGOUT;
         msg.sender_id = my_id;
+
+        msg.session_token = my_tok;
         msg.reply_type = g_reply_type;
         msgsnd(g_msqid, &msg, MSG_SIZE, 0);
     }
@@ -2054,6 +2360,8 @@ static int run_client(int msqid) {
         if (strcmp(line, "?") == 0 || strcasecmp(line, "/who") == 0) {
             pthread_mutex_lock(&g_mtx);
             long cur_id = g_my_id;
+
+            uint64_t cur_tok = g_session_token;
             pthread_mutex_unlock(&g_mtx);
 
             struct qmsg req;
@@ -2061,6 +2369,8 @@ static int run_client(int msqid) {
             req.mtype = ARBITER_TYPE;
             req.cmd = CMD_WHO;
             req.sender_id = cur_id;
+
+            req.session_token = cur_tok;
             req.reply_type = g_reply_type;
             if (msgsnd(msqid, &req, MSG_SIZE, 0) < 0) {
                 perror("msgsnd");
@@ -2083,6 +2393,8 @@ static int run_client(int msqid) {
         if (strcasecmp(line, "/history") == 0 || strncasecmp(line, "/history ", 9) == 0) {
             pthread_mutex_lock(&g_mtx);
             long cur_id = g_my_id;
+
+            uint64_t cur_tok = g_session_token;
             pthread_mutex_unlock(&g_mtx);
 
             if (cur_id <= 0) {
@@ -2104,6 +2416,8 @@ static int run_client(int msqid) {
             req.cmd = CMD_HISTORY;
             req.sender_id = cur_id;
             req.reply_type = 0;
+
+            req.session_token = cur_tok;
             snprintf(req.name, sizeof(req.name), "%.*s", MAX_NAME - 1, filter);
             msgsnd(msqid, &req, MSG_SIZE, 0);
             print_prompt();
@@ -2113,6 +2427,8 @@ static int run_client(int msqid) {
         if (strncasecmp(line, "/delchat ", 9) == 0) {
             pthread_mutex_lock(&g_mtx);
             long cur_id = g_my_id;
+
+            uint64_t cur_tok = g_session_token;
             pthread_mutex_unlock(&g_mtx);
 
             if (cur_id <= 0) {
@@ -2146,6 +2462,8 @@ static int run_client(int msqid) {
             req.cmd = is_room ? CMD_DELETE_ROOM : CMD_DELETE_CHAT;
             req.sender_id = cur_id;
             req.reply_type = g_reply_type;
+
+            req.session_token = cur_tok;
             snprintf(req.name, sizeof(req.name), "%.*s", MAX_NAME - 1, target);
             if (msgsnd(msqid, &req, MSG_SIZE, 0) < 0) {
                 perror("msgsnd");
@@ -2173,6 +2491,8 @@ static int run_client(int msqid) {
             pthread_mutex_lock(&g_mtx);
             long cur_id = g_my_id;
             char cur_name[MAX_NAME];
+
+            uint64_t cur_tok = g_session_token;
             snprintf(cur_name, sizeof(cur_name), "%.*s", MAX_NAME - 1, g_my_name);
             pthread_mutex_unlock(&g_mtx);
 
@@ -2231,6 +2551,8 @@ static int run_client(int msqid) {
             req.sender_id = cur_id;
             req.msg_id = g_next_msg_id++;
             req.reply_type = g_reply_type;
+
+            req.session_token = cur_tok;
             req.target_id = shmid;
             req.timestamp = fsize;
             snprintf(req.name, sizeof(req.name), "%.*s", MAX_NAME - 1, target);
@@ -2264,6 +2586,8 @@ static int run_client(int msqid) {
         if (strncasecmp(line, "/getfile ", 9) == 0) {
             pthread_mutex_lock(&g_mtx);
             long cur_id = g_my_id;
+
+            uint64_t cur_tok = g_session_token;
             pthread_mutex_unlock(&g_mtx);
 
             if (cur_id <= 0) {
@@ -2313,6 +2637,8 @@ static int run_client(int msqid) {
             req.cmd = CMD_FILE_GET;
             req.sender_id = cur_id;
             req.reply_type = g_reply_type;
+
+            req.session_token = cur_tok;
             snprintf(req.text, sizeof(req.text), "%.*s", MAX_TEXT - 1, file_id);
 
             if (msgsnd(msqid, &req, MSG_SIZE, 0) < 0) {
@@ -2349,6 +2675,8 @@ static int run_client(int msqid) {
         if (strcasecmp(line, "/rooms") == 0) {
             pthread_mutex_lock(&g_mtx);
             long cur_id = g_my_id;
+
+            uint64_t cur_tok = g_session_token;
             pthread_mutex_unlock(&g_mtx);
 
             if (cur_id <= 0) {
@@ -2365,6 +2693,8 @@ static int run_client(int msqid) {
             req.cmd = CMD_ROOM_LIST;
             req.sender_id = cur_id;
             req.reply_type = g_reply_type;
+
+            req.session_token = cur_tok;
             if (msgsnd(msqid, &req, MSG_SIZE, 0) < 0) {
                 perror("msgsnd");
                 break;
@@ -2395,6 +2725,8 @@ static int run_client(int msqid) {
 
             pthread_mutex_lock(&g_mtx);
             long cur_id = g_my_id;
+
+            uint64_t cur_tok = g_session_token;
             pthread_mutex_unlock(&g_mtx);
 
             if (cur_id <= 0) {
@@ -2411,6 +2743,8 @@ static int run_client(int msqid) {
             req.cmd = is_join ? CMD_ROOM_JOIN : CMD_ROOM_LEAVE;
             req.sender_id = cur_id;
             req.reply_type = g_reply_type;
+
+            req.session_token = cur_tok;
             snprintf(req.name, sizeof(req.name), "%.*s", MAX_NAME - 2, rname);
             if (msgsnd(msqid, &req, MSG_SIZE, 0) < 0) {
                 perror("msgsnd");
@@ -2458,6 +2792,8 @@ static int run_client(int msqid) {
 
             pthread_mutex_lock(&g_mtx);
             long cur_id = g_my_id;
+
+            uint64_t cur_tok = g_session_token;
             long msg_id = g_next_msg_id++;
             pthread_mutex_unlock(&g_mtx);
 
@@ -2476,6 +2812,8 @@ static int run_client(int msqid) {
             req.sender_id = cur_id;
             req.msg_id = msg_id;
             req.reply_type = g_reply_type;
+
+            req.session_token = cur_tok;
             snprintf(req.name, sizeof(req.name), "%.*s", MAX_NAME - 2, rname);
             copy_utf8_safe(req.text, sizeof(req.text), text);
 
@@ -2589,6 +2927,8 @@ static int run_client(int msqid) {
                 g_my_id = rep.target_id;
                 g_next_msg_id = 1;
                 snprintf(g_my_name, sizeof(g_my_name), "%.*s", MAX_NAME - 1, name);
+
+                g_session_token = rep.session_token;
                 pthread_mutex_unlock(&g_mtx);
 
                 pthread_mutex_lock(&g_io_mtx);
@@ -2612,6 +2952,8 @@ static int run_client(int msqid) {
         if (sep != NULL && sep != line) {
             pthread_mutex_lock(&g_mtx);
             long cur_id = g_my_id;
+
+            uint64_t cur_tok = g_session_token;
             char cur_name[MAX_NAME];
             snprintf(cur_name, sizeof(cur_name), "%.*s", MAX_NAME - 1, g_my_name);
             pthread_mutex_unlock(&g_mtx);
@@ -2654,6 +2996,8 @@ static int run_client(int msqid) {
             chat.sender_id = cur_id;
             chat.msg_id = msg_id;
             chat.reply_type = g_reply_type;
+
+            chat.session_token = cur_tok;
             snprintf(chat.name, sizeof(chat.name), "%.*s", MAX_NAME - 1, target_name);
             snprintf(chat.sender_name, sizeof(chat.sender_name), "%.*s", MAX_NAME - 1, cur_name);
             copy_utf8_safe(chat.text, sizeof(chat.text), text);
@@ -2854,7 +3198,8 @@ static int daemonize_and_run(key_t key) {
     }
     write_pid_to_lock(lock_fd);
 
-    int msqid = msgget(key, 0666 | IPC_CREAT);
+
+    int msqid = msgget(key, 0600 | IPC_CREAT);
     if (msqid < 0) {
         flock(lock_fd, LOCK_UN);
         close(lock_fd);
@@ -2951,7 +3296,8 @@ int main(int argc, char *argv[]) {
         write_pid_to_lock(lock_fd);
     }
 
-    int flags = is_arbiter ? (0666 | IPC_CREAT) : 0666;
+
+    int flags = is_arbiter ? (0600 | IPC_CREAT) : 0600;
     int msqid = msgget(key, flags);
     if (msqid < 0) {
         if (!is_arbiter && errno == ENOENT) {

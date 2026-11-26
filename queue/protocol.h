@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <sys/ipc.h>
 #include <sys/msg.h>
@@ -73,6 +74,7 @@ struct qmsg {
     long mtype;
     int cmd;
     long sender_id;
+    uint64_t session_token;
     long reply_type;
     long target_id;
     long msg_id;

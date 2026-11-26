@@ -6,6 +6,8 @@
 #include <gdk/gdkkeysyms.h>
 #include <pthread.h>
 #include <signal.h>
+
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -193,6 +195,8 @@ static volatile sig_atomic_t g_running = 1;
 static volatile sig_atomic_t g_who_force = 0;
 static int g_msqid = -1;
 static long g_my_id = 0;
+
+static uint64_t g_session_token = 0;
 static int g_is_debug = 0;
 static long g_reply_type = 0;
 static long g_who_reply_type = 0;
@@ -213,6 +217,9 @@ static time_t g_last_typing_sent = 0;
 static char g_last_typing_peer[MAX_NAME] = "";
 static int g_last_typing_is_room = 0;
 static guint g_typing_timer_id = 0;
+
+static int g_auth_lock_secs = 0;
+static guint g_auth_lock_timer_id = 0;
 
 
 static long g_edit_msg_id = 0;
@@ -338,6 +345,9 @@ static int wait_reply(int msqid, long reply_type, struct qmsg *rep, int max_trie
 static void send_logout(void) {
     pthread_mutex_lock(&g_mtx);
     long my_id = g_my_id;
+
+    uint64_t my_tok = g_session_token;
+    g_session_token = 0;
     g_my_id = 0;
     g_is_debug = 0;
     g_my_name[0] = '\0';
@@ -350,6 +360,8 @@ static void send_logout(void) {
         msg.cmd = CMD_LOGOUT;
         msg.sender_id = my_id;
         msg.reply_type = g_reply_type;
+
+        msg.session_token = my_tok;
         msgsnd(g_msqid, &msg, MSG_SIZE, IPC_NOWAIT);
     }
 }
@@ -361,7 +373,9 @@ static void send_read_ack(long msg_id, const char *sender_name) {
 
     char cur_name[MAX_NAME];
     pthread_mutex_lock(&g_mtx);
+
     long my_id = g_my_id;
+    uint64_t my_tok = g_session_token;
     snprintf(cur_name, sizeof(cur_name), "%.*s", MAX_NAME - 1, g_my_name);
     pthread_mutex_unlock(&g_mtx);
 
@@ -376,6 +390,8 @@ static void send_read_ack(long msg_id, const char *sender_name) {
     ack.sender_id = my_id;
     ack.msg_id = msg_id;
     snprintf(ack.name, sizeof(ack.name), "%.*s", MAX_NAME - 1, sender_name);
+
+    ack.session_token = my_tok;
     snprintf(ack.sender_name, sizeof(ack.sender_name), "%.*s", MAX_NAME - 1, cur_name);
     msgsnd(g_msqid, &ack, MSG_SIZE, IPC_NOWAIT);
 }
@@ -386,7 +402,9 @@ static void send_mark_read(const char *peer, int is_room) {
     }
 
     pthread_mutex_lock(&g_mtx);
+
     long my_id = g_my_id;
+    uint64_t my_tok = g_session_token;
     int is_dbg = g_is_debug;
     pthread_mutex_unlock(&g_mtx);
 
@@ -400,6 +418,8 @@ static void send_mark_read(const char *peer, int is_room) {
     req.cmd = CMD_MARK_READ;
     req.sender_id = my_id;
     req.target_id = is_room ? 1 : 0;
+
+    req.session_token = my_tok;
     snprintf(req.name, sizeof(req.name), "%.*s", MAX_NAME - 1, peer);
     msgsnd(g_msqid, &req, MSG_SIZE, IPC_NOWAIT);
 }
@@ -410,7 +430,9 @@ static void send_typing(void) {
     }
 
     pthread_mutex_lock(&g_mtx);
+
     long my_id = g_my_id;
+    uint64_t my_tok = g_session_token;
     pthread_mutex_unlock(&g_mtx);
 
     if (my_id <= 0) {
@@ -434,6 +456,8 @@ static void send_typing(void) {
     req.cmd = CMD_TYPING;
     req.sender_id = my_id;
     req.target_id = g_active_is_room ? 1 : 0;
+
+    req.session_token = my_tok;
     snprintf(req.name, sizeof(req.name), "%.*s", MAX_NAME - 1, g_active_peer);
     msgsnd(g_msqid, &req, MSG_SIZE, IPC_NOWAIT);
 }
@@ -662,7 +686,9 @@ static void on_theme_changed(GtkComboBox *combo, gpointer data) {
     }
 
     pthread_mutex_lock(&g_mtx);
+
     long my_id = g_my_id;
+    uint64_t my_tok = g_session_token;
     int is_dbg = g_is_debug;
     pthread_mutex_unlock(&g_mtx);
 
@@ -672,6 +698,8 @@ static void on_theme_changed(GtkComboBox *combo, gpointer data) {
         req.mtype = ARBITER_TYPE;
         req.cmd = CMD_SET_THEME;
         req.sender_id = my_id;
+
+        req.session_token = my_tok;
         req.msg_id = idx;
         msgsnd(g_msqid, &req, MSG_SIZE, IPC_NOWAIT);
     }
@@ -870,7 +898,9 @@ static void on_file_download_clicked(GtkWidget *btn, gpointer data) {
     }
 
     pthread_mutex_lock(&g_mtx);
+
     long cur_id = g_my_id;
+    uint64_t cur_tok = g_session_token;
     pthread_mutex_unlock(&g_mtx);
     if (cur_id <= 0) {
         ui_append_error("Login first.");
@@ -905,6 +935,8 @@ static void on_file_download_clicked(GtkWidget *btn, gpointer data) {
     req.mtype = ARBITER_TYPE;
     req.cmd = CMD_FILE_GET;
     req.sender_id = cur_id;
+
+    req.session_token = cur_tok;
     req.reply_type = g_reply_type;
     snprintf(req.text, sizeof(req.text), "%.*s", MAX_TEXT - 1, stored);
 
@@ -959,7 +991,9 @@ static GdkPixbuf *shm_fetch_pixbuf(const char *stored) {
     }
 
     pthread_mutex_lock(&g_mtx);
+
     long cur_id = g_my_id;
+    uint64_t cur_tok = g_session_token;
     pthread_mutex_unlock(&g_mtx);
     if (cur_id <= 0) {
         return NULL;
@@ -972,6 +1006,8 @@ static GdkPixbuf *shm_fetch_pixbuf(const char *stored) {
     req.mtype = ARBITER_TYPE;
     req.cmd = CMD_FILE_GET;
     req.sender_id = cur_id;
+
+    req.session_token = cur_tok;
     req.reply_type = g_reply_type;
     snprintf(req.text, sizeof(req.text), "%.*s", MAX_TEXT - 1, stored);
 
@@ -1786,7 +1822,9 @@ static void on_msg_delete_activate(GtkMenuItem *item, gpointer data) {
     }
 
     pthread_mutex_lock(&g_mtx);
+
     long cur_id = g_my_id;
+    uint64_t cur_tok = g_session_token;
     pthread_mutex_unlock(&g_mtx);
     if (cur_id <= 0) {
         return;
@@ -1804,6 +1842,8 @@ static void on_msg_delete_activate(GtkMenuItem *item, gpointer data) {
     req.mtype = ARBITER_TYPE;
     req.cmd = CMD_MSG_DELETE;
     req.sender_id = cur_id;
+
+    req.session_token = cur_tok;
     req.reply_type = g_reply_type;
     req.target_id = is_room ? 1 : 0;
     req.msg_id = del_id;
@@ -1838,7 +1878,9 @@ static void send_room_pin_text(const char *room, const char *pin_text) {
         return;
     }
     pthread_mutex_lock(&g_mtx);
+
     long cur_id = g_my_id;
+    uint64_t cur_tok = g_session_token;
     pthread_mutex_unlock(&g_mtx);
     if (cur_id <= 0) {
         return;
@@ -1850,6 +1892,8 @@ static void send_room_pin_text(const char *room, const char *pin_text) {
     req.mtype = ARBITER_TYPE;
     req.cmd = CMD_ROOM_PIN;
     req.sender_id = cur_id;
+
+    req.session_token = cur_tok;
     req.reply_type = g_reply_type;
     snprintf(req.name, sizeof(req.name), "%.*s", MAX_NAME - 1, room);
     if (pin_text != NULL && pin_text[0] != '\0') {
@@ -2388,7 +2432,9 @@ static void clear_all_dialogs(void) {
 
 static int do_join_room(const char *raw_name) {
     pthread_mutex_lock(&g_mtx);
+
     long cur_id = g_my_id;
+    uint64_t cur_tok = g_session_token;
     pthread_mutex_unlock(&g_mtx);
 
     if (cur_id <= 0) {
@@ -2414,6 +2460,8 @@ static int do_join_room(const char *raw_name) {
     req.mtype = ARBITER_TYPE;
     req.cmd = CMD_ROOM_JOIN;
     req.sender_id = cur_id;
+
+    req.session_token = cur_tok;
     req.reply_type = g_reply_type;
     snprintf(req.name, sizeof(req.name), "%.*s", MAX_NAME - 2, raw_name);
 
@@ -2475,7 +2523,9 @@ static void on_leave_room_clicked(GtkWidget *widget, gpointer data) {
     }
 
     pthread_mutex_lock(&g_mtx);
+
     long cur_id = g_my_id;
+    uint64_t cur_tok = g_session_token;
     pthread_mutex_unlock(&g_mtx);
 
     if (cur_id <= 0) {
@@ -2490,6 +2540,8 @@ static void on_leave_room_clicked(GtkWidget *widget, gpointer data) {
     req.mtype = ARBITER_TYPE;
     req.cmd = CMD_ROOM_LEAVE;
     req.sender_id = cur_id;
+
+    req.session_token = cur_tok;
     req.reply_type = g_reply_type;
     snprintf(req.name, sizeof(req.name), "%.*s", MAX_NAME - 2, rname);
 
@@ -2536,7 +2588,9 @@ static void on_delete_clicked(GtkWidget *widget, gpointer data) {
     }
 
     pthread_mutex_lock(&g_mtx);
+
     long cur_id = g_my_id;
+    uint64_t cur_tok = g_session_token;
     pthread_mutex_unlock(&g_mtx);
 
     if (cur_id <= 0) {
@@ -2575,6 +2629,8 @@ static void on_delete_clicked(GtkWidget *widget, gpointer data) {
     req.mtype = ARBITER_TYPE;
     req.cmd = is_room ? CMD_DELETE_ROOM : CMD_DELETE_CHAT;
     req.sender_id = cur_id;
+
+    req.session_token = cur_tok;
     req.reply_type = g_reply_type;
     snprintf(req.name, sizeof(req.name), "%.*s", MAX_NAME - 1, peer);
 
@@ -2625,7 +2681,9 @@ static void on_kick_member_clicked(GtkWidget *btn, gpointer data) {
     }
 
     pthread_mutex_lock(&g_mtx);
+
     long cur_id = g_my_id;
+    uint64_t cur_tok = g_session_token;
     pthread_mutex_unlock(&g_mtx);
     if (cur_id <= 0) {
         return;
@@ -2637,6 +2695,8 @@ static void on_kick_member_clicked(GtkWidget *btn, gpointer data) {
     req.mtype = ARBITER_TYPE;
     req.cmd = CMD_ROOM_KICK;
     req.sender_id = cur_id;
+
+    req.session_token = cur_tok;
     req.reply_type = g_reply_type;
     snprintf(req.name, sizeof(req.name), "%.*s", MAX_NAME - 1, room);
     snprintf(req.text, sizeof(req.text), "%.*s", MAX_NAME - 1, target);
@@ -2672,7 +2732,9 @@ static void on_room_info_activate(GtkMenuItem *item, gpointer data) {
 
     char cur_name[MAX_NAME];
     pthread_mutex_lock(&g_mtx);
+
     long cur_id = g_my_id;
+    uint64_t cur_tok = g_session_token;
     snprintf(cur_name, sizeof(cur_name), "%.*s", MAX_NAME - 1, g_my_name);
     pthread_mutex_unlock(&g_mtx);
     if (cur_id <= 0) {
@@ -2688,6 +2750,8 @@ static void on_room_info_activate(GtkMenuItem *item, gpointer data) {
     req.mtype = ARBITER_TYPE;
     req.cmd = CMD_ROOM_INFO;
     req.sender_id = cur_id;
+
+    req.session_token = cur_tok;
     req.reply_type = g_reply_type;
     snprintf(req.name, sizeof(req.name), "%.*s", MAX_NAME - 1, rname);
 
@@ -2833,6 +2897,8 @@ static void on_room_info_activate(GtkMenuItem *item, gpointer data) {
         treq.mtype = ARBITER_TYPE;
         treq.cmd = CMD_ROOM_TOPIC;
         treq.sender_id = cur_id;
+
+        treq.session_token = cur_tok;
         treq.reply_type = g_reply_type;
         snprintf(treq.name, sizeof(treq.name), "%.*s", MAX_NAME - 1, rname);
         if (new_topic != NULL) {
@@ -3243,7 +3309,9 @@ static gboolean ui_handle_event(gpointer user_data) {
         pthread_mutex_lock(&g_mtx);
         g_my_id = 0;
         g_is_debug = 0;
+
         g_my_name[0] = '\0';
+        g_session_token = 0;
         pthread_mutex_unlock(&g_mtx);
         ui_set_connected_state(0, "", 0, 0);
         gtk_widget_set_sensitive(w_auth_user, FALSE);
@@ -3445,7 +3513,9 @@ static void *heartbeat_worker(void *arg) {
         poll_ticks++;
 
         pthread_mutex_lock(&g_mtx);
+
         long my_id = g_my_id;
+        uint64_t my_tok = g_session_token;
         pthread_mutex_unlock(&g_mtx);
 
         if (my_id <= 0) {
@@ -3461,6 +3531,8 @@ static void *heartbeat_worker(void *arg) {
             memset(&hb, 0, sizeof(hb));
             hb.mtype = ARBITER_TYPE;
             hb.cmd = CMD_HEARTBEAT;
+
+            hb.session_token = my_tok;
             hb.sender_id = my_id;
             if (msgsnd(g_msqid, &hb, MSG_SIZE, IPC_NOWAIT) < 0 && errno != EINTR && errno != EAGAIN) {
                 g_running = 0;
@@ -3480,6 +3552,8 @@ static void *heartbeat_worker(void *arg) {
             req.mtype = ARBITER_TYPE;
             req.cmd = CMD_WHO;
             req.sender_id = my_id;
+
+            req.session_token = my_tok;
             req.reply_type = g_who_reply_type;
 
             if (msgsnd(g_msqid, &req, MSG_SIZE, IPC_NOWAIT) == 0) {
@@ -3507,6 +3581,8 @@ static void *heartbeat_worker(void *arg) {
             req.mtype = ARBITER_TYPE;
             req.cmd = CMD_ROOM_LIST;
             req.sender_id = my_id;
+
+            req.session_token = my_tok;
             req.reply_type = g_who_reply_type;
 
             if (msgsnd(g_msqid, &req, MSG_SIZE, IPC_NOWAIT) == 0) {
@@ -3533,6 +3609,35 @@ static void *heartbeat_worker(void *arg) {
     drain_type(g_msqid, g_who_reply_type);
     return NULL;
 }
+
+static void ui_stop_auth_lock_timer(void) {
+    if (g_auth_lock_timer_id > 0) {
+        g_source_remove(g_auth_lock_timer_id);
+        g_auth_lock_timer_id = 0;
+    }
+    g_auth_lock_secs = 0;
+}
+
+static gboolean ui_auth_lock_tick(gpointer data) {
+    (void)data;
+    if (!g_running || w_auth_err == NULL) {
+        g_auth_lock_timer_id = 0;
+        g_auth_lock_secs = 0;
+        return G_SOURCE_REMOVE;
+    }
+    if (g_auth_lock_secs > 1) {
+        g_auth_lock_secs--;
+        char buf[64];
+        snprintf(buf, sizeof(buf), "too many attempts, wait %ds", g_auth_lock_secs);
+        gtk_label_set_text(GTK_LABEL(w_auth_err), buf);
+        return G_SOURCE_CONTINUE;
+    }
+    g_auth_lock_secs = 0;
+    g_auth_lock_timer_id = 0;
+    gtk_label_set_text(GTK_LABEL(w_auth_err), "");
+    return G_SOURCE_REMOVE;
+}
+
 
 static void do_auth(int is_login) {
     pthread_mutex_lock(&g_mtx);
@@ -3583,6 +3688,8 @@ static void do_auth(int is_login) {
     rep.text[MAX_TEXT - 1] = '\0';
 
     if (rep.target_id > 0) {
+
+        ui_stop_auth_lock_timer();
         int is_dbg = (rep.sender_id != 0);
         int saved_theme = (int)rep.msg_id;
         if (saved_theme < 0 || saved_theme >= THEME_COUNT) {
@@ -3593,7 +3700,9 @@ static void do_auth(int is_login) {
         g_my_id = rep.target_id;
         g_is_debug = is_dbg;
         g_next_msg_id = 1;
+
         snprintf(g_my_name, sizeof(g_my_name), "%.*s", MAX_NAME - 1, name);
+        g_session_token = rep.session_token;
         pthread_mutex_unlock(&g_mtx);
 
         g_suppress_theme_save = 1;
@@ -3615,16 +3724,29 @@ static void do_auth(int is_login) {
             memset(&hreq, 0, sizeof(hreq));
             hreq.mtype = ARBITER_TYPE;
             hreq.cmd = CMD_HISTORY;
+
+            hreq.session_token = rep.session_token;
             hreq.sender_id = rep.target_id;
             hreq.reply_type = 0;
             msgsnd(g_msqid, &hreq, MSG_SIZE, IPC_NOWAIT);
         }
+
     } else {
-        char info[MAX_TEXT + 32];
-        snprintf(info, sizeof(info), "%s", rep.text[0] != '\0' ? rep.text : "Auth failed");
-        gtk_label_set_text(GTK_LABEL(w_auth_err), info);
+        ui_stop_auth_lock_timer();
+        int wait_sec = 0;
+        if (sscanf(rep.text, "too many attempts, wait %ds", &wait_sec) == 1 && wait_sec > 0) {
+            g_auth_lock_secs = wait_sec;
+            char info[64];
+            snprintf(info, sizeof(info), "too many attempts, wait %ds", g_auth_lock_secs);
+            gtk_label_set_text(GTK_LABEL(w_auth_err), info);
+            g_auth_lock_timer_id = g_timeout_add(1000, ui_auth_lock_tick, NULL);
+        } else {
+            char info[MAX_TEXT + 32];
+            snprintf(info, sizeof(info), "%s", rep.text[0] != '\0' ? rep.text : "Auth failed");
+            gtk_label_set_text(GTK_LABEL(w_auth_err), info);
+        }
     }
-}
+    }
 
 static void on_login_clicked(GtkWidget *widget, gpointer data) {
     (void)widget;
@@ -3666,7 +3788,9 @@ static void on_send_clicked(GtkWidget *widget, gpointer data) {
     (void)data;
 
     pthread_mutex_lock(&g_mtx);
+
     long cur_id = g_my_id;
+    uint64_t cur_tok = g_session_token;
     char cur_name[MAX_NAME];
     snprintf(cur_name, sizeof(cur_name), "%.*s", MAX_NAME - 1, g_my_name);
     pthread_mutex_unlock(&g_mtx);
@@ -3702,6 +3826,8 @@ static void on_send_clicked(GtkWidget *widget, gpointer data) {
         req.mtype = ARBITER_TYPE;
         req.cmd = CMD_MSG_EDIT;
         req.sender_id = cur_id;
+
+        req.session_token = cur_tok;
         req.reply_type = g_reply_type;
         req.target_id = g_active_is_room ? 1 : 0;
         req.msg_id = g_edit_msg_id;
@@ -3750,6 +3876,8 @@ static void on_send_clicked(GtkWidget *widget, gpointer data) {
         req.cmd = CMD_ROOM_MSG;
         req.sender_id = cur_id;
         req.msg_id = msg_id;
+
+        req.session_token = cur_tok;
         req.reply_type = g_reply_type;
         snprintf(req.name, sizeof(req.name), "%.*s", MAX_NAME - 2, rname);
 
@@ -3813,6 +3941,8 @@ static void on_send_clicked(GtkWidget *widget, gpointer data) {
     chat.cmd = CMD_CHAT;
     chat.sender_id = cur_id;
     chat.msg_id = msg_id;
+
+    chat.session_token = cur_tok;
     chat.reply_type = g_reply_type;
     snprintf(chat.name, sizeof(chat.name), "%.*s", MAX_NAME - 1, target);
     snprintf(chat.sender_name, sizeof(chat.sender_name), "%.*s", MAX_NAME - 1, cur_name);
@@ -3868,7 +3998,9 @@ static void on_send_clicked(GtkWidget *widget, gpointer data) {
 
 static void do_send_attachment(int images_only) {
     pthread_mutex_lock(&g_mtx);
+
     long cur_id = g_my_id;
+    uint64_t cur_tok = g_session_token;
     char cur_name[MAX_NAME];
     snprintf(cur_name, sizeof(cur_name), "%.*s", MAX_NAME - 1, g_my_name);
     pthread_mutex_unlock(&g_mtx);
@@ -3951,6 +4083,8 @@ static void do_send_attachment(int images_only) {
     req.cmd = CMD_FILE_SEND;
     req.sender_id = cur_id;
     req.msg_id = msg_id;
+
+    req.session_token = cur_tok;
     req.reply_type = g_reply_type;
     req.target_id = shmid;
     req.timestamp = fsize;
@@ -4068,6 +4202,8 @@ static void on_window_destroy(GtkWidget *widget, gpointer data) {
     w_chat_view = NULL;
     w_chat_header = NULL;
 
+    w_auth_err = NULL;
+
     w_menu_btn = NULL;
     w_menu_popover = NULL;
     w_acct_info_lbl = NULL;
@@ -4114,6 +4250,8 @@ static void on_window_destroy(GtkWidget *widget, gpointer data) {
         g_source_remove(g_typing_timer_id);
         g_typing_timer_id = 0;
     }
+
+    ui_stop_auth_lock_timer();
     send_logout();
 
 
@@ -4535,7 +4673,8 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    g_msqid = msgget(key, 0666);
+
+    g_msqid = msgget(key, 0600);
     if (g_msqid < 0) {
         GtkWidget *dlg = gtk_message_dialog_new(
             NULL,
