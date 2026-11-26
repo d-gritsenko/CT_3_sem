@@ -2,6 +2,8 @@
 
 #include <errno.h>
 #include <gtk/gtk.h>
+
+#include <gdk/gdkkeysyms.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
@@ -30,7 +32,9 @@ enum ui_event_kind {
     EV_WHO = 4,
     EV_ROOM_MSG = 5,
     EV_ROOMS = 6,
-    EV_HISTORY_ITEM = 7
+
+    EV_HISTORY_ITEM = 7,
+    EV_TYPING = 8
 };
 
 struct ui_event {
@@ -66,6 +70,9 @@ struct dialog_entry {
 
     GtkTextChildAnchor *file_anchors[MAX_FILE_ANCHORS];
     int file_anchor_count;
+
+    char typing_user[MAX_NAME];
+    time_t typing_until;
 };
 
 struct room_list_item {
@@ -170,6 +177,13 @@ static GtkCssProvider *g_css_provider = NULL;
 static int g_font_size = 11;
 
 static int g_manual_font_size = 0;
+
+static time_t g_last_typing_sent = 0;
+static char g_last_typing_peer[MAX_NAME] = "";
+static int g_last_typing_is_room = 0;
+static guint g_typing_timer_id = 0;
+
+static int g_search_cur = -1;
 static GtkTextBuffer *g_sys_buf = NULL;
 static struct dialog_entry g_dialogs[MAX_DIALOGS];
 static char g_active_peer[MAX_NAME] = "";
@@ -200,9 +214,15 @@ static GtkWidget *w_theme_combo = NULL;
 static GtkWidget *w_chat_header = NULL;
 static GtkWidget *w_chat_menu_btn = NULL;
 static GtkWidget *w_chat_menu = NULL;
+
+static GtkWidget *w_mi_search = NULL;
 static GtkWidget *w_mi_leave = NULL;
 static GtkWidget *w_mi_delete = NULL;
 static GtkWidget *w_chat_view = NULL;
+
+static GtkWidget *w_search_bar = NULL;
+static GtkWidget *w_search_entry = NULL;
+static GtkWidget *w_search_count_lbl = NULL;
 
 static GtkWidget *w_tab_users = NULL;
 static GtkWidget *w_tab_rooms = NULL;
@@ -326,6 +346,48 @@ static void send_mark_read(const char *peer, int is_room) {
     msgsnd(g_msqid, &req, MSG_SIZE, IPC_NOWAIT);
 }
 
+static void send_typing(void) {
+    if (g_active_peer[0] == '\0' || g_msqid < 0) {
+        return;
+    }
+
+    pthread_mutex_lock(&g_mtx);
+    long my_id = g_my_id;
+    pthread_mutex_unlock(&g_mtx);
+
+    if (my_id <= 0) {
+        return;
+    }
+
+    time_t now = time(NULL);
+    if ((now - g_last_typing_sent) < 2 &&
+        g_last_typing_is_room == g_active_is_room &&
+        strcmp(g_last_typing_peer, g_active_peer) == 0) {
+        return;
+    }
+
+    g_last_typing_sent = now;
+    g_last_typing_is_room = g_active_is_room;
+    snprintf(g_last_typing_peer, sizeof(g_last_typing_peer), "%.*s", MAX_NAME - 1, g_active_peer);
+
+    struct qmsg req;
+    memset(&req, 0, sizeof(req));
+    req.mtype = ARBITER_TYPE;
+    req.cmd = CMD_TYPING;
+    req.sender_id = my_id;
+    req.target_id = g_active_is_room ? 1 : 0;
+    snprintf(req.name, sizeof(req.name), "%.*s", MAX_NAME - 1, g_active_peer);
+    msgsnd(g_msqid, &req, MSG_SIZE, IPC_NOWAIT);
+}
+
+static void on_msg_entry_changed(GtkEditable *editable, gpointer data) {
+    (void)data;
+    const char *txt = gtk_entry_get_text(GTK_ENTRY(editable));
+    if (txt != NULL && txt[0] != '\0') {
+        send_typing();
+    }
+}
+
 
 static void apply_buffer_theme(GtkTextBuffer *buf) {
     if (buf == NULL) {
@@ -356,6 +418,13 @@ static void apply_buffer_theme(GtkTextBuffer *buf) {
     if ((tag = gtk_text_tag_table_lookup(table, "sys")) != NULL) {
         g_object_set(tag, "foreground", t->sys, NULL);
     }
+
+    if ((tag = gtk_text_tag_table_lookup(table, "search_hit")) != NULL) {
+        g_object_set(tag, "background", t->row_sel_bg, "foreground", t->row_sel_fg, NULL);
+    }
+    if ((tag = gtk_text_tag_table_lookup(table, "search_cur")) != NULL) {
+        g_object_set(tag, "background", t->accent, "foreground", t->btn_fg, NULL);
+    }
 }
 
 static GtkTextBuffer *create_chat_buffer(void) {
@@ -368,6 +437,9 @@ static GtkTextBuffer *create_chat_buffer(void) {
     gtk_text_buffer_create_tag(buf, "warn", "foreground", t->warn, NULL);
     gtk_text_buffer_create_tag(buf, "err", "foreground", t->err, "weight", PANGO_WEIGHT_BOLD, NULL);
     gtk_text_buffer_create_tag(buf, "sys", "foreground", t->sys, NULL);
+
+    gtk_text_buffer_create_tag(buf, "search_hit", "background", t->row_sel_bg, "foreground", t->row_sel_fg, NULL);
+    gtk_text_buffer_create_tag(buf, "search_cur", "background", t->accent, "foreground", t->btn_fg, "weight", PANGO_WEIGHT_BOLD, NULL);
     return buf;
 }
 
@@ -1140,6 +1212,7 @@ static void ui_mark_all_delivered(const char *peer) {
     }
 }
 
+
 static void ui_update_chat_header(void) {
     if (w_chat_header == NULL) {
         return;
@@ -1153,15 +1226,26 @@ static void ui_update_chat_header(void) {
         return;
     }
 
-    char header[MAX_NAME + 64];
+    time_t now = time(NULL);
+    char header[MAX_NAME * 2 + 96];
     if (g_active_is_room) {
         struct dialog_entry *d = find_dialog(g_active_peer, 1);
         int members = (d != NULL && d->member_count > 0) ? d->member_count : 1;
-        snprintf(header, sizeof(header), "#%s (%d %s)", g_active_peer, members, members == 1 ? "member" : "members");
+        if (d != NULL && d->typing_until > now && d->typing_user[0] != '\0') {
+            snprintf(header, sizeof(header), "#%s (%d %s) — %s is typing...",
+                     g_active_peer, members, members == 1 ? "member" : "members", d->typing_user);
+        } else {
+            snprintf(header, sizeof(header), "#%s (%d %s)", g_active_peer, members, members == 1 ? "member" : "members");
+        }
         gtk_label_set_text(GTK_LABEL(w_chat_header), header);
     } else {
+        struct dialog_entry *d = find_dialog(g_active_peer, 0);
         int online = is_user_online(g_active_peer);
-        snprintf(header, sizeof(header), "Chat with %s (%s)", g_active_peer, online ? "online" : "offline");
+        if (d != NULL && d->typing_until > now) {
+            snprintf(header, sizeof(header), "Chat with %s — typing...", g_active_peer);
+        } else {
+            snprintf(header, sizeof(header), "Chat with %s (%s)", g_active_peer, online ? "online" : "offline");
+        }
         gtk_label_set_text(GTK_LABEL(w_chat_header), header);
     }
 
@@ -1170,6 +1254,166 @@ static void ui_update_chat_header(void) {
     }
 }
 
+static gboolean ui_typing_tick(gpointer data) {
+    (void)data;
+    if (!g_running) {
+        return G_SOURCE_REMOVE;
+    }
+    time_t now = time(NULL);
+    int need_header = 0;
+    for (int i = 0; i < MAX_DIALOGS; i++) {
+        if (g_dialogs[i].used && g_dialogs[i].typing_until > 0 && now >= g_dialogs[i].typing_until) {
+            g_dialogs[i].typing_until = 0;
+            g_dialogs[i].typing_user[0] = '\0';
+            if (g_active_is_room == g_dialogs[i].is_room &&
+                strcmp(g_active_peer, g_dialogs[i].peer) == 0) {
+                need_header = 1;
+            }
+        }
+    }
+    if (need_header) {
+        ui_update_chat_header();
+    }
+    return G_SOURCE_CONTINUE;
+}
+
+static void ui_clear_search_tags(GtkTextBuffer *buf) {
+    if (buf == NULL) {
+        return;
+    }
+    GtkTextIter start;
+    GtkTextIter end;
+    gtk_text_buffer_get_bounds(buf, &start, &end);
+    gtk_text_buffer_remove_tag_by_name(buf, "search_hit", &start, &end);
+    gtk_text_buffer_remove_tag_by_name(buf, "search_cur", &start, &end);
+}
+
+static void ui_search_run(int jump_dir) {
+    if (w_chat_view == NULL || w_search_entry == NULL || w_search_count_lbl == NULL) {
+        return;
+    }
+    GtkTextBuffer *buf = gtk_text_view_get_buffer(GTK_TEXT_VIEW(w_chat_view));
+    if (buf == NULL) {
+        return;
+    }
+    ui_clear_search_tags(buf);
+
+    const char *query = gtk_entry_get_text(GTK_ENTRY(w_search_entry));
+    if (query == NULL || query[0] == '\0') {
+
+        g_search_cur = -1;
+        gtk_label_set_text(GTK_LABEL(w_search_count_lbl), "");
+        return;
+    }
+
+    GtkTextIter iter;
+    GtkTextIter m_start;
+    GtkTextIter m_end;
+    gtk_text_buffer_get_start_iter(buf, &iter);
+
+    int total = 0;
+    while (gtk_text_iter_forward_search(&iter, query, GTK_TEXT_SEARCH_CASE_INSENSITIVE, &m_start, &m_end, NULL)) {
+        gtk_text_buffer_apply_tag_by_name(buf, "search_hit", &m_start, &m_end);
+        total++;
+        iter = m_end;
+    }
+
+    if (total == 0) {
+        g_search_cur = -1;
+        gtk_label_set_text(GTK_LABEL(w_search_count_lbl), "0 / 0");
+        return;
+    }
+
+    if (jump_dir == 0 || g_search_cur < 0 || g_search_cur >= total) {
+        g_search_cur = total - 1;
+    } else if (jump_dir < 0) {
+        g_search_cur = (g_search_cur - 1 + total) % total;
+    } else {
+        g_search_cur = (g_search_cur + 1) % total;
+    }
+
+    gtk_text_buffer_get_start_iter(buf, &iter);
+    int idx = 0;
+    while (gtk_text_iter_forward_search(&iter, query, GTK_TEXT_SEARCH_CASE_INSENSITIVE, &m_start, &m_end, NULL)) {
+        if (idx == g_search_cur) {
+            gtk_text_buffer_apply_tag_by_name(buf, "search_cur", &m_start, &m_end);
+            gtk_text_view_scroll_to_iter(GTK_TEXT_VIEW(w_chat_view), &m_start, 0.1, TRUE, 0.0, 0.5);
+            break;
+        }
+        idx++;
+        iter = m_end;
+    }
+
+    char cnt[32];
+    snprintf(cnt, sizeof(cnt), "%d / %d", g_search_cur + 1, total);
+    gtk_label_set_text(GTK_LABEL(w_search_count_lbl), cnt);
+}
+
+static void ui_close_search(void) {
+    if (w_chat_view != NULL) {
+        ui_clear_search_tags(gtk_text_view_get_buffer(GTK_TEXT_VIEW(w_chat_view)));
+    }
+
+    g_search_cur = -1;
+    if (w_search_entry != NULL) {
+        gtk_entry_set_text(GTK_ENTRY(w_search_entry), "");
+    }
+    if (w_search_count_lbl != NULL) {
+        gtk_label_set_text(GTK_LABEL(w_search_count_lbl), "");
+    }
+    if (w_search_bar != NULL) {
+        gtk_widget_set_visible(w_search_bar, FALSE);
+    }
+    if (g_active_peer[0] != '\0' && w_msg_entry != NULL) {
+        gtk_widget_grab_focus(w_msg_entry);
+    }
+}
+
+static void on_search_menu_activate(GtkMenuItem *item, gpointer data) {
+    (void)item;
+    (void)data;
+    if (w_search_bar == NULL || w_search_entry == NULL || g_active_peer[0] == '\0') {
+        return;
+    }
+    gtk_widget_set_visible(w_search_bar, TRUE);
+    gtk_widget_grab_focus(w_search_entry);
+    gtk_editable_select_region(GTK_EDITABLE(w_search_entry), 0, -1);
+}
+
+static void on_search_entry_changed(GtkEditable *editable, gpointer data) {
+    (void)editable;
+    (void)data;
+    ui_search_run(0);
+}
+
+static void on_search_prev_clicked(GtkWidget *widget, gpointer data) {
+    (void)widget;
+    (void)data;
+    ui_search_run(-1);
+}
+
+static void on_search_next_clicked(GtkWidget *widget, gpointer data) {
+    (void)widget;
+    (void)data;
+    ui_search_run(1);
+}
+
+static void on_search_close_clicked(GtkWidget *widget, gpointer data) {
+    (void)widget;
+    (void)data;
+    ui_close_search();
+}
+
+
+static gboolean on_search_entry_key_press(GtkWidget *widget, GdkEventKey *event, gpointer data) {
+    (void)widget;
+    (void)data;
+    if (event != NULL && event->keyval == GDK_KEY_Escape) {
+        ui_close_search();
+        return TRUE;
+    }
+    return FALSE;
+}
 static void ui_update_tab_labels(void) {
     if (w_tab_users == NULL || w_tab_rooms == NULL) {
         return;
@@ -1248,7 +1492,9 @@ static void ui_switch_dialog(const char *peer, int is_room, int set_target) {
     (void)set_target;
     if (w_chat_view == NULL) {
         return;
+
     }
+    ui_close_search();
 
     if (peer == NULL || peer[0] == '\0') {
         g_active_peer[0] = '\0';
@@ -1821,6 +2067,10 @@ static void on_chat_menu_clicked(GtkWidget *widget, gpointer data) {
         gtk_menu_item_set_label(GTK_MENU_ITEM(w_mi_delete), "Delete Chat");
     }
     gtk_widget_show(w_mi_delete);
+
+    if (w_mi_search != NULL) {
+        gtk_widget_show(w_mi_search);
+    }
     gtk_menu_popup_at_widget(
         GTK_MENU(w_chat_menu),
         widget,
@@ -2036,6 +2286,14 @@ static gboolean ui_handle_event(gpointer user_data) {
 
             ui_append_dialog_line_ts(d, (time_t)ev->timestamp, "incoming", prefix, ev->text);
 
+            if (d->typing_until > 0 && strcmp(d->typing_user, ev->sender) == 0) {
+                d->typing_until = 0;
+                d->typing_user[0] = '\0';
+                if (!g_active_is_room && strcmp(g_active_peer, d->peer) == 0) {
+                    ui_update_chat_header();
+                }
+            }
+
             if (!g_active_is_room && strcmp(g_active_peer, d->peer) == 0) {
                 send_read_ack(ev->msg_id, ev->sender);
 
@@ -2085,6 +2343,14 @@ static gboolean ui_handle_event(gpointer user_data) {
 
                 ui_append_dialog_line_ts(d, (time_t)ev->timestamp, "incoming", prefix, ev->text);
 
+                if (d->typing_until > 0 && strcmp(d->typing_user, ev->sender) == 0) {
+                    d->typing_until = 0;
+                    d->typing_user[0] = '\0';
+                    if (g_active_is_room && strcmp(g_active_peer, d->peer) == 0) {
+                        ui_update_chat_header();
+                    }
+                }
+
                 if (g_active_is_room && strcmp(g_active_peer, d->peer) == 0) {
                     send_read_ack(ev->msg_id, ev->sender);
 
@@ -2103,6 +2369,16 @@ static gboolean ui_handle_event(gpointer user_data) {
             ui_mark_all_delivered(ev->sender);
         } else {
             ui_mark_delivered(ev->msg_id);
+        }
+
+    } else if (ev->kind == EV_TYPING) {
+        struct dialog_entry *d = find_dialog(ev->room, ev->is_room);
+        if (d != NULL) {
+            d->typing_until = time(NULL) + 3;
+            snprintf(d->typing_user, sizeof(d->typing_user), "%.*s", MAX_NAME - 1, ev->sender);
+            if (g_active_is_room == ev->is_room && strcmp(g_active_peer, d->peer) == 0) {
+                ui_update_chat_header();
+            }
         }
     } else if (ev->kind == EV_WHO) {
         ui_update_users_list(ev->msg_id, ev->text);
@@ -2195,6 +2471,19 @@ static void *recv_worker(void *arg) {
                 if (ev != NULL) {
                     ev->kind = EV_ACK;
                     ev->msg_id = msg.msg_id;
+                    copy_utf8_safe(ev->sender, sizeof(ev->sender), msg.sender_name);
+                    g_idle_add(ui_handle_event, ev);
+                }
+
+
+            } else if (msg.cmd == CMD_TYPING) {
+                msg.sender_name[MAX_NAME - 1] = '\0';
+
+                struct ui_event *ev = calloc(1, sizeof(*ev));
+                if (ev != NULL) {
+                    ev->kind = EV_TYPING;
+                    ev->is_room = (msg.target_id != 0);
+                    copy_utf8_safe(ev->room, sizeof(ev->room), msg.name);
                     copy_utf8_safe(ev->sender, sizeof(ev->sender), msg.sender_name);
                     g_idle_add(ui_handle_event, ev);
                 }
@@ -2784,6 +3073,11 @@ static void on_window_destroy(GtkWidget *widget, gpointer data) {
     w_acct_info_lbl = NULL;
     w_scale_combo = NULL;
     w_chat_menu_btn = NULL;
+
+    w_mi_search = NULL;
+    w_search_bar = NULL;
+    w_search_entry = NULL;
+    w_search_count_lbl = NULL;
     w_mi_leave = NULL;
     w_mi_delete = NULL;
     w_new_chat_btn = NULL;
@@ -2803,6 +3097,11 @@ static void on_window_destroy(GtkWidget *widget, gpointer data) {
 
 
     w_sidebar = NULL;
+
+    if (g_typing_timer_id > 0) {
+        g_source_remove(g_typing_timer_id);
+        g_typing_timer_id = 0;
+    }
     send_logout();
 
 
@@ -2973,6 +3272,10 @@ static void build_ui(void) {
     gtk_widget_set_halign(w_chat_header, GTK_ALIGN_START);
 
     w_chat_menu = gtk_menu_new();
+
+    w_mi_search = gtk_menu_item_new_with_label("🔍  Search");
+    g_signal_connect(w_mi_search, "activate", G_CALLBACK(on_search_menu_activate), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(w_chat_menu), w_mi_search);
     w_mi_leave = gtk_menu_item_new_with_label("Leave Room");
     w_mi_delete = gtk_menu_item_new_with_label("Delete Chat");
     g_signal_connect(w_mi_leave, "activate", G_CALLBACK(on_leave_room_clicked), NULL);
@@ -2988,6 +3291,38 @@ static void build_ui(void) {
     gtk_box_pack_start(GTK_BOX(header_bar), w_chat_header, TRUE, TRUE, 0);
     gtk_box_pack_end(GTK_BOX(header_bar), w_chat_menu_btn, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(chat_col), header_bar, FALSE, FALSE, 0);
+
+    w_search_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+
+    w_search_entry = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(w_search_entry), "Search in chat...");
+    g_signal_connect(w_search_entry, "changed", G_CALLBACK(on_search_entry_changed), NULL);
+    g_signal_connect(w_search_entry, "activate", G_CALLBACK(on_search_prev_clicked), NULL);
+    g_signal_connect(w_search_entry, "key-press-event", G_CALLBACK(on_search_entry_key_press), NULL);
+
+    w_search_count_lbl = gtk_label_new("");
+
+    GtkWidget *s_prev = gtk_button_new_with_label("▲");
+    gtk_widget_set_tooltip_text(s_prev, "Previous match");
+    gtk_style_context_add_class(gtk_widget_get_style_context(s_prev), "tab-btn");
+    g_signal_connect(s_prev, "clicked", G_CALLBACK(on_search_prev_clicked), NULL);
+
+    GtkWidget *s_next = gtk_button_new_with_label("▼");
+    gtk_widget_set_tooltip_text(s_next, "Next match");
+    gtk_style_context_add_class(gtk_widget_get_style_context(s_next), "tab-btn");
+    g_signal_connect(s_next, "clicked", G_CALLBACK(on_search_next_clicked), NULL);
+
+    GtkWidget *s_close = gtk_button_new_with_label("✕");
+    gtk_widget_set_tooltip_text(s_close, "Close search");
+    gtk_style_context_add_class(gtk_widget_get_style_context(s_close), "tab-btn");
+    g_signal_connect(s_close, "clicked", G_CALLBACK(on_search_close_clicked), NULL);
+
+    gtk_box_pack_start(GTK_BOX(w_search_bar), w_search_entry, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(w_search_bar), w_search_count_lbl, FALSE, FALSE, 4);
+    gtk_box_pack_start(GTK_BOX(w_search_bar), s_prev, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(w_search_bar), s_next, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(w_search_bar), s_close, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(chat_col), w_search_bar, FALSE, FALSE, 0);
 
     GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
@@ -3106,6 +3441,8 @@ static void build_ui(void) {
     gtk_entry_set_max_length(GTK_ENTRY(w_msg_entry), MAX_TEXT - 1);
     g_signal_connect(w_msg_entry, "activate", G_CALLBACK(on_send_clicked), NULL);
 
+    g_signal_connect(w_msg_entry, "changed", G_CALLBACK(on_msg_entry_changed), NULL);
+
     w_send_btn = gtk_button_new_with_label("Send");
     g_signal_connect(w_send_btn, "clicked", G_CALLBACK(on_send_clicked), NULL);
 
@@ -3120,6 +3457,8 @@ static void build_ui(void) {
     gtk_widget_show_all(w_window);
     ui_select_sidebar_tab("users");
     ui_set_connected_state(0, "", 0, 0);
+
+    g_typing_timer_id = g_timeout_add(1000, ui_typing_tick, NULL);
 }
 
 int main(int argc, char *argv[]) {

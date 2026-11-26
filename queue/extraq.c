@@ -800,6 +800,58 @@ static int run_arbiter(int msqid) {
                 }
             }
 
+        } else if (msg.cmd == CMD_TYPING) {
+            msg.name[MAX_NAME - 1] = '\0';
+            int cidx = find_client_by_id(clients, msg.sender_id);
+            if (cidx >= 0 && clients[cidx].active && msg.name[0] != '\0') {
+                clients[cidx].last_seen = time(NULL);
+                if (msg.target_id != 0) {
+                    for (int i = 0; i < MAX_ROOMS; i++) {
+                        if (rooms[i].used && strcmp(rooms[i].name, msg.name) == 0) {
+                            int in_room = 0;
+                            for (int j = 0; j < rooms[i].member_count; j++) {
+                                if (rooms[i].members[j] == msg.sender_id) {
+                                    in_room = 1;
+                                    break;
+                                }
+                            }
+                            if (in_room) {
+                                for (int j = 0; j < rooms[i].member_count; j++) {
+                                    long mid = rooms[i].members[j];
+                                    if (mid == msg.sender_id) {
+                                        continue;
+                                    }
+                                    int midx = find_client_by_id(clients, mid);
+                                    if (midx >= 0 && clients[midx].active) {
+                                        struct qmsg out;
+                                        memset(&out, 0, sizeof(out));
+                                        out.mtype = mid;
+                                        out.cmd = CMD_TYPING;
+                                        out.target_id = 1;
+                                        snprintf(out.name, sizeof(out.name), "%.*s", MAX_NAME - 1, rooms[i].name);
+                                        snprintf(out.sender_name, sizeof(out.sender_name), "%.*s", MAX_NAME - 1, clients[cidx].name);
+                                        msgsnd(msqid, &out, MSG_SIZE, IPC_NOWAIT);
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                    }
+                } else {
+                    int tidx = find_client_by_name(clients, msg.name);
+                    if (tidx >= 0 && clients[tidx].active && tidx != cidx) {
+                        struct qmsg out;
+                        memset(&out, 0, sizeof(out));
+                        out.mtype = clients[tidx].id;
+                        out.cmd = CMD_TYPING;
+                        out.target_id = 0;
+                        snprintf(out.name, sizeof(out.name), "%.*s", MAX_NAME - 1, clients[cidx].name);
+                        snprintf(out.sender_name, sizeof(out.sender_name), "%.*s", MAX_NAME - 1, clients[cidx].name);
+                        msgsnd(msqid, &out, MSG_SIZE, IPC_NOWAIT);
+                    }
+                }
+            }
+
         } else if (msg.cmd == CMD_FILE_SEND) {
             msg.name[MAX_NAME - 1] = '\0';
             msg.text[MAX_TEXT - 1] = '\0';
