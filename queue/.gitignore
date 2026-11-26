@@ -15,4 +15,4 @@ users.db-journal
 users.db-wal
 users.db-shm
 uploads/
-downloads/
+downloads/arbiter.log

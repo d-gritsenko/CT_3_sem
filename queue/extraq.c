@@ -15,6 +15,8 @@
 
 #include <sys/stat.h>
 #include <sys/types.h>
+
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -25,6 +27,8 @@
 #define BACKLOG_TMP  "chat_backlog.dat.tmp"
 #define BACKLOG_MAGIC 0x51424B4CU
 #define BACKLOG_VERSION 1U
+
+#define ARBITER_LOG_PATH "arbiter.log"
 
 #define MAX_HISTORY_LOAD 64
 #define MAX_ROOM_HISTORY_LOAD 32
@@ -2700,9 +2704,215 @@ static int run_client(int msqid) {
 }
 
 
+
+static void write_pid_to_lock(int lock_fd) {
+
+    if (ftruncate(lock_fd, 0) == 0) {
+        lseek(lock_fd, 0, SEEK_SET);
+        char buf[32];
+        int len = snprintf(buf, sizeof(buf), "%ld\n", (long)getpid());
+        if (len > 0) {
+            ssize_t w = write(lock_fd, buf, (size_t)len);
+            (void)w;
+        }
+    }
+}
+
+static long read_pid_from_lock(int fd) {
+    char buf[32];
+    lseek(fd, 0, SEEK_SET);
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    if (n <= 0) {
+        return -1;
+    }
+    buf[n] = '\0';
+    long pid = strtol(buf, NULL, 10);
+    return (pid > 1) ? pid : -1;
+}
+
+static int cmd_status(void) {
+    int fd = open(ARBITER_LOCK_PATH, O_RDONLY);
+    if (fd < 0) {
+        printf("Arbiter is not running.\n");
+        return 1;
+    }
+    if (flock(fd, LOCK_EX | LOCK_NB) == 0) {
+        flock(fd, LOCK_UN);
+        close(fd);
+        printf("Arbiter is not running.\n");
+        return 1;
+    }
+    long pid = read_pid_from_lock(fd);
+    close(fd);
+    if (pid > 0) {
+        printf(CLR_GREEN "Arbiter is running (pid=%ld).\n" CLR_RESET, pid);
+    } else {
+        printf(CLR_GREEN "Arbiter is running.\n" CLR_RESET);
+    }
+    return 0;
+}
+
+static int cmd_stop(void) {
+    int fd = open(ARBITER_LOCK_PATH, O_RDONLY);
+    if (fd < 0) {
+        printf("Arbiter is not running.\n");
+        return 1;
+    }
+    if (flock(fd, LOCK_EX | LOCK_NB) == 0) {
+        flock(fd, LOCK_UN);
+        close(fd);
+        printf("Arbiter is not running.\n");
+        return 1;
+    }
+    long pid = read_pid_from_lock(fd);
+    close(fd);
+    if (pid <= 0) {
+        fprintf(stderr, CLR_RED "! Cannot read arbiter PID.\n" CLR_RESET);
+        return 1;
+    }
+    if (kill((pid_t)pid, SIGTERM) < 0) {
+        perror("kill");
+        return 1;
+    }
+    for (int i = 0; i < 40; i++) {
+        if (kill((pid_t)pid, 0) < 0 && errno == ESRCH) {
+            printf(CLR_YELLOW "Arbiter stopped (pid=%ld).\n" CLR_RESET, pid);
+            return 0;
+        }
+        usleep(50000);
+    }
+    fprintf(stderr, CLR_YELLOW "! Sent SIGTERM to pid=%ld, still shutting down.\n" CLR_RESET, pid);
+    return 0;
+}
+
+static int daemonize_and_run(key_t key) {
+    int pfd[2];
+    if (pipe(pfd) < 0) {
+        perror("pipe");
+        return 1;
+    }
+
+    pid_t p1 = fork();
+    if (p1 < 0) {
+        perror("fork");
+        close(pfd[0]);
+        close(pfd[1]);
+        return 1;
+    }
+
+    if (p1 > 0) {
+        close(pfd[1]);
+        long dpid = -1;
+        ssize_t r = read(pfd[0], &dpid, sizeof(dpid));
+        close(pfd[0]);
+        waitpid(p1, NULL, 0);
+        if (r == (ssize_t)sizeof(dpid) && dpid > 0) {
+            printf(CLR_GREEN "DeepSpeak daemon started (pid=%ld, log=%s)\n" CLR_RESET,
+                   dpid, ARBITER_LOG_PATH);
+            return 0;
+        }
+        fprintf(stderr, CLR_RED "! Failed to start daemon (already running or IPC error).\n" CLR_RESET);
+        return 1;
+    }
+
+    close(pfd[0]);
+    if (setsid() < 0) {
+        long fail = -1;
+        ssize_t w = write(pfd[1], &fail, sizeof(fail));
+        (void)w;
+        close(pfd[1]);
+        _exit(1);
+    }
+
+    signal(SIGHUP, SIG_IGN);
+
+    pid_t p2 = fork();
+    if (p2 < 0) {
+        long fail = -1;
+        ssize_t w = write(pfd[1], &fail, sizeof(fail));
+        (void)w;
+        close(pfd[1]);
+        _exit(1);
+    }
+    if (p2 > 0) {
+        close(pfd[1]);
+        _exit(0);
+    }
+
+    umask(0027);
+
+    int lock_fd = open(ARBITER_LOCK_PATH, O_CREAT | O_RDWR, 0644);
+    if (lock_fd < 0 || flock(lock_fd, LOCK_EX | LOCK_NB) < 0) {
+        if (lock_fd >= 0) {
+            close(lock_fd);
+        }
+        long fail = -1;
+        ssize_t w = write(pfd[1], &fail, sizeof(fail));
+        (void)w;
+        close(pfd[1]);
+        _exit(1);
+    }
+    write_pid_to_lock(lock_fd);
+
+    int msqid = msgget(key, 0666 | IPC_CREAT);
+    if (msqid < 0) {
+        flock(lock_fd, LOCK_UN);
+        close(lock_fd);
+        long fail = -1;
+        ssize_t w = write(pfd[1], &fail, sizeof(fail));
+        (void)w;
+        close(pfd[1]);
+        _exit(1);
+    }
+
+    int devnull = open("/dev/null", O_RDONLY);
+    if (devnull >= 0) {
+        dup2(devnull, STDIN_FILENO);
+        if (devnull > STDERR_FILENO) {
+            close(devnull);
+        }
+    }
+
+    int log_fd = open(ARBITER_LOG_PATH, O_CREAT | O_WRONLY | O_APPEND, 0640);
+    if (log_fd >= 0) {
+        dup2(log_fd, STDOUT_FILENO);
+        dup2(log_fd, STDERR_FILENO);
+        if (log_fd > STDERR_FILENO) {
+            close(log_fd);
+        }
+    }
+
+    long dpid = (long)getpid();
+    ssize_t w = write(pfd[1], &dpid, sizeof(dpid));
+    (void)w;
+    close(pfd[1]);
+
+    int rc = run_arbiter(msqid);
+
+    flock(lock_fd, LOCK_UN);
+    close(lock_fd);
+    unlink(ARBITER_LOCK_PATH);
+    _exit(rc);
+}
+
 int main(int argc, char *argv[]) {
-    if (argc != 2 || (strcasecmp(argv[1], "arbiter") != 0 && strcasecmp(argv[1], "client") != 0)) {
-        fprintf(stderr, "Usage: %s <arbiter|client>\n", argv[0]);
+    if (argc != 2) {
+        fprintf(stderr, "Usage: %s <arbiter|daemon|stop|status|client>\n", argv[0]);
+        return 1;
+    }
+
+    if (strcasecmp(argv[1], "status") == 0) {
+        return cmd_status();
+    }
+    if (strcasecmp(argv[1], "stop") == 0) {
+        return cmd_stop();
+    }
+
+    int is_arbiter = (strcasecmp(argv[1], "arbiter") == 0);
+    int is_daemon = (strcasecmp(argv[1], "daemon") == 0);
+    int is_client = (strcasecmp(argv[1], "client") == 0);
+    if (!is_arbiter && !is_daemon && !is_client) {
+        fprintf(stderr, "Usage: %s <arbiter|daemon|stop|status|client>\n", argv[0]);
         return 1;
     }
 
@@ -2718,10 +2928,13 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    int is_arbiter = (strcasecmp(argv[1], "arbiter") == 0);
+    if (is_daemon) {
+        return daemonize_and_run(key);
+    }
+
     int lock_fd = -1;
     if (is_arbiter) {
-        lock_fd = open(ARBITER_LOCK_PATH, O_CREAT | O_RDWR, 0666);
+        lock_fd = open(ARBITER_LOCK_PATH, O_CREAT | O_RDWR, 0644);
         if (lock_fd < 0) {
             perror("open lock file");
             return 1;
@@ -2735,13 +2948,14 @@ int main(int argc, char *argv[]) {
             close(lock_fd);
             return 1;
         }
+        write_pid_to_lock(lock_fd);
     }
 
     int flags = is_arbiter ? (0666 | IPC_CREAT) : 0666;
     int msqid = msgget(key, flags);
     if (msqid < 0) {
         if (!is_arbiter && errno == ENOENT) {
-            fprintf(stderr, "Arbiter is not running. Start '%s arbiter' first.\n", argv[0]);
+            fprintf(stderr, "Arbiter is not running. Start '%s arbiter' or '%s daemon' first.\n", argv[0], argv[0]);
         } else {
             perror("msgget");
         }
