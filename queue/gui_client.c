@@ -25,6 +25,8 @@
 
 #define MAX_FILE_ANCHORS 64
 
+
+#define MAX_TRACKED_MSGS 256
 enum ui_event_kind {
     EV_CHAT = 1,
     EV_ACK = 2,
@@ -34,13 +36,19 @@ enum ui_event_kind {
     EV_ROOMS = 6,
 
     EV_HISTORY_ITEM = 7,
-    EV_TYPING = 8
+
+    EV_TYPING = 8,
+    EV_MSG_EDIT = 9,
+    EV_MSG_DELETE = 10
 };
 
 struct ui_event {
     int kind;
     int is_room;
     int is_outgoing;
+
+    int is_unread;
+    int is_edited;
     long msg_id;
     long timestamp;
     char room[MAX_NAME];
@@ -51,6 +59,19 @@ struct ui_event {
 struct pending_ack {
     long msg_id;
     char sender[MAX_NAME];
+};
+
+
+struct msg_slot {
+    long msg_id;
+    int is_outgoing;
+    int is_file;
+    char sender[MAX_NAME];
+    char raw_text[MAX_TEXT];
+    GtkTextMark *line_start;
+    GtkTextMark *body_start;
+    GtkTextMark *body_end;
+    GtkTextMark *line_end;
 };
 
 struct dialog_entry {
@@ -73,6 +94,9 @@ struct dialog_entry {
 
     char typing_user[MAX_NAME];
     time_t typing_until;
+
+    struct msg_slot msgs[MAX_TRACKED_MSGS];
+    int msg_count;
 };
 
 struct room_list_item {
@@ -183,6 +207,16 @@ static char g_last_typing_peer[MAX_NAME] = "";
 static int g_last_typing_is_room = 0;
 static guint g_typing_timer_id = 0;
 
+
+static long g_edit_msg_id = 0;
+static char g_edit_reply_prefix[128] = "";
+static char g_reply_author[MAX_NAME] = "";
+static char g_reply_snippet[64] = "";
+
+static long g_ctx_msg_id = 0;
+static char g_ctx_msg_sender[MAX_NAME] = "";
+static char g_ctx_msg_raw[MAX_TEXT] = "";
+
 static int g_search_cur = -1;
 static GtkTextBuffer *g_sys_buf = NULL;
 static struct dialog_entry g_dialogs[MAX_DIALOGS];
@@ -242,10 +276,19 @@ static GtkWidget *w_msg_entry = NULL;
 static GtkWidget *w_send_btn = NULL;
 static GtkWidget *w_file_btn = NULL;
 static GtkWidget *w_attach_menu = NULL;
+
+static GtkWidget *w_compose_bar = NULL;
+static GtkWidget *w_compose_lbl = NULL;
+static GtkWidget *w_msg_menu = NULL;
+static GtkWidget *w_mi_msg_reply = NULL;
+static GtkWidget *w_mi_msg_edit = NULL;
+static GtkWidget *w_mi_msg_delete = NULL;
 static void ui_rebuild_users_list(void);
 static void ui_rebuild_rooms_list(void);
 static void ui_update_tab_labels(void);
 static void ui_update_chat_header(void);
+
+static void ui_cancel_compose(void);
 static void ui_switch_dialog(const char *peer, int is_room, int set_target);
 
 static void ui_append_sys(const char *tag_name, const char *text);
@@ -397,7 +440,14 @@ static void apply_buffer_theme(GtkTextBuffer *buf) {
     GtkTextTagTable *table = gtk_text_buffer_get_tag_table(buf);
     GtkTextTag *tag;
 
+
     if ((tag = gtk_text_tag_table_lookup(table, "time")) != NULL) {
+        g_object_set(tag, "foreground", t->muted, NULL);
+    }
+    if ((tag = gtk_text_tag_table_lookup(table, "quote")) != NULL) {
+        g_object_set(tag, "foreground", t->muted, NULL);
+    }
+    if ((tag = gtk_text_tag_table_lookup(table, "edited")) != NULL) {
         g_object_set(tag, "foreground", t->muted, NULL);
     }
     if ((tag = gtk_text_tag_table_lookup(table, "incoming")) != NULL) {
@@ -431,6 +481,9 @@ static GtkTextBuffer *create_chat_buffer(void) {
     const struct ui_theme *t = current_theme();
     GtkTextBuffer *buf = gtk_text_buffer_new(NULL);
     gtk_text_buffer_create_tag(buf, "time", "foreground", t->muted, NULL);
+
+    gtk_text_buffer_create_tag(buf, "quote", "foreground", t->muted, "style", PANGO_STYLE_ITALIC, NULL);
+    gtk_text_buffer_create_tag(buf, "edited", "foreground", t->muted, "style", PANGO_STYLE_ITALIC, NULL);
     gtk_text_buffer_create_tag(buf, "incoming", "foreground", t->incoming, "weight", PANGO_WEIGHT_BOLD, NULL);
     gtk_text_buffer_create_tag(buf, "outgoing", "foreground", t->outgoing, "weight", PANGO_WEIGHT_BOLD, NULL);
     gtk_text_buffer_create_tag(buf, "ack", "foreground", t->ack, NULL);
@@ -508,7 +561,9 @@ static void apply_css(void) {
 
         "menuitem:hover { background-color: %s; color: %s; }\n"
         "popover, popover.background { background-color: %s; color: %s; border: 1px solid %s; border-radius: 8px; padding: 12px; }\n"
-        ".acct-info { font-weight: bold; color: %s; }\n",
+
+        ".acct-info { font-weight: bold; color: %s; }\n"
+        ".compose-bar { background-color: %s; border: 1px solid %s; border-radius: 6px; padding: 4px 8px; }\n",
         t->win_bg, t->fg, ui_pt,
         t->fg, ui_pt,
         t->chat_bg, t->border,
@@ -550,7 +605,8 @@ static void apply_css(void) {
 
         t->row_sel_bg, t->row_sel_fg,
         t->chat_bg, t->fg, t->border,
-        t->accent
+
+        t->accent, t->entry_bg, t->accent
     );
 
     gtk_css_provider_load_from_data(g_css_provider, css_data, -1, NULL);
@@ -1059,7 +1115,95 @@ static void ui_insert_file_or_text(struct dialog_entry *d, GtkTextBuffer *buf, G
 }
 
 
-static void ui_append_dialog_line_ts(struct dialog_entry *d, time_t ts_val, const char *tag_name, const char *prefix, const char *body) {
+
+static void ui_record_msg_slot(struct dialog_entry *d, long msg_id, int is_outgoing, int is_file,
+                               const char *sender, const char *raw_text,
+                               GtkTextMark *ls, GtkTextMark *bs, GtkTextMark *be, GtkTextMark *le) {
+    if (d == NULL || ls == NULL || bs == NULL || be == NULL || le == NULL) {
+        return;
+    }
+    if (d->msg_count >= MAX_TRACKED_MSGS) {
+        if (d->buf != NULL) {
+            gtk_text_buffer_delete_mark(d->buf, d->msgs[0].line_start);
+            gtk_text_buffer_delete_mark(d->buf, d->msgs[0].body_start);
+            gtk_text_buffer_delete_mark(d->buf, d->msgs[0].body_end);
+            gtk_text_buffer_delete_mark(d->buf, d->msgs[0].line_end);
+        }
+        memmove(&d->msgs[0], &d->msgs[1], sizeof(struct msg_slot) * (MAX_TRACKED_MSGS - 1));
+        d->msg_count = MAX_TRACKED_MSGS - 1;
+    }
+    struct msg_slot *s = &d->msgs[d->msg_count++];
+    memset(s, 0, sizeof(*s));
+    s->msg_id = msg_id;
+    s->is_outgoing = is_outgoing;
+    s->is_file = is_file;
+    snprintf(s->sender, sizeof(s->sender), "%.*s", MAX_NAME - 1, sender != NULL ? sender : "");
+    copy_utf8_safe(s->raw_text, sizeof(s->raw_text), raw_text != NULL ? raw_text : "");
+    s->line_start = ls;
+    s->body_start = bs;
+    s->body_end = be;
+    s->line_end = le;
+}
+
+static void ui_apply_msg_edit(struct dialog_entry *d, long msg_id, const char *new_raw) {
+    if (d == NULL || d->buf == NULL || msg_id <= 0 || new_raw == NULL) {
+        return;
+    }
+    for (int i = 0; i < d->msg_count; i++) {
+        if (d->msgs[i].msg_id == msg_id) {
+            struct msg_slot *slot = &d->msgs[i];
+            copy_utf8_safe(slot->raw_text, sizeof(slot->raw_text), new_raw);
+
+            char rauthor[MAX_NAME];
+            char rsnip[64];
+            const char *display_body = new_raw;
+            if (parse_reply_prefix(new_raw, rauthor, sizeof(rauthor), rsnip, sizeof(rsnip), &display_body)) {
+                /* display_body points past reply prefix */
+            }
+
+            GtkTextIter s;
+            GtkTextIter e;
+            gtk_text_buffer_get_iter_at_mark(d->buf, &s, slot->body_start);
+            gtk_text_buffer_get_iter_at_mark(d->buf, &e, slot->body_end);
+            gtk_text_buffer_delete(d->buf, &s, &e);
+            gtk_text_buffer_insert(d->buf, &s, display_body, -1);
+            gtk_text_buffer_insert_with_tags_by_name(d->buf, &s, " (edited)", -1, "edited", NULL);
+            gtk_text_buffer_move_mark(d->buf, slot->body_end, &s);
+            return;
+        }
+    }
+}
+
+static void ui_apply_msg_delete(struct dialog_entry *d, long msg_id) {
+    if (d == NULL || d->buf == NULL || msg_id <= 0) {
+        return;
+    }
+    for (int i = 0; i < d->msg_count; i++) {
+        if (d->msgs[i].msg_id == msg_id) {
+            struct msg_slot *slot = &d->msgs[i];
+            GtkTextIter s;
+            GtkTextIter e;
+            gtk_text_buffer_get_iter_at_mark(d->buf, &s, slot->line_start);
+            gtk_text_buffer_get_iter_at_mark(d->buf, &e, slot->line_end);
+            gtk_text_buffer_delete(d->buf, &s, &e);
+            gtk_text_buffer_delete_mark(d->buf, slot->line_start);
+            gtk_text_buffer_delete_mark(d->buf, slot->body_start);
+            gtk_text_buffer_delete_mark(d->buf, slot->body_end);
+            gtk_text_buffer_delete_mark(d->buf, slot->line_end);
+            for (int k = i; k < d->msg_count - 1; k++) {
+                d->msgs[k] = d->msgs[k + 1];
+            }
+            d->msg_count--;
+            return;
+        }
+    }
+}
+
+
+static void ui_append_dialog_msg_ts(struct dialog_entry *d, long msg_id, time_t ts_val,
+                                    int is_outgoing, int is_edited,
+                                    const char *tag_name, const char *sender_name,
+                                    const char *prefix, const char *body) {
     if (d == NULL || d->buf == NULL) {
         return;
     }
@@ -1073,6 +1217,16 @@ static void ui_append_dialog_line_ts(struct dialog_entry *d, time_t ts_val, cons
 
     GtkTextIter end;
     gtk_text_buffer_get_end_iter(d->buf, &end);
+    GtkTextMark *ls = gtk_text_buffer_create_mark(d->buf, NULL, &end, TRUE);
+
+    char rauthor[MAX_NAME];
+    char rsnip[64];
+    const char *display_body = (body != NULL) ? body : "";
+    if (parse_reply_prefix(display_body, rauthor, sizeof(rauthor), rsnip, sizeof(rsnip), &display_body)) {
+        char qline[MAX_NAME + 80];
+        snprintf(qline, sizeof(qline), "  ↳ %s: %s\n", rauthor, rsnip);
+        gtk_text_buffer_insert_with_tags_by_name(d->buf, &end, qline, -1, "quote", NULL);
+    }
 
     char ts_str[32];
     snprintf(ts_str, sizeof(ts_str), "[%s] ", ts);
@@ -1082,9 +1236,27 @@ static void ui_append_dialog_line_ts(struct dialog_entry *d, time_t ts_val, cons
         gtk_text_buffer_insert_with_tags_by_name(d->buf, &end, prefix, -1, tag_name, NULL);
     }
 
-    ui_insert_file_or_text(d, d->buf, &end, body);
+    gtk_text_buffer_get_end_iter(d->buf, &end);
+    GtkTextMark *bs = gtk_text_buffer_create_mark(d->buf, NULL, &end, TRUE);
+
+    char dummy_s[96];
+    char dummy_o[96];
+    int is_file = parse_file_marker(display_body, dummy_s, sizeof(dummy_s), NULL, dummy_o, sizeof(dummy_o));
+    ui_insert_file_or_text(d, d->buf, &end, display_body);
+
+    if (is_edited && !is_file) {
+        gtk_text_buffer_get_end_iter(d->buf, &end);
+        gtk_text_buffer_insert_with_tags_by_name(d->buf, &end, " (edited)", -1, "edited", NULL);
+    }
+
+    gtk_text_buffer_get_end_iter(d->buf, &end);
+    GtkTextMark *be = gtk_text_buffer_create_mark(d->buf, NULL, &end, TRUE);
 
     gtk_text_buffer_insert(d->buf, &end, "\n", -1);
+    gtk_text_buffer_get_end_iter(d->buf, &end);
+    GtkTextMark *le = gtk_text_buffer_create_mark(d->buf, NULL, &end, TRUE);
+
+    ui_record_msg_slot(d, msg_id, is_outgoing, is_file, sender_name, body, ls, bs, be, le);
     ui_scroll_if_active(d->buf);
 }
 
@@ -1102,6 +1274,7 @@ static void ui_append_error(const char *text) {
 }
 
 
+
 static void ui_append_outgoing_to(struct dialog_entry *d, long msg_id, const char *body) {
 
     if (d == NULL || d->buf == NULL) {
@@ -1112,38 +1285,54 @@ static void ui_append_outgoing_to(struct dialog_entry *d, long msg_id, const cha
     get_timestamp(ts, sizeof(ts));
 
     GtkTextIter end;
-
     gtk_text_buffer_get_end_iter(d->buf, &end);
+    GtkTextMark *ls = gtk_text_buffer_create_mark(d->buf, NULL, &end, TRUE);
+
+    char rauthor[MAX_NAME];
+    char rsnip[64];
+    const char *display_body = (body != NULL) ? body : "";
+    if (parse_reply_prefix(display_body, rauthor, sizeof(rauthor), rsnip, sizeof(rsnip), &display_body)) {
+        char qline[MAX_NAME + 80];
+        snprintf(qline, sizeof(qline), "  ↳ %s: %s\n", rauthor, rsnip);
+        gtk_text_buffer_insert_with_tags_by_name(d->buf, &end, qline, -1, "quote", NULL);
+    }
 
     char ts_str[24];
     snprintf(ts_str, sizeof(ts_str), "[%s] ", ts);
-
     gtk_text_buffer_insert_with_tags_by_name(d->buf, &end, ts_str, -1, "time", NULL);
-
     gtk_text_buffer_insert_with_tags_by_name(d->buf, &end, "you: ", -1, "outgoing", NULL);
 
+    gtk_text_buffer_get_end_iter(d->buf, &end);
+    GtkTextMark *bs = gtk_text_buffer_create_mark(d->buf, NULL, &end, TRUE);
 
-    ui_insert_file_or_text(d, d->buf, &end, body);
+    char dummy_s[96];
+    char dummy_o[96];
+    int is_file = parse_file_marker(display_body, dummy_s, sizeof(dummy_s), NULL, dummy_o, sizeof(dummy_o));
+    ui_insert_file_or_text(d, d->buf, &end, display_body);
+
+    gtk_text_buffer_get_end_iter(d->buf, &end);
+    GtkTextMark *be = gtk_text_buffer_create_mark(d->buf, NULL, &end, TRUE);
 
     char m_start[32];
     char m_end[32];
     snprintf(m_start, sizeof(m_start), "ms_%ld", msg_id);
     snprintf(m_end, sizeof(m_end), "me_%ld", msg_id);
 
-
-    gtk_text_buffer_get_end_iter(d->buf, &end);
-
     gtk_text_buffer_create_mark(d->buf, m_start, &end, TRUE);
-
     gtk_text_buffer_insert_with_tags_by_name(d->buf, &end, " ✓", -1, "time", NULL);
-
     gtk_text_buffer_get_end_iter(d->buf, &end);
-
     gtk_text_buffer_create_mark(d->buf, m_end, &end, TRUE);
-
     gtk_text_buffer_insert(d->buf, &end, "\n", -1);
 
+    gtk_text_buffer_get_end_iter(d->buf, &end);
+    GtkTextMark *le = gtk_text_buffer_create_mark(d->buf, NULL, &end, TRUE);
 
+    char cur_name[MAX_NAME];
+    pthread_mutex_lock(&g_mtx);
+    snprintf(cur_name, sizeof(cur_name), "%.*s", MAX_NAME - 1, g_my_name);
+    pthread_mutex_unlock(&g_mtx);
+
+    ui_record_msg_slot(d, msg_id, 1, is_file, cur_name, body, ls, bs, be, le);
     ui_scroll_if_active(d->buf);
 }
 
@@ -1414,6 +1603,239 @@ static gboolean on_search_entry_key_press(GtkWidget *widget, GdkEventKey *event,
     }
     return FALSE;
 }
+
+static void ui_cancel_compose(void) {
+    g_edit_msg_id = 0;
+    g_edit_reply_prefix[0] = '\0';
+    g_reply_author[0] = '\0';
+    g_reply_snippet[0] = '\0';
+    if (w_compose_lbl != NULL) {
+        gtk_label_set_text(GTK_LABEL(w_compose_lbl), "");
+    }
+    if (w_compose_bar != NULL) {
+        gtk_widget_set_visible(w_compose_bar, FALSE);
+    }
+    if (w_send_btn != NULL) {
+        gtk_button_set_label(GTK_BUTTON(w_send_btn), "Send");
+    }
+}
+
+static void on_compose_cancel_clicked(GtkWidget *widget, gpointer data) {
+    (void)widget;
+    (void)data;
+    int was_edit = (g_edit_msg_id > 0);
+    ui_cancel_compose();
+    if (was_edit && w_msg_entry != NULL) {
+        gtk_entry_set_text(GTK_ENTRY(w_msg_entry), "");
+    }
+    if (w_msg_entry != NULL) {
+        gtk_widget_grab_focus(w_msg_entry);
+    }
+}
+
+static gboolean on_msg_entry_key_press(GtkWidget *widget, GdkEventKey *event, gpointer data) {
+    (void)widget;
+    (void)data;
+    if (event != NULL && event->keyval == GDK_KEY_Escape &&
+        (g_edit_msg_id > 0 || g_reply_author[0] != '\0')) {
+        on_compose_cancel_clicked(NULL, NULL);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static void on_msg_reply_activate(GtkMenuItem *item, gpointer data) {
+    (void)item;
+    (void)data;
+    if (g_ctx_msg_sender[0] == '\0') {
+        return;
+    }
+    ui_cancel_compose();
+
+    snprintf(g_reply_author, sizeof(g_reply_author), "%.*s", MAX_NAME - 1, g_ctx_msg_sender);
+
+    char rauthor[MAX_NAME];
+    char rsnip[64];
+    const char *src_body = g_ctx_msg_raw;
+    if (parse_reply_prefix(src_body, rauthor, sizeof(rauthor), rsnip, sizeof(rsnip), &src_body)) {
+        /* use body without nested quote */
+    }
+    char fstored[96];
+    char forig[96];
+
+    char clean_src[112];
+    if (parse_file_marker(src_body, fstored, sizeof(fstored), NULL, forig, sizeof(forig))) {
+        snprintf(clean_src, sizeof(clean_src), "[File: %s]", forig);
+    } else {
+        copy_utf8_safe(clean_src, sizeof(clean_src), src_body);
+    }
+
+    size_t pos = 0;
+    for (size_t i = 0; clean_src[i] != '\0' && pos + 1 < sizeof(g_reply_snippet) && pos < 44; i++) {
+        unsigned char c = (unsigned char)clean_src[i];
+        if (c == '|' || c == '[' || c == ']' || c == '\n' || c == '\r') {
+            g_reply_snippet[pos++] = ' ';
+        } else {
+            g_reply_snippet[pos++] = (char)c;
+        }
+    }
+    g_reply_snippet[pos] = '\0';
+    copy_utf8_safe(g_reply_snippet, sizeof(g_reply_snippet), g_reply_snippet);
+
+    if (w_compose_lbl != NULL && w_compose_bar != NULL) {
+        char lbl[MAX_NAME + 96];
+        snprintf(lbl, sizeof(lbl), "↩ Replying to %s: %s", g_reply_author, g_reply_snippet);
+        gtk_label_set_text(GTK_LABEL(w_compose_lbl), lbl);
+        gtk_widget_set_visible(w_compose_bar, TRUE);
+    }
+    if (w_msg_entry != NULL) {
+        gtk_widget_grab_focus(w_msg_entry);
+    }
+}
+
+static void on_msg_edit_activate(GtkMenuItem *item, gpointer data) {
+    (void)item;
+    (void)data;
+    if (g_ctx_msg_id <= 0) {
+        return;
+    }
+    ui_cancel_compose();
+    g_edit_msg_id = g_ctx_msg_id;
+
+    char rauthor[MAX_NAME];
+    char rsnip[64];
+    const char *body_only = g_ctx_msg_raw;
+    if (parse_reply_prefix(g_ctx_msg_raw, rauthor, sizeof(rauthor), rsnip, sizeof(rsnip), &body_only)) {
+        size_t plen = (size_t)(body_only - g_ctx_msg_raw);
+        if (plen >= sizeof(g_edit_reply_prefix)) {
+            plen = sizeof(g_edit_reply_prefix) - 1;
+        }
+        memcpy(g_edit_reply_prefix, g_ctx_msg_raw, plen);
+        g_edit_reply_prefix[plen] = '\0';
+    } else {
+        g_edit_reply_prefix[0] = '\0';
+    }
+
+    if (w_compose_lbl != NULL && w_compose_bar != NULL) {
+        gtk_label_set_text(GTK_LABEL(w_compose_lbl), "✏ Editing message...");
+        gtk_widget_set_visible(w_compose_bar, TRUE);
+    }
+    if (w_send_btn != NULL) {
+        gtk_button_set_label(GTK_BUTTON(w_send_btn), "Save");
+    }
+    if (w_msg_entry != NULL) {
+        gtk_entry_set_text(GTK_ENTRY(w_msg_entry), body_only);
+        gtk_widget_grab_focus(w_msg_entry);
+        gtk_editable_set_position(GTK_EDITABLE(w_msg_entry), -1);
+    }
+}
+
+static void on_msg_delete_activate(GtkMenuItem *item, gpointer data) {
+    (void)item;
+    (void)data;
+    if (g_ctx_msg_id <= 0 || g_active_peer[0] == '\0') {
+        return;
+    }
+
+    pthread_mutex_lock(&g_mtx);
+    long cur_id = g_my_id;
+    pthread_mutex_unlock(&g_mtx);
+    if (cur_id <= 0) {
+        return;
+    }
+
+    long del_id = g_ctx_msg_id;
+    int is_room = g_active_is_room;
+    char peer[MAX_NAME];
+    snprintf(peer, sizeof(peer), "%.*s", MAX_NAME - 1, g_active_peer);
+
+    drain_type(g_msqid, g_reply_type);
+
+    struct qmsg req;
+    memset(&req, 0, sizeof(req));
+    req.mtype = ARBITER_TYPE;
+    req.cmd = CMD_MSG_DELETE;
+    req.sender_id = cur_id;
+    req.reply_type = g_reply_type;
+    req.target_id = is_room ? 1 : 0;
+    req.msg_id = del_id;
+    snprintf(req.name, sizeof(req.name), "%.*s", MAX_NAME - 1, peer);
+
+    if (msgsnd(g_msqid, &req, MSG_SIZE, IPC_NOWAIT) < 0) {
+        ui_append_error("Failed to send delete request.");
+        return;
+    }
+
+    struct qmsg rep;
+    if (wait_reply(g_msqid, g_reply_type, &rep, 200) < 0) {
+        ui_append_error("No response from arbiter.");
+        return;
+    }
+    if (rep.target_id > 0) {
+        struct dialog_entry *d = find_dialog(peer, is_room);
+        ui_apply_msg_delete(d, del_id);
+        if (g_edit_msg_id == del_id) {
+            on_compose_cancel_clicked(NULL, NULL);
+        }
+    } else {
+        rep.text[MAX_TEXT - 1] = '\0';
+        char err[MAX_TEXT + 32];
+        snprintf(err, sizeof(err), "Delete failed: %s", rep.text);
+        ui_append_error(err);
+    }
+}
+
+static gboolean on_chat_view_button_press(GtkWidget *widget, GdkEventButton *event, gpointer data) {
+    (void)data;
+    if (event == NULL || event->type != GDK_BUTTON_PRESS || event->button != 3) {
+        return FALSE;
+    }
+    if (g_active_peer[0] == '\0' || w_msg_menu == NULL) {
+        return FALSE;
+    }
+    struct dialog_entry *d = find_dialog(g_active_peer, g_active_is_room);
+    if (d == NULL || d->buf == NULL) {
+        return FALSE;
+    }
+
+    gint bx = 0;
+    gint by = 0;
+    gtk_text_view_window_to_buffer_coords(GTK_TEXT_VIEW(widget), GTK_TEXT_WINDOW_WIDGET,
+                                          (gint)event->x, (gint)event->y, &bx, &by);
+    GtkTextIter click_it;
+    gtk_text_view_get_iter_at_location(GTK_TEXT_VIEW(widget), &click_it, bx, by);
+
+    struct msg_slot *hit = NULL;
+    for (int i = 0; i < d->msg_count; i++) {
+        GtkTextIter ls;
+        GtkTextIter le;
+        gtk_text_buffer_get_iter_at_mark(d->buf, &ls, d->msgs[i].line_start);
+        gtk_text_buffer_get_iter_at_mark(d->buf, &le, d->msgs[i].line_end);
+        if (gtk_text_iter_compare(&click_it, &ls) >= 0 && gtk_text_iter_compare(&click_it, &le) < 0) {
+            hit = &d->msgs[i];
+            break;
+        }
+    }
+    if (hit == NULL) {
+        return FALSE;
+    }
+
+    g_ctx_msg_id = hit->msg_id;
+    snprintf(g_ctx_msg_sender, sizeof(g_ctx_msg_sender), "%.*s", MAX_NAME - 1, hit->sender);
+    copy_utf8_safe(g_ctx_msg_raw, sizeof(g_ctx_msg_raw), hit->raw_text);
+
+    pthread_mutex_lock(&g_mtx);
+    int is_dbg = g_is_debug;
+    pthread_mutex_unlock(&g_mtx);
+
+    gtk_widget_set_visible(w_mi_msg_reply, TRUE);
+    gtk_widget_set_visible(w_mi_msg_edit, (hit->is_outgoing && !hit->is_file && hit->msg_id > 0 && !is_dbg) ? TRUE : FALSE);
+    gtk_widget_set_visible(w_mi_msg_delete, (hit->is_outgoing && hit->msg_id > 0 && !is_dbg) ? TRUE : FALSE);
+
+    gtk_menu_popup_at_pointer(GTK_MENU(w_msg_menu), (GdkEvent *)event);
+    return TRUE;
+}
+
 static void ui_update_tab_labels(void) {
     if (w_tab_users == NULL || w_tab_rooms == NULL) {
         return;
@@ -1494,6 +1916,8 @@ static void ui_switch_dialog(const char *peer, int is_room, int set_target) {
         return;
 
     }
+
+    ui_cancel_compose();
     ui_close_search();
 
     if (peer == NULL || peer[0] == '\0') {
@@ -2284,7 +2708,8 @@ static gboolean ui_handle_event(gpointer user_data) {
             char prefix[MAX_NAME + 8];
             snprintf(prefix, sizeof(prefix), "%s: ", ev->sender);
 
-            ui_append_dialog_line_ts(d, (time_t)ev->timestamp, "incoming", prefix, ev->text);
+
+            ui_append_dialog_msg_ts(d, ev->msg_id, (time_t)ev->timestamp, 0, 0, "incoming", ev->sender, prefix, ev->text);
 
             if (d->typing_until > 0 && strcmp(d->typing_user, ev->sender) == 0) {
                 d->typing_until = 0;
@@ -2311,23 +2736,39 @@ static gboolean ui_handle_event(gpointer user_data) {
             if (ev->is_room) {
                 d->joined = 1;
             }
-            if (ev->is_outgoing) {
 
-                ui_append_dialog_line_ts(d, (time_t)ev->timestamp, "outgoing", "you: ", ev->text);
+            if (ev->is_outgoing) {
+                ui_append_dialog_msg_ts(d, ev->msg_id, (time_t)ev->timestamp, 1, ev->is_edited,
+                                        "outgoing", ev->sender, "you: ", ev->text);
             } else {
                 char prefix[MAX_NAME + 8];
                 snprintf(prefix, sizeof(prefix), "%s: ", ev->sender);
+                ui_append_dialog_msg_ts(d, ev->msg_id, (time_t)ev->timestamp, 0, ev->is_edited,
+                                        "incoming", ev->sender, prefix, ev->text);
 
-                ui_append_dialog_line_ts(d, (time_t)ev->timestamp, "incoming", prefix, ev->text);
 
-            if (!ev->is_outgoing && ev->msg_id != 0) {
-                if (g_active_is_room == ev->is_room && strcmp(g_active_peer, d->peer) == 0) {
-                    send_mark_read(d->peer, ev->is_room);
-                } else {
-                    d->unread++;
+
+                if (ev->is_unread) {
+
+                    if (g_active_is_room == ev->is_room && strcmp(g_active_peer, d->peer) == 0) {
+
+                        send_read_ack(ev->msg_id, ev->sender);
+
+                        send_mark_read(d->peer, ev->is_room);
+
+                    } else {
+
+                        d->unread++;
+
+                        queue_dialog_ack(d, ev->msg_id, ev->sender);
+
+                    }
+
                 }
+
             }
-            }
+
+
             ui_schedule_sidebar_rebuild();
         }
     } else if (ev->kind == EV_ROOM_MSG) {
@@ -2341,7 +2782,8 @@ static gboolean ui_handle_event(gpointer user_data) {
                 char prefix[MAX_NAME + 8];
                 snprintf(prefix, sizeof(prefix), "%s: ", ev->sender);
 
-                ui_append_dialog_line_ts(d, (time_t)ev->timestamp, "incoming", prefix, ev->text);
+
+                ui_append_dialog_msg_ts(d, ev->msg_id, (time_t)ev->timestamp, 0, 0, "incoming", ev->sender, prefix, ev->text);
 
                 if (d->typing_until > 0 && strcmp(d->typing_user, ev->sender) == 0) {
                     d->typing_until = 0;
@@ -2380,6 +2822,13 @@ static gboolean ui_handle_event(gpointer user_data) {
                 ui_update_chat_header();
             }
         }
+
+    } else if (ev->kind == EV_MSG_EDIT) {
+        struct dialog_entry *d = find_dialog(ev->room, ev->is_room);
+        ui_apply_msg_edit(d, ev->msg_id, ev->text);
+    } else if (ev->kind == EV_MSG_DELETE) {
+        struct dialog_entry *d = find_dialog(ev->room, ev->is_room);
+        ui_apply_msg_delete(d, ev->msg_id);
     } else if (ev->kind == EV_WHO) {
         ui_update_users_list(ev->msg_id, ev->text);
     } else if (ev->kind == EV_ROOMS) {
@@ -2439,8 +2888,12 @@ static void *recv_worker(void *arg) {
                 struct ui_event *ev = calloc(1, sizeof(*ev));
                 if (ev != NULL) {
                     ev->kind = EV_HISTORY_ITEM;
+
+
                     ev->is_room = (msg.target_id != 0);
-                    ev->is_outgoing = (msg.sender_id != 0);
+                    ev->is_outgoing = (msg.sender_id & 1) != 0;
+                    ev->is_unread = (msg.sender_id & 2) != 0;
+                    ev->is_edited = (msg.sender_id & 4) != 0;
 
                     ev->msg_id = msg.msg_id;
                     ev->timestamp = msg.timestamp;
@@ -2483,6 +2936,35 @@ static void *recv_worker(void *arg) {
                 if (ev != NULL) {
                     ev->kind = EV_TYPING;
                     ev->is_room = (msg.target_id != 0);
+                    copy_utf8_safe(ev->room, sizeof(ev->room), msg.name);
+                    copy_utf8_safe(ev->sender, sizeof(ev->sender), msg.sender_name);
+                    g_idle_add(ui_handle_event, ev);
+                }
+
+            } else if (msg.cmd == CMD_MSG_EDIT) {
+                msg.name[MAX_NAME - 1] = '\0';
+                msg.sender_name[MAX_NAME - 1] = '\0';
+                msg.text[MAX_TEXT - 1] = '\0';
+
+                struct ui_event *ev = calloc(1, sizeof(*ev));
+                if (ev != NULL) {
+                    ev->kind = EV_MSG_EDIT;
+                    ev->is_room = (msg.target_id != 0);
+                    ev->msg_id = msg.msg_id;
+                    copy_utf8_safe(ev->room, sizeof(ev->room), msg.name);
+                    copy_utf8_safe(ev->sender, sizeof(ev->sender), msg.sender_name);
+                    copy_utf8_safe(ev->text, sizeof(ev->text), msg.text);
+                    g_idle_add(ui_handle_event, ev);
+                }
+            } else if (msg.cmd == CMD_MSG_DELETE) {
+                msg.name[MAX_NAME - 1] = '\0';
+                msg.sender_name[MAX_NAME - 1] = '\0';
+
+                struct ui_event *ev = calloc(1, sizeof(*ev));
+                if (ev != NULL) {
+                    ev->kind = EV_MSG_DELETE;
+                    ev->is_room = (msg.target_id != 0);
+                    ev->msg_id = msg.msg_id;
                     copy_utf8_safe(ev->room, sizeof(ev->room), msg.name);
                     copy_utf8_safe(ev->sender, sizeof(ev->sender), msg.sender_name);
                     g_idle_add(ui_handle_event, ev);
@@ -2769,6 +3251,60 @@ static void on_send_clicked(GtkWidget *widget, gpointer data) {
         return;
     }
 
+    if (g_edit_msg_id > 0) {
+        char final_text[MAX_TEXT];
+        if (g_edit_reply_prefix[0] != '\0') {
+            char combined[MAX_TEXT + 128];
+            snprintf(combined, sizeof(combined), "%s%s", g_edit_reply_prefix, text);
+            copy_utf8_safe(final_text, sizeof(final_text), combined);
+        } else {
+            copy_utf8_safe(final_text, sizeof(final_text), text);
+        }
+
+        drain_type(g_msqid, g_reply_type);
+        struct qmsg req;
+        memset(&req, 0, sizeof(req));
+        req.mtype = ARBITER_TYPE;
+        req.cmd = CMD_MSG_EDIT;
+        req.sender_id = cur_id;
+        req.reply_type = g_reply_type;
+        req.target_id = g_active_is_room ? 1 : 0;
+        req.msg_id = g_edit_msg_id;
+        snprintf(req.name, sizeof(req.name), "%.*s", MAX_NAME - 1, g_active_peer);
+        copy_utf8_safe(req.text, sizeof(req.text), final_text);
+
+        if (msgsnd(g_msqid, &req, MSG_SIZE, IPC_NOWAIT) < 0) {
+            ui_append_error("Failed to send edit.");
+            return;
+        }
+        struct qmsg rep;
+        if (wait_reply(g_msqid, g_reply_type, &rep, 200) < 0) {
+            ui_append_error("No response from arbiter.");
+            return;
+        }
+        if (rep.target_id > 0) {
+            struct dialog_entry *d = find_dialog(g_active_peer, g_active_is_room);
+            ui_apply_msg_edit(d, g_edit_msg_id, final_text);
+            gtk_entry_set_text(GTK_ENTRY(w_msg_entry), "");
+            ui_cancel_compose();
+        } else {
+            rep.text[MAX_TEXT - 1] = '\0';
+            char err[MAX_TEXT + 32];
+            snprintf(err, sizeof(err), "Edit failed: %s", rep.text);
+            ui_append_error(err);
+        }
+        gtk_widget_grab_focus(w_msg_entry);
+        return;
+    }
+
+    char payload[MAX_TEXT];
+    if (g_reply_author[0] != '\0') {
+        char combined[MAX_TEXT + 128];
+        snprintf(combined, sizeof(combined), "[[REPLY:%s|%s]]%s", g_reply_author, g_reply_snippet, text);
+        copy_utf8_safe(payload, sizeof(payload), combined);
+    } else {
+        copy_utf8_safe(payload, sizeof(payload), text);
+    }
     if (g_active_is_room) {
         const char *rname = g_active_peer;
         long msg_id = g_next_msg_id++;
@@ -2781,7 +3317,8 @@ static void on_send_clicked(GtkWidget *widget, gpointer data) {
         req.msg_id = msg_id;
         req.reply_type = g_reply_type;
         snprintf(req.name, sizeof(req.name), "%.*s", MAX_NAME - 2, rname);
-        copy_utf8_safe(req.text, sizeof(req.text), text);
+
+        copy_utf8_safe(req.text, sizeof(req.text), payload);
 
         if (msgsnd(g_msqid, &req, MSG_SIZE, IPC_NOWAIT) < 0) {
             ui_append_error(errno == EAGAIN
@@ -2813,8 +3350,11 @@ static void on_send_clicked(GtkWidget *widget, gpointer data) {
             ui_switch_dialog(d->peer, 1, 0);
         }
 
-        ui_append_outgoing_to(d, msg_id, text);
+
+        long eff_id = (rep.msg_id > 0) ? rep.msg_id : msg_id;
+        ui_append_outgoing_to(d, eff_id, payload);
         gtk_entry_set_text(GTK_ENTRY(w_msg_entry), "");
+        ui_cancel_compose();
         gtk_widget_grab_focus(w_msg_entry);
         return;
     }
@@ -2841,7 +3381,8 @@ static void on_send_clicked(GtkWidget *widget, gpointer data) {
     chat.reply_type = g_reply_type;
     snprintf(chat.name, sizeof(chat.name), "%.*s", MAX_NAME - 1, target);
     snprintf(chat.sender_name, sizeof(chat.sender_name), "%.*s", MAX_NAME - 1, cur_name);
-    copy_utf8_safe(chat.text, sizeof(chat.text), text);
+
+    copy_utf8_safe(chat.text, sizeof(chat.text), payload);
 
     if (msgsnd(g_msqid, &chat, MSG_SIZE, IPC_NOWAIT) < 0) {
         ui_append_error(errno == EAGAIN
@@ -2877,10 +3418,14 @@ static void on_send_clicked(GtkWidget *widget, gpointer data) {
     }
 
 
-    ui_append_outgoing_to(d, msg_id, text);
 
-    record_unacked_id(d, msg_id);
+    long eff_id = (rep.msg_id > 0) ? rep.msg_id : msg_id;
+    ui_append_outgoing_to(d, eff_id, payload);
+
+    record_unacked_id(d, eff_id);
     gtk_entry_set_text(GTK_ENTRY(w_msg_entry), "");
+    ui_cancel_compose();
+
     gtk_widget_grab_focus(w_msg_entry);
 }
 
@@ -3016,9 +3561,11 @@ static void do_send_attachment(int images_only) {
         ui_update_chat_header();
     }
 
-    ui_append_outgoing_to(d, msg_id, rep.text);
+
+    long eff_id = (rep.msg_id > 0) ? rep.msg_id : msg_id;
+    ui_append_outgoing_to(d, eff_id, rep.text);
     if (!is_room) {
-        record_unacked_id(d, msg_id);
+        record_unacked_id(d, eff_id);
     }
     gtk_widget_grab_focus(w_msg_entry);
 }
@@ -3052,13 +3599,31 @@ static void on_attach_clicked(GtkWidget *widget, gpointer data) {
 
 
 
+
 static gboolean on_window_configure(GtkWidget *widget, GdkEventConfigure *event, gpointer data) {
-    (void)widget;
+
     (void)data;
-    if (g_manual_font_size > 0 || event == NULL || event->width <= 0 || event->height <= 0) {
+
+    if (g_manual_font_size > 0 || widget == NULL || event == NULL) {
+
+        return FALSE;
+
+    }
+
+    if (event->window != gtk_widget_get_window(widget)) {
+
+        return FALSE;
+
+    }
+
+    int w = 0;
+
+    int h = 0;
+    gtk_window_get_size(GTK_WINDOW(widget), &w, &h);
+    if (w <= 0 || h <= 0) {
         return FALSE;
     }
-    apply_font_size(compute_auto_font_size(event->width, event->height));
+    apply_font_size(compute_auto_font_size(w, h));
     return FALSE;
 }
 
@@ -3085,6 +3650,12 @@ static void on_window_destroy(GtkWidget *widget, gpointer data) {
     w_send_btn = NULL;
     w_file_btn = NULL;
     w_theme_combo = NULL;
+
+    w_compose_bar = NULL;
+    w_compose_lbl = NULL;
+    w_mi_msg_reply = NULL;
+    w_mi_msg_edit = NULL;
+    w_mi_msg_delete = NULL;
     w_users_list = NULL;
     w_users_lbl = NULL;
     w_rooms_list = NULL;
@@ -3108,6 +3679,11 @@ static void on_window_destroy(GtkWidget *widget, gpointer data) {
     if (w_chat_menu != NULL) {
         gtk_widget_destroy(w_chat_menu);
         w_chat_menu = NULL;
+
+    }
+    if (w_msg_menu != NULL) {
+        gtk_widget_destroy(w_msg_menu);
+        w_msg_menu = NULL;
     }
     if (w_attach_menu != NULL) {
         gtk_widget_destroy(w_attach_menu);
@@ -3331,6 +3907,8 @@ static void build_ui(void) {
     gtk_text_view_set_editable(GTK_TEXT_VIEW(w_chat_view), FALSE);
     gtk_text_view_set_cursor_visible(GTK_TEXT_VIEW(w_chat_view), FALSE);
     gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(w_chat_view), GTK_WRAP_WORD_CHAR);
+
+    g_signal_connect(w_chat_view, "button-press-event", G_CALLBACK(on_chat_view_button_press), NULL);
     gtk_text_view_set_left_margin(GTK_TEXT_VIEW(w_chat_view), 10);
     gtk_text_view_set_right_margin(GTK_TEXT_VIEW(w_chat_view), 10);
     gtk_text_view_set_top_margin(GTK_TEXT_VIEW(w_chat_view), 8);
@@ -3338,6 +3916,17 @@ static void build_ui(void) {
 
     gtk_container_add(GTK_CONTAINER(scroll), w_chat_view);
     gtk_box_pack_start(GTK_BOX(chat_col), scroll, TRUE, TRUE, 0);
+
+    w_msg_menu = gtk_menu_new();
+    w_mi_msg_reply = gtk_menu_item_new_with_label("↩  Reply");
+    w_mi_msg_edit = gtk_menu_item_new_with_label("✏  Edit");
+    w_mi_msg_delete = gtk_menu_item_new_with_label("🗑  Delete");
+    g_signal_connect(w_mi_msg_reply, "activate", G_CALLBACK(on_msg_reply_activate), NULL);
+    g_signal_connect(w_mi_msg_edit, "activate", G_CALLBACK(on_msg_edit_activate), NULL);
+    g_signal_connect(w_mi_msg_delete, "activate", G_CALLBACK(on_msg_delete_activate), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(w_msg_menu), w_mi_msg_reply);
+    gtk_menu_shell_append(GTK_MENU_SHELL(w_msg_menu), w_mi_msg_edit);
+    gtk_menu_shell_append(GTK_MENU_SHELL(w_msg_menu), w_mi_msg_delete);
     gtk_box_pack_start(GTK_BOX(mid_box), chat_col, TRUE, TRUE, 0);
 
     GtkWidget *sidebar = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
@@ -3416,6 +4005,18 @@ static void build_ui(void) {
     gtk_box_pack_start(GTK_BOX(root), mid_box, TRUE, TRUE, 0);
 
 
+
+    w_compose_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_style_context_add_class(gtk_widget_get_style_context(w_compose_bar), "compose-bar");
+    w_compose_lbl = gtk_label_new("");
+    gtk_widget_set_halign(w_compose_lbl, GTK_ALIGN_START);
+    gtk_label_set_ellipsize(GTK_LABEL(w_compose_lbl), PANGO_ELLIPSIZE_END);
+    GtkWidget *c_close = gtk_button_new_with_label("✕");
+    gtk_style_context_add_class(gtk_widget_get_style_context(c_close), "tab-btn");
+    g_signal_connect(c_close, "clicked", G_CALLBACK(on_compose_cancel_clicked), NULL);
+    gtk_box_pack_start(GTK_BOX(w_compose_bar), w_compose_lbl, TRUE, TRUE, 0);
+    gtk_box_pack_end(GTK_BOX(w_compose_bar), c_close, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(root), w_compose_bar, FALSE, FALSE, 0);
     GtkWidget *bottom_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
 
     w_new_chat_btn = gtk_button_new_with_label("+");
@@ -3442,6 +4043,8 @@ static void build_ui(void) {
     g_signal_connect(w_msg_entry, "activate", G_CALLBACK(on_send_clicked), NULL);
 
     g_signal_connect(w_msg_entry, "changed", G_CALLBACK(on_msg_entry_changed), NULL);
+
+    g_signal_connect(w_msg_entry, "key-press-event", G_CALLBACK(on_msg_entry_key_press), NULL);
 
     w_send_btn = gtk_button_new_with_label("Send");
     g_signal_connect(w_send_btn, "clicked", G_CALLBACK(on_send_clicked), NULL);

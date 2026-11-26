@@ -162,7 +162,10 @@ int db_init(const char *path) {
 
         "  deleted_by_receiver INTEGER NOT NULL DEFAULT 0,"
 
-        "  is_read INTEGER NOT NULL DEFAULT 0"
+
+        "  is_read INTEGER NOT NULL DEFAULT 0,"
+
+        "  is_edited INTEGER NOT NULL DEFAULT 0"
 
         ");"
         "CREATE INDEX IF NOT EXISTS idx_messages_pair ON messages(sender, receiver);"
@@ -171,7 +174,10 @@ int db_init(const char *path) {
         "  room TEXT NOT NULL,"
         "  sender TEXT NOT NULL,"
         "  text TEXT NOT NULL,"
-        "  created_at INTEGER NOT NULL"
+
+        "  created_at INTEGER NOT NULL,"
+
+        "  is_edited INTEGER NOT NULL DEFAULT 0"
         ");"
         "CREATE INDEX IF NOT EXISTS idx_room_messages_room ON room_messages(room);"
         "CREATE TABLE IF NOT EXISTS room_members ("
@@ -205,6 +211,9 @@ int db_init(const char *path) {
 
 
     sqlite3_exec(g_db, "ALTER TABLE messages ADD COLUMN is_read INTEGER NOT NULL DEFAULT 0;", NULL, NULL, NULL);
+
+    sqlite3_exec(g_db, "ALTER TABLE messages ADD COLUMN is_edited INTEGER NOT NULL DEFAULT 0;", NULL, NULL, NULL);
+    sqlite3_exec(g_db, "ALTER TABLE room_messages ADD COLUMN is_edited INTEGER NOT NULL DEFAULT 0;", NULL, NULL, NULL);
 
     seed_default_users_if_empty();
     return 0;
@@ -340,7 +349,8 @@ int db_set_theme(const char *username, int theme_id) {
     return (rc == SQLITE_DONE) ? 0 : -1;
 }
 
-int db_save_dm(const char *sender, const char *receiver, const char *text, time_t ts) {
+
+long db_save_dm(const char *sender, const char *receiver, const char *text, time_t ts) {
     if (g_db == NULL || sender == NULL || receiver == NULL || text == NULL) {
         return 0;
     }
@@ -363,7 +373,8 @@ int db_save_dm(const char *sender, const char *receiver, const char *text, time_
 
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    return (rc == SQLITE_DONE) ? 0 : -1;
+
+    return (rc == SQLITE_DONE) ? (long)sqlite3_last_insert_rowid(g_db) : -1;
 }
 
 int db_load_dm_history(const char *username, const char *peer_filter,
@@ -377,9 +388,11 @@ int db_load_dm_history(const char *username, const char *peer_filter,
 
     const char *sql_all =
 
-        "SELECT sender, receiver, text, created_at, is_read FROM ("
 
-        "  SELECT id, sender, receiver, text, created_at, is_read FROM messages "
+        "SELECT id, sender, receiver, text, created_at, is_read, is_edited FROM ("
+
+
+        "  SELECT id, sender, receiver, text, created_at, is_read, is_edited FROM messages "
         "  WHERE (sender = ?1 AND deleted_by_sender = 0) "
         "     OR (receiver = ?1 AND deleted_by_receiver = 0) "
         "  ORDER BY id DESC LIMIT ?2"
@@ -387,9 +400,11 @@ int db_load_dm_history(const char *username, const char *peer_filter,
 
     const char *sql_peer =
 
-        "SELECT sender, receiver, text, created_at, is_read FROM ("
 
-        "  SELECT id, sender, receiver, text, created_at, is_read FROM messages "
+        "SELECT id, sender, receiver, text, created_at, is_read, is_edited FROM ("
+
+
+        "  SELECT id, sender, receiver, text, created_at, is_read, is_edited FROM messages "
         "  WHERE (sender = ?1 AND receiver = ?2 AND deleted_by_sender = 0) "
         "     OR (receiver = ?1 AND sender = ?2 AND deleted_by_receiver = 0) "
         "  ORDER BY id DESC LIMIT ?3"
@@ -411,12 +426,20 @@ int db_load_dm_history(const char *username, const char *peer_filter,
 
     int count = 0;
     while (count < max_count && sqlite3_step(stmt) == SQLITE_ROW) {
-        const char *sender = (const char *)sqlite3_column_text(stmt, 0);
-        const char *receiver = (const char *)sqlite3_column_text(stmt, 1);
-        const char *text = (const char *)sqlite3_column_text(stmt, 2);
-        sqlite3_int64 ts = sqlite3_column_int64(stmt, 3);
 
-        int is_read = sqlite3_column_int(stmt, 4);
+        sqlite3_int64 msg_id = sqlite3_column_int64(stmt, 0);
+
+        const char *sender = (const char *)sqlite3_column_text(stmt, 1);
+
+        const char *receiver = (const char *)sqlite3_column_text(stmt, 2);
+
+        const char *text = (const char *)sqlite3_column_text(stmt, 3);
+
+        sqlite3_int64 ts = sqlite3_column_int64(stmt, 4);
+
+        int is_read = sqlite3_column_int(stmt, 5);
+
+        int is_edited = sqlite3_column_int(stmt, 6);
 
         if (sender == NULL || receiver == NULL || text == NULL) {
             continue;
@@ -424,9 +447,13 @@ int db_load_dm_history(const char *username, const char *peer_filter,
 
         const char *peer = (strcmp(sender, username) == 0) ? receiver : sender;
         memset(&out[count], 0, sizeof(out[count]));
+
+        out[count].id = (long)msg_id;
         out[count].is_room = 0;
 
         out[count].is_unread = (strcmp(receiver, username) == 0 && is_read == 0) ? 1 : 0;
+
+        out[count].is_edited = (is_edited != 0) ? 1 : 0;
         snprintf(out[count].peer, sizeof(out[count].peer), "%.*s", MAX_NAME - 1, peer);
         snprintf(out[count].sender, sizeof(out[count].sender), "%.*s", MAX_NAME - 1, sender);
         copy_utf8_safe(out[count].text, sizeof(out[count].text), text);
@@ -547,7 +574,8 @@ int db_load_user_rooms(const char *username, char rooms_out[][MAX_NAME], int max
     return count;
 }
 
-int db_save_room_msg(const char *room, const char *sender, const char *text, time_t ts) {
+
+long db_save_room_msg(const char *room, const char *sender, const char *text, time_t ts) {
     if (g_db == NULL || room == NULL || sender == NULL || text == NULL) {
         return 0;
     }
@@ -567,7 +595,8 @@ int db_save_room_msg(const char *room, const char *sender, const char *text, tim
     sqlite3_bind_int64(stmt, 4, (sqlite3_int64)ts);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    return (rc == SQLITE_DONE) ? 0 : -1;
+
+    return (rc == SQLITE_DONE) ? (long)sqlite3_last_insert_rowid(g_db) : -1;
 }
 
 int db_load_room_history(const char *room, const char *username,
@@ -606,8 +635,10 @@ int db_load_room_history(const char *room, const char *username,
 
     const char *sql =
 
-        "SELECT id, sender, text, created_at FROM ("
-        "  SELECT id, sender, text, created_at FROM room_messages "
+
+        "SELECT id, sender, text, created_at, is_edited FROM ("
+
+        "  SELECT id, sender, text, created_at, is_edited FROM room_messages "
         "  WHERE room = ?1 AND created_at > ?2 "
         "  ORDER BY id DESC LIMIT ?3"
         ") ORDER BY id ASC;";
@@ -630,13 +661,19 @@ int db_load_room_history(const char *room, const char *username,
         const char *text = (const char *)sqlite3_column_text(stmt, 2);
 
         sqlite3_int64 ts = sqlite3_column_int64(stmt, 3);
+
+        int is_edited = sqlite3_column_int(stmt, 4);
         if (sender == NULL || text == NULL) {
             continue;
         }
         memset(&out[count], 0, sizeof(out[count]));
         out[count].is_room = 1;
 
+        out[count].id = (long)msg_id;
+
         out[count].is_unread = (strcmp(sender, username) != 0 && msg_id > last_read_id) ? 1 : 0;
+
+        out[count].is_edited = (is_edited != 0) ? 1 : 0;
         snprintf(out[count].peer, sizeof(out[count].peer), "%.*s", MAX_NAME - 1, room);
         snprintf(out[count].sender, sizeof(out[count].sender), "%.*s", MAX_NAME - 1, sender);
         copy_utf8_safe(out[count].text, sizeof(out[count].text), text);
@@ -646,6 +683,16 @@ int db_load_room_history(const char *room, const char *username,
 
     sqlite3_finalize(stmt);
     return count;
+}
+
+
+static void db_exec_delete_by_room(const char *sql, const char *room) {
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, room, -1, SQLITE_TRANSIENT);
+        sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+    }
 }
 
 int db_delete_room_for_user(const char *username, const char *room, int remaining_active_members) {
@@ -680,25 +727,11 @@ int db_delete_room_for_user(const char *username, const char *room, int remainin
     }
 
     if (db_members == 0 && remaining_active_members <= 0) {
-        if (sqlite3_prepare_v2(g_db, "DELETE FROM room_messages WHERE room = ?1;",
-                               -1, &stmt, NULL) == SQLITE_OK) {
-            sqlite3_bind_text(stmt, 1, room, -1, SQLITE_TRANSIENT);
-            sqlite3_step(stmt);
-            sqlite3_finalize(stmt);
-        }
-        if (sqlite3_prepare_v2(g_db, "DELETE FROM room_cleared WHERE room = ?1;",
-                               -1, &stmt, NULL) == SQLITE_OK) {
-            sqlite3_bind_text(stmt, 1, room, -1, SQLITE_TRANSIENT);
-            sqlite3_step(stmt);
-            sqlite3_finalize(stmt);
-        }
 
-        if (sqlite3_prepare_v2(g_db, "DELETE FROM room_read WHERE room = ?1;",
-                               -1, &stmt, NULL) == SQLITE_OK) {
-            sqlite3_bind_text(stmt, 1, room, -1, SQLITE_TRANSIENT);
-            sqlite3_step(stmt);
-            sqlite3_finalize(stmt);
-        }
+        db_exec_delete_by_room("DELETE FROM room_messages WHERE room = ?1;", room);
+
+        db_exec_delete_by_room("DELETE FROM room_cleared WHERE room = ?1;", room);
+        db_exec_delete_by_room("DELETE FROM room_read WHERE room = ?1;", room);
     }
 
     return 0;
@@ -735,4 +768,48 @@ int db_mark_room_read(const char *username, const char *room) {
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     return (rc == SQLITE_DONE) ? 0 : -1;
+}
+
+
+int db_edit_message(int is_room, long msg_id, const char *sender, const char *new_text) {
+    if (g_db == NULL || msg_id <= 0 || sender == NULL || new_text == NULL || new_text[0] == '\0') {
+        return 0;
+    }
+    if (db_is_debug_name(sender)) {
+        return 0;
+    }
+    const char *sql = is_room
+        ? "UPDATE room_messages SET text = ?1, is_edited = 1 WHERE id = ?2 AND sender = ?3;"
+        : "UPDATE messages SET text = ?1, is_edited = 1 WHERE id = ?2 AND sender = ?3;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    sqlite3_bind_text(stmt, 1, new_text, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 2, (sqlite3_int64)msg_id);
+    sqlite3_bind_text(stmt, 3, sender, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_DONE) ? sqlite3_changes(g_db) : -1;
+}
+
+int db_delete_message(int is_room, long msg_id, const char *sender) {
+    if (g_db == NULL || msg_id <= 0 || sender == NULL) {
+        return 0;
+    }
+    if (db_is_debug_name(sender)) {
+        return 0;
+    }
+    const char *sql = is_room
+        ? "DELETE FROM room_messages WHERE id = ?1 AND sender = ?2;"
+        : "DELETE FROM messages WHERE id = ?1 AND sender = ?2;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    sqlite3_bind_int64(stmt, 1, (sqlite3_int64)msg_id);
+    sqlite3_bind_text(stmt, 2, sender, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_DONE) ? sqlite3_changes(g_db) : -1;
 }

@@ -60,7 +60,9 @@ enum msg_cmd {
     CMD_MARK_READ = 21,
     CMD_FILE_SEND = 22,
     CMD_FILE_GET = 23,
-    CMD_TYPING = 24
+    CMD_TYPING = 24,
+    CMD_MSG_EDIT = 25,
+    CMD_MSG_DELETE = 26
 };
 
 struct qmsg {
@@ -343,6 +345,43 @@ static inline int shm_save_to_file(int shmid, long fsize, const char *dest_path)
     shmdt(ptr);
     shmctl(shmid, IPC_RMID, NULL);
     return ok ? 0 : -1;
+}
+
+static inline int parse_reply_prefix(const char *text, char *author_out, size_t author_sz,
+                                     char *snippet_out, size_t snippet_sz, const char **body_out) {
+    if (text == NULL || strncmp(text, "[[REPLY:", 8) != 0) {
+        return 0;
+    }
+    const char *p1 = text + 8;
+    const char *bar = strchr(p1, '|');
+    if (bar == NULL || bar == p1) {
+        return 0;
+    }
+    const char *p2 = bar + 1;
+    const char *end = strstr(p2, "]]");
+    if (end == NULL || end < p2) {
+        return 0;
+    }
+    if (author_out != NULL && author_sz > 0) {
+        size_t alen = (size_t)(bar - p1);
+        if (alen >= author_sz) {
+            alen = author_sz - 1;
+        }
+        memcpy(author_out, p1, alen);
+        author_out[alen] = '\0';
+    }
+    if (snippet_out != NULL && snippet_sz > 0) {
+        size_t slen = (size_t)(end - p2);
+        if (slen >= snippet_sz) {
+            slen = snippet_sz - 1;
+        }
+        memcpy(snippet_out, p2, slen);
+        snippet_out[slen] = '\0';
+    }
+    if (body_out != NULL) {
+        *body_out = end + 2;
+    }
+    return 1;
 }
 
 #endif
