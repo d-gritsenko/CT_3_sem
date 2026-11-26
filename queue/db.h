@@ -20,6 +20,13 @@ struct db_msg_record {
     long timestamp;
 };
 
+
+struct db_room_meta {
+    char owner[MAX_NAME];
+    char topic[MAX_TEXT];
+    char pinned_text[MAX_TEXT];
+};
+
 int db_init(const char *path);
 void db_close(void);
 
@@ -52,5 +59,12 @@ int db_mark_room_read(const char *username, const char *room);
 
 int db_edit_message(int is_room, long msg_id, const char *sender, const char *new_text);
 int db_delete_message(int is_room, long msg_id, const char *sender);
+
+
+int db_room_ensure_meta(const char *room, const char *default_owner);
+int db_room_get_meta(const char *room, struct db_room_meta *out);
+int db_room_set_topic(const char *room, const char *topic);
+int db_room_set_pin(const char *room, const char *pinned_text);
+int db_room_load_members(const char *room, char members_out[][MAX_NAME], int max_members);
 
 #endif

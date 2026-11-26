@@ -39,7 +39,10 @@ enum ui_event_kind {
 
     EV_TYPING = 8,
     EV_MSG_EDIT = 9,
-    EV_MSG_DELETE = 10
+
+    EV_MSG_DELETE = 10,
+    EV_ROOM_INFO = 11,
+    EV_ROOM_KICK = 12
 };
 
 struct ui_event {
@@ -96,7 +99,11 @@ struct dialog_entry {
     time_t typing_until;
 
     struct msg_slot msgs[MAX_TRACKED_MSGS];
+
     int msg_count;
+    char owner[MAX_NAME];
+    char topic[MAX_TEXT];
+    char pinned[MAX_TEXT];
 };
 
 struct room_list_item {
@@ -249,14 +256,20 @@ static GtkWidget *w_chat_header = NULL;
 static GtkWidget *w_chat_menu_btn = NULL;
 static GtkWidget *w_chat_menu = NULL;
 
+
 static GtkWidget *w_mi_search = NULL;
+static GtkWidget *w_mi_room_info = NULL;
 static GtkWidget *w_mi_leave = NULL;
 static GtkWidget *w_mi_delete = NULL;
 static GtkWidget *w_chat_view = NULL;
 
 static GtkWidget *w_search_bar = NULL;
 static GtkWidget *w_search_entry = NULL;
+
 static GtkWidget *w_search_count_lbl = NULL;
+static GtkWidget *w_pin_bar = NULL;
+static GtkWidget *w_pin_lbl = NULL;
+static GtkWidget *w_pin_close = NULL;
 
 static GtkWidget *w_tab_users = NULL;
 static GtkWidget *w_tab_rooms = NULL;
@@ -282,7 +295,9 @@ static GtkWidget *w_compose_lbl = NULL;
 static GtkWidget *w_msg_menu = NULL;
 static GtkWidget *w_mi_msg_reply = NULL;
 static GtkWidget *w_mi_msg_edit = NULL;
+
 static GtkWidget *w_mi_msg_delete = NULL;
+static GtkWidget *w_mi_msg_pin = NULL;
 static void ui_rebuild_users_list(void);
 static void ui_rebuild_rooms_list(void);
 static void ui_update_tab_labels(void);
@@ -563,7 +578,9 @@ static void apply_css(void) {
         "popover, popover.background { background-color: %s; color: %s; border: 1px solid %s; border-radius: 8px; padding: 12px; }\n"
 
         ".acct-info { font-weight: bold; color: %s; }\n"
-        ".compose-bar { background-color: %s; border: 1px solid %s; border-radius: 6px; padding: 4px 8px; }\n",
+
+        ".compose-bar { background-color: %s; border: 1px solid %s; border-radius: 6px; padding: 4px 8px; }\n"
+        ".pin-bar { background-color: %s; border: 1px solid %s; border-radius: 6px; padding: 4px 8px; }\n",
         t->win_bg, t->fg, ui_pt,
         t->fg, ui_pt,
         t->chat_bg, t->border,
@@ -606,7 +623,8 @@ static void apply_css(void) {
         t->row_sel_bg, t->row_sel_fg,
         t->chat_bg, t->fg, t->border,
 
-        t->accent, t->entry_bg, t->accent
+
+        t->accent, t->entry_bg, t->accent, t->entry_bg, t->warn
     );
 
     gtk_css_provider_load_from_data(g_css_provider, css_data, -1, NULL);
@@ -1407,27 +1425,55 @@ static void ui_update_chat_header(void) {
         return;
     }
 
+
     if (g_active_peer[0] == '\0') {
         gtk_label_set_text(GTK_LABEL(w_chat_header), "★ System");
         if (w_chat_menu_btn != NULL) {
             gtk_widget_set_visible(w_chat_menu_btn, FALSE);
         }
+        if (w_pin_bar != NULL) {
+            gtk_widget_set_visible(w_pin_bar, FALSE);
+        }
         return;
     }
 
+
     time_t now = time(NULL);
-    char header[MAX_NAME * 2 + 96];
     if (g_active_is_room) {
+        char header[MAX_NAME * 2 + MAX_TEXT + 64];
         struct dialog_entry *d = find_dialog(g_active_peer, 1);
         int members = (d != NULL && d->member_count > 0) ? d->member_count : 1;
         if (d != NULL && d->typing_until > now && d->typing_user[0] != '\0') {
             snprintf(header, sizeof(header), "#%s (%d %s) — %s is typing...",
                      g_active_peer, members, members == 1 ? "member" : "members", d->typing_user);
+        } else if (d != NULL && d->topic[0] != '\0') {
+            snprintf(header, sizeof(header), "#%s (%d %s) — %s",
+                     g_active_peer, members, members == 1 ? "member" : "members", d->topic);
         } else {
             snprintf(header, sizeof(header), "#%s (%d %s)", g_active_peer, members, members == 1 ? "member" : "members");
         }
         gtk_label_set_text(GTK_LABEL(w_chat_header), header);
+
+        if (w_pin_bar != NULL && w_pin_lbl != NULL) {
+            if (d != NULL && d->pinned[0] != '\0') {
+                char plbl[MAX_TEXT + 16];
+                snprintf(plbl, sizeof(plbl), "📌 %s", d->pinned);
+                gtk_label_set_text(GTK_LABEL(w_pin_lbl), plbl);
+                gtk_widget_set_visible(w_pin_bar, TRUE);
+                if (w_pin_close != NULL) {
+                    char cur_name[MAX_NAME];
+                    pthread_mutex_lock(&g_mtx);
+                    snprintf(cur_name, sizeof(cur_name), "%.*s", MAX_NAME - 1, g_my_name);
+                    pthread_mutex_unlock(&g_mtx);
+                    int is_owner = (d->owner[0] != '\0' && strcmp(d->owner, cur_name) == 0);
+                    gtk_widget_set_visible(w_pin_close, is_owner ? TRUE : FALSE);
+                }
+            } else {
+                gtk_widget_set_visible(w_pin_bar, FALSE);
+            }
+        }
     } else {
+        char header[MAX_NAME * 2 + 96];
         struct dialog_entry *d = find_dialog(g_active_peer, 0);
         int online = is_user_online(g_active_peer);
         if (d != NULL && d->typing_until > now) {
@@ -1436,8 +1482,10 @@ static void ui_update_chat_header(void) {
             snprintf(header, sizeof(header), "Chat with %s (%s)", g_active_peer, online ? "online" : "offline");
         }
         gtk_label_set_text(GTK_LABEL(w_chat_header), header);
+        if (w_pin_bar != NULL) {
+            gtk_widget_set_visible(w_pin_bar, FALSE);
+        }
     }
-
     if (w_chat_menu_btn != NULL) {
         gtk_widget_set_visible(w_chat_menu_btn, TRUE);
     }
@@ -1785,6 +1833,87 @@ static void on_msg_delete_activate(GtkMenuItem *item, gpointer data) {
     }
 }
 
+static void send_room_pin_text(const char *room, const char *pin_text) {
+    if (room == NULL || room[0] == '\0') {
+        return;
+    }
+    pthread_mutex_lock(&g_mtx);
+    long cur_id = g_my_id;
+    pthread_mutex_unlock(&g_mtx);
+    if (cur_id <= 0) {
+        return;
+    }
+
+    drain_type(g_msqid, g_reply_type);
+    struct qmsg req;
+    memset(&req, 0, sizeof(req));
+    req.mtype = ARBITER_TYPE;
+    req.cmd = CMD_ROOM_PIN;
+    req.sender_id = cur_id;
+    req.reply_type = g_reply_type;
+    snprintf(req.name, sizeof(req.name), "%.*s", MAX_NAME - 1, room);
+    if (pin_text != NULL && pin_text[0] != '\0') {
+        copy_utf8_safe(req.text, sizeof(req.text), pin_text);
+    }
+
+    if (msgsnd(g_msqid, &req, MSG_SIZE, IPC_NOWAIT) < 0) {
+        ui_append_error("Failed to send pin request.");
+        return;
+    }
+    struct qmsg rep;
+    if (wait_reply(g_msqid, g_reply_type, &rep, 200) < 0) {
+        ui_append_error("No response from arbiter.");
+        return;
+    }
+    if (rep.target_id > 0) {
+        struct dialog_entry *d = find_dialog(room, 1);
+        if (d != NULL) {
+            copy_utf8_safe(d->pinned, sizeof(d->pinned), pin_text != NULL ? pin_text : "");
+            ui_update_chat_header();
+        }
+    } else {
+        rep.text[MAX_TEXT - 1] = '\0';
+        char err[MAX_TEXT + 32];
+        snprintf(err, sizeof(err), "Pin failed: %s", rep.text);
+        ui_append_error(err);
+    }
+}
+
+static void on_msg_pin_activate(GtkMenuItem *item, gpointer data) {
+    (void)item;
+    (void)data;
+    if (!g_active_is_room || g_active_peer[0] == '\0') {
+        return;
+    }
+    char rauthor[MAX_NAME];
+    char rsnip[64];
+    const char *src = g_ctx_msg_raw;
+    if (parse_reply_prefix(src, rauthor, sizeof(rauthor), rsnip, sizeof(rsnip), &src)) {
+        /* strip reply prefix */
+    }
+    char fstored[96];
+    char forig[96];
+    char pin_buf[180];
+    if (parse_file_marker(src, fstored, sizeof(fstored), NULL, forig, sizeof(forig))) {
+        snprintf(pin_buf, sizeof(pin_buf), "%s: [File: %.90s]", g_ctx_msg_sender, forig);
+    } else {
+        char body_trim[128];
+        copy_utf8_safe(body_trim, sizeof(body_trim), src);
+        snprintf(pin_buf, sizeof(pin_buf), "%s: %s", g_ctx_msg_sender, body_trim);
+    }
+    send_room_pin_text(g_active_peer, pin_buf);
+}
+
+static void on_unpin_clicked(GtkWidget *widget, gpointer data) {
+    (void)widget;
+    (void)data;
+    if (!g_active_is_room || g_active_peer[0] == '\0') {
+        return;
+    }
+    send_room_pin_text(g_active_peer, "");
+}
+
+
 static gboolean on_chat_view_button_press(GtkWidget *widget, GdkEventButton *event, gpointer data) {
     (void)data;
     if (event == NULL || event->type != GDK_BUTTON_PRESS || event->button != 3) {
@@ -1830,7 +1959,16 @@ static gboolean on_chat_view_button_press(GtkWidget *widget, GdkEventButton *eve
 
     gtk_widget_set_visible(w_mi_msg_reply, TRUE);
     gtk_widget_set_visible(w_mi_msg_edit, (hit->is_outgoing && !hit->is_file && hit->msg_id > 0 && !is_dbg) ? TRUE : FALSE);
+
     gtk_widget_set_visible(w_mi_msg_delete, (hit->is_outgoing && hit->msg_id > 0 && !is_dbg) ? TRUE : FALSE);
+    char cur_name[MAX_NAME];
+    pthread_mutex_lock(&g_mtx);
+    snprintf(cur_name, sizeof(cur_name), "%.*s", MAX_NAME - 1, g_my_name);
+    pthread_mutex_unlock(&g_mtx);
+    int can_pin = (g_active_is_room && d->owner[0] != '\0' && strcmp(d->owner, cur_name) == 0);
+    if (w_mi_msg_pin != NULL) {
+        gtk_widget_set_visible(w_mi_msg_pin, can_pin ? TRUE : FALSE);
+    }
 
     gtk_menu_popup_at_pointer(GTK_MENU(w_msg_menu), (GdkEvent *)event);
     return TRUE;
@@ -2477,11 +2615,248 @@ static void on_delete_clicked(GtkWidget *widget, gpointer data) {
 
 }
 
+
+static void on_kick_member_clicked(GtkWidget *btn, gpointer data) {
+    GtkWidget *row = GTK_WIDGET(data);
+    const char *room = g_object_get_data(G_OBJECT(btn), "room");
+    const char *target = g_object_get_data(G_OBJECT(btn), "target");
+    if (room == NULL || target == NULL || room[0] == '\0' || target[0] == '\0') {
+        return;
+    }
+
+    pthread_mutex_lock(&g_mtx);
+    long cur_id = g_my_id;
+    pthread_mutex_unlock(&g_mtx);
+    if (cur_id <= 0) {
+        return;
+    }
+
+    drain_type(g_msqid, g_reply_type);
+    struct qmsg req;
+    memset(&req, 0, sizeof(req));
+    req.mtype = ARBITER_TYPE;
+    req.cmd = CMD_ROOM_KICK;
+    req.sender_id = cur_id;
+    req.reply_type = g_reply_type;
+    snprintf(req.name, sizeof(req.name), "%.*s", MAX_NAME - 1, room);
+    snprintf(req.text, sizeof(req.text), "%.*s", MAX_NAME - 1, target);
+
+    if (msgsnd(g_msqid, &req, MSG_SIZE, IPC_NOWAIT) < 0) {
+        ui_append_error("Failed to send kick request.");
+        return;
+    }
+    struct qmsg rep;
+    if (wait_reply(g_msqid, g_reply_type, &rep, 200) < 0) {
+        ui_append_error("No response from arbiter.");
+        return;
+    }
+    if (rep.target_id > 0) {
+        if (row != NULL) {
+            gtk_widget_destroy(row);
+        }
+        g_who_force = 1;
+    } else {
+        rep.text[MAX_TEXT - 1] = '\0';
+        char err[MAX_TEXT + 32];
+        snprintf(err, sizeof(err), "Kick failed: %s", rep.text);
+        ui_append_error(err);
+    }
+}
+
+static void on_room_info_activate(GtkMenuItem *item, gpointer data) {
+    (void)item;
+    (void)data;
+    if (!g_active_is_room || g_active_peer[0] == '\0') {
+        return;
+    }
+
+    char cur_name[MAX_NAME];
+    pthread_mutex_lock(&g_mtx);
+    long cur_id = g_my_id;
+    snprintf(cur_name, sizeof(cur_name), "%.*s", MAX_NAME - 1, g_my_name);
+    pthread_mutex_unlock(&g_mtx);
+    if (cur_id <= 0) {
+        return;
+    }
+
+    char rname[MAX_NAME];
+    snprintf(rname, sizeof(rname), "%.*s", MAX_NAME - 1, g_active_peer);
+
+    drain_type(g_msqid, g_reply_type);
+    struct qmsg req;
+    memset(&req, 0, sizeof(req));
+    req.mtype = ARBITER_TYPE;
+    req.cmd = CMD_ROOM_INFO;
+    req.sender_id = cur_id;
+    req.reply_type = g_reply_type;
+    snprintf(req.name, sizeof(req.name), "%.*s", MAX_NAME - 1, rname);
+
+    if (msgsnd(g_msqid, &req, MSG_SIZE, IPC_NOWAIT) < 0) {
+        ui_append_error("Failed to request room info.");
+        return;
+    }
+
+    struct qmsg rep;
+    if (wait_reply(g_msqid, g_reply_type, &rep, 200) < 0 || rep.target_id < 0) {
+        ui_append_error("Failed to load room info.");
+        return;
+    }
+    rep.sender_name[MAX_NAME - 1] = '\0';
+    rep.text[MAX_TEXT - 1] = '\0';
+
+    struct dialog_entry *d = find_dialog(rname, 1);
+    if (d != NULL && rep.sender_name[0] != '\0') {
+        snprintf(d->owner, sizeof(d->owner), "%.*s", MAX_NAME - 1, rep.sender_name);
+    }
+    const char *owner = (rep.sender_name[0] != '\0') ? rep.sender_name : (d != NULL ? d->owner : "");
+    int is_owner = (owner[0] != '\0' && strcmp(owner, cur_name) == 0);
+    const struct ui_theme *t = current_theme();
+
+    char title[MAX_NAME + 32];
+    snprintf(title, sizeof(title), "Room #%s — Info & Members", rname);
+    GtkWidget *dlg = gtk_dialog_new_with_buttons(
+        title,
+        GTK_WINDOW(w_window),
+        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+        "_Close", GTK_RESPONSE_CLOSE,
+        NULL
+    );
+    gtk_window_set_default_size(GTK_WINDOW(dlg), 380, 400);
+
+    GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dlg));
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_widget_set_margin_top(box, 12);
+    gtk_widget_set_margin_bottom(box, 12);
+    gtk_widget_set_margin_start(box, 14);
+    gtk_widget_set_margin_end(box, 14);
+
+    char owner_txt[MAX_NAME + 32];
+    snprintf(owner_txt, sizeof(owner_txt), "Owner: ★ %s", owner[0] != '\0' ? owner : "unknown");
+    GtkWidget *owner_lbl = gtk_label_new(owner_txt);
+    gtk_widget_set_halign(owner_lbl, GTK_ALIGN_START);
+    gtk_style_context_add_class(gtk_widget_get_style_context(owner_lbl), "acct-info");
+    gtk_box_pack_start(GTK_BOX(box), owner_lbl, FALSE, FALSE, 0);
+
+    GtkWidget *topic_hdr = gtk_label_new("Topic:");
+    gtk_widget_set_halign(topic_hdr, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(box), topic_hdr, FALSE, FALSE, 0);
+
+    GtkWidget *topic_entry = NULL;
+    if (is_owner) {
+        topic_entry = gtk_entry_new();
+        gtk_entry_set_placeholder_text(GTK_ENTRY(topic_entry), "Set room topic...");
+        gtk_entry_set_max_length(GTK_ENTRY(topic_entry), 120);
+        if (d != NULL && d->topic[0] != '\0') {
+            gtk_entry_set_text(GTK_ENTRY(topic_entry), d->topic);
+        }
+        gtk_box_pack_start(GTK_BOX(box), topic_entry, FALSE, FALSE, 0);
+        gtk_dialog_add_button(GTK_DIALOG(dlg), "_Save Topic", GTK_RESPONSE_APPLY);
+    } else {
+        GtkWidget *t_lbl = gtk_label_new((d != NULL && d->topic[0] != '\0') ? d->topic : "No topic set");
+        gtk_widget_set_halign(t_lbl, GTK_ALIGN_START);
+        gtk_label_set_line_wrap(GTK_LABEL(t_lbl), TRUE);
+        gtk_box_pack_start(GTK_BOX(box), t_lbl, FALSE, FALSE, 0);
+    }
+
+    char mhdr[48];
+    snprintf(mhdr, sizeof(mhdr), "Members (%ld):", rep.target_id);
+    GtkWidget *mem_hdr = gtk_label_new(mhdr);
+    gtk_widget_set_halign(mem_hdr, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(box), mem_hdr, FALSE, FALSE, 0);
+
+    GtkWidget *m_scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(m_scroll), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+
+    gtk_scrolled_window_set_min_content_height(GTK_SCROLLED_WINDOW(m_scroll), 180);
+    gtk_widget_set_vexpand(m_scroll, TRUE);
+    GtkWidget *m_list = gtk_list_box_new();
+    gtk_list_box_set_selection_mode(GTK_LIST_BOX(m_list), GTK_SELECTION_NONE);
+
+    char copy[MAX_TEXT];
+    snprintf(copy, sizeof(copy), "%.*s", MAX_TEXT - 1, rep.text);
+    char *saveptr = NULL;
+    char *tok = strtok_r(copy, ",", &saveptr);
+    while (tok != NULL) {
+        int is_on = (tok[0] == '1');
+        const char *uname = (tok[0] != '\0' && tok[1] == ' ') ? (tok + 2) : tok;
+        if (uname[0] != '\0') {
+            GtkWidget *row = gtk_list_box_row_new();
+            GtkWidget *rbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+            gtk_widget_set_margin_top(rbox, 4);
+            gtk_widget_set_margin_bottom(rbox, 4);
+            gtk_widget_set_margin_start(rbox, 8);
+            gtk_widget_set_margin_end(rbox, 8);
+
+            char *esc = g_markup_escape_text(uname, -1);
+            char markup[MAX_NAME * 6 + 128];
+            int row_is_owner = (owner[0] != '\0' && strcmp(uname, owner) == 0);
+            snprintf(markup, sizeof(markup),
+                     "<span foreground='%s'>%s</span> %s%s",
+                     is_on ? t->online : t->muted,
+                     is_on ? "●" : "○",
+                     esc,
+                     row_is_owner ? "  ★" : "");
+            g_free(esc);
+
+            GtkWidget *lbl = gtk_label_new(NULL);
+            gtk_label_set_markup(GTK_LABEL(lbl), markup);
+            gtk_widget_set_halign(lbl, GTK_ALIGN_START);
+            gtk_box_pack_start(GTK_BOX(rbox), lbl, TRUE, TRUE, 0);
+
+            if (is_owner && strcmp(uname, cur_name) != 0) {
+                GtkWidget *kbtn = gtk_button_new_with_label("Kick");
+                gtk_style_context_add_class(gtk_widget_get_style_context(kbtn), "leave-btn");
+                g_object_set_data_full(G_OBJECT(kbtn), "room", g_strdup(rname), g_free);
+                g_object_set_data_full(G_OBJECT(kbtn), "target", g_strdup(uname), g_free);
+                g_signal_connect(kbtn, "clicked", G_CALLBACK(on_kick_member_clicked), row);
+                gtk_box_pack_end(GTK_BOX(rbox), kbtn, FALSE, FALSE, 0);
+            }
+
+            gtk_container_add(GTK_CONTAINER(row), rbox);
+            gtk_list_box_insert(GTK_LIST_BOX(m_list), row, -1);
+        }
+        tok = strtok_r(NULL, ",", &saveptr);
+    }
+
+    gtk_container_add(GTK_CONTAINER(m_scroll), m_list);
+    gtk_box_pack_start(GTK_BOX(box), m_scroll, TRUE, TRUE, 0);
+
+    gtk_box_pack_start(GTK_BOX(content), box, TRUE, TRUE, 0);
+    gtk_widget_show_all(dlg);
+
+    gint resp = gtk_dialog_run(GTK_DIALOG(dlg));
+    if (resp == GTK_RESPONSE_APPLY && is_owner && topic_entry != NULL) {
+        const char *new_topic = gtk_entry_get_text(GTK_ENTRY(topic_entry));
+        drain_type(g_msqid, g_reply_type);
+        struct qmsg treq;
+        memset(&treq, 0, sizeof(treq));
+        treq.mtype = ARBITER_TYPE;
+        treq.cmd = CMD_ROOM_TOPIC;
+        treq.sender_id = cur_id;
+        treq.reply_type = g_reply_type;
+        snprintf(treq.name, sizeof(treq.name), "%.*s", MAX_NAME - 1, rname);
+        if (new_topic != NULL) {
+            copy_utf8_safe(treq.text, sizeof(treq.text), new_topic);
+        }
+        if (msgsnd(g_msqid, &treq, MSG_SIZE, IPC_NOWAIT) == 0) {
+            struct qmsg trep;
+            if (wait_reply(g_msqid, g_reply_type, &trep, 200) == 0 && trep.target_id > 0) {
+                if (d != NULL) {
+                    copy_utf8_safe(d->topic, sizeof(d->topic), new_topic != NULL ? new_topic : "");
+                    ui_update_chat_header();
+                }
+            }
+        }
+    }
+    gtk_widget_destroy(dlg);
+}
+
 static void on_chat_menu_clicked(GtkWidget *widget, gpointer data) {
     (void)data;
     if (w_chat_menu == NULL || g_active_peer[0] == '\0') {
         return;
     }
+
     if (g_active_is_room) {
         struct dialog_entry *d = find_dialog(g_active_peer, 1);
         gtk_widget_set_visible(w_mi_leave, (d != NULL && d->joined) ? TRUE : FALSE);
@@ -2489,6 +2864,9 @@ static void on_chat_menu_clicked(GtkWidget *widget, gpointer data) {
     } else {
         gtk_widget_set_visible(w_mi_leave, FALSE);
         gtk_menu_item_set_label(GTK_MENU_ITEM(w_mi_delete), "Delete Chat");
+    }
+    if (w_mi_room_info != NULL) {
+        gtk_widget_set_visible(w_mi_room_info, g_active_is_room ? TRUE : FALSE);
     }
     gtk_widget_show(w_mi_delete);
 
@@ -2828,7 +3206,35 @@ static gboolean ui_handle_event(gpointer user_data) {
         ui_apply_msg_edit(d, ev->msg_id, ev->text);
     } else if (ev->kind == EV_MSG_DELETE) {
         struct dialog_entry *d = find_dialog(ev->room, ev->is_room);
+
         ui_apply_msg_delete(d, ev->msg_id);
+    } else if (ev->kind == EV_ROOM_INFO) {
+        struct dialog_entry *d = get_or_create_dialog(ev->room, 1);
+
+
+        if (d != NULL) {
+
+            d->joined = 1;
+            if (ev->sender[0] != '\0') {
+                snprintf(d->owner, sizeof(d->owner), "%.*s", MAX_NAME - 1, ev->sender);
+            }
+            if (ev->msg_id == 0) {
+                copy_utf8_safe(d->topic, sizeof(d->topic), ev->text);
+            } else if (ev->msg_id == 1) {
+                copy_utf8_safe(d->pinned, sizeof(d->pinned), ev->text);
+            }
+            if (g_active_is_room && strcmp(g_active_peer, d->peer) == 0) {
+                ui_update_chat_header();
+            }
+        }
+    } else if (ev->kind == EV_ROOM_KICK) {
+        remove_dialog(ev->room, 1);
+        char note[MAX_NAME * 2 + 48];
+        snprintf(note, sizeof(note), "You were kicked from #%s by %s.", ev->room, ev->sender);
+        ui_append_sys("err", note);
+        g_who_force = 1;
+        ui_rebuild_rooms_list();
+        ui_update_tab_labels();
     } else if (ev->kind == EV_WHO) {
         ui_update_users_list(ev->msg_id, ev->text);
     } else if (ev->kind == EV_ROOMS) {
@@ -2968,8 +3374,37 @@ static void *recv_worker(void *arg) {
                     copy_utf8_safe(ev->room, sizeof(ev->room), msg.name);
                     copy_utf8_safe(ev->sender, sizeof(ev->sender), msg.sender_name);
                     g_idle_add(ui_handle_event, ev);
+
                 }
-            }
+
+            } else if (msg.cmd == CMD_ROOM_INFO) {
+                msg.name[MAX_NAME - 1] = '\0';
+                msg.sender_name[MAX_NAME - 1] = '\0';
+                msg.text[MAX_TEXT - 1] = '\0';
+
+                struct ui_event *ev = calloc(1, sizeof(*ev));
+                if (ev != NULL) {
+                    ev->kind = EV_ROOM_INFO;
+                    ev->is_room = 1;
+                    ev->msg_id = msg.msg_id;
+                    copy_utf8_safe(ev->room, sizeof(ev->room), msg.name);
+                    copy_utf8_safe(ev->sender, sizeof(ev->sender), msg.sender_name);
+                    copy_utf8_safe(ev->text, sizeof(ev->text), msg.text);
+                    g_idle_add(ui_handle_event, ev);
+                }
+            } else if (msg.cmd == CMD_ROOM_KICK) {
+                msg.name[MAX_NAME - 1] = '\0';
+                msg.sender_name[MAX_NAME - 1] = '\0';
+
+                struct ui_event *ev = calloc(1, sizeof(*ev));
+                if (ev != NULL) {
+                    ev->kind = EV_ROOM_KICK;
+                    ev->is_room = 1;
+                    copy_utf8_safe(ev->room, sizeof(ev->room), msg.name);
+                    copy_utf8_safe(ev->sender, sizeof(ev->sender), msg.sender_name);
+                    g_idle_add(ui_handle_event, ev);
+                }
+                }
         } else {
             if (errno == ENOMSG) {
                 usleep(50000);
@@ -3639,7 +4074,12 @@ static void on_window_destroy(GtkWidget *widget, gpointer data) {
     w_scale_combo = NULL;
     w_chat_menu_btn = NULL;
 
+
     w_mi_search = NULL;
+    w_mi_room_info = NULL;
+    w_pin_bar = NULL;
+    w_pin_lbl = NULL;
+    w_pin_close = NULL;
     w_search_bar = NULL;
     w_search_entry = NULL;
     w_search_count_lbl = NULL;
@@ -3656,6 +4096,7 @@ static void on_window_destroy(GtkWidget *widget, gpointer data) {
     w_mi_msg_reply = NULL;
     w_mi_msg_edit = NULL;
     w_mi_msg_delete = NULL;
+    w_mi_msg_pin = NULL;
     w_users_list = NULL;
     w_users_lbl = NULL;
     w_rooms_list = NULL;
@@ -3851,6 +4292,10 @@ static void build_ui(void) {
 
     w_mi_search = gtk_menu_item_new_with_label("🔍  Search");
     g_signal_connect(w_mi_search, "activate", G_CALLBACK(on_search_menu_activate), NULL);
+
+    w_mi_room_info = gtk_menu_item_new_with_label("👥  Members & Info");
+    g_signal_connect(w_mi_room_info, "activate", G_CALLBACK(on_room_info_activate), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(w_chat_menu), w_mi_room_info);
     gtk_menu_shell_append(GTK_MENU_SHELL(w_chat_menu), w_mi_search);
     w_mi_leave = gtk_menu_item_new_with_label("Leave Room");
     w_mi_delete = gtk_menu_item_new_with_label("Delete Chat");
@@ -3867,6 +4312,19 @@ static void build_ui(void) {
     gtk_box_pack_start(GTK_BOX(header_bar), w_chat_header, TRUE, TRUE, 0);
     gtk_box_pack_end(GTK_BOX(header_bar), w_chat_menu_btn, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(chat_col), header_bar, FALSE, FALSE, 0);
+
+    w_pin_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_style_context_add_class(gtk_widget_get_style_context(w_pin_bar), "pin-bar");
+    w_pin_lbl = gtk_label_new("");
+    gtk_widget_set_halign(w_pin_lbl, GTK_ALIGN_START);
+    gtk_label_set_ellipsize(GTK_LABEL(w_pin_lbl), PANGO_ELLIPSIZE_END);
+    w_pin_close = gtk_button_new_with_label("✕");
+    gtk_widget_set_tooltip_text(w_pin_close, "Unpin message");
+    gtk_style_context_add_class(gtk_widget_get_style_context(w_pin_close), "tab-btn");
+    g_signal_connect(w_pin_close, "clicked", G_CALLBACK(on_unpin_clicked), NULL);
+    gtk_box_pack_start(GTK_BOX(w_pin_bar), w_pin_lbl, TRUE, TRUE, 0);
+    gtk_box_pack_end(GTK_BOX(w_pin_bar), w_pin_close, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(chat_col), w_pin_bar, FALSE, FALSE, 0);
 
     w_search_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
 
@@ -3926,6 +4384,10 @@ static void build_ui(void) {
     g_signal_connect(w_mi_msg_delete, "activate", G_CALLBACK(on_msg_delete_activate), NULL);
     gtk_menu_shell_append(GTK_MENU_SHELL(w_msg_menu), w_mi_msg_reply);
     gtk_menu_shell_append(GTK_MENU_SHELL(w_msg_menu), w_mi_msg_edit);
+
+    w_mi_msg_pin = gtk_menu_item_new_with_label("📌  Pin");
+    g_signal_connect(w_mi_msg_pin, "activate", G_CALLBACK(on_msg_pin_activate), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(w_msg_menu), w_mi_msg_pin);
     gtk_menu_shell_append(GTK_MENU_SHELL(w_msg_menu), w_mi_msg_delete);
     gtk_box_pack_start(GTK_BOX(mid_box), chat_col, TRUE, TRUE, 0);
 

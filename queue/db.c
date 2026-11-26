@@ -198,6 +198,12 @@ int db_init(const char *path) {
         "  username TEXT NOT NULL,"
         "  last_read_id INTEGER NOT NULL DEFAULT 0,"
         "  PRIMARY KEY(room, username)"
+        ");"
+        "CREATE TABLE IF NOT EXISTS room_meta ("
+        "  room TEXT PRIMARY KEY,"
+        "  owner TEXT NOT NULL DEFAULT '',"
+        "  topic TEXT NOT NULL DEFAULT '',"
+        "  pinned_text TEXT NOT NULL DEFAULT ''"
         ");";
 
     char *errmsg = NULL;
@@ -732,6 +738,8 @@ int db_delete_room_for_user(const char *username, const char *room, int remainin
 
         db_exec_delete_by_room("DELETE FROM room_cleared WHERE room = ?1;", room);
         db_exec_delete_by_room("DELETE FROM room_read WHERE room = ?1;", room);
+
+        db_exec_delete_by_room("DELETE FROM room_meta WHERE room = ?1;", room);
     }
 
     return 0;
@@ -812,4 +820,124 @@ int db_delete_message(int is_room, long msg_id, const char *sender) {
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     return (rc == SQLITE_DONE) ? sqlite3_changes(g_db) : -1;
+}
+
+
+int db_room_ensure_meta(const char *room, const char *default_owner) {
+    if (g_db == NULL || room == NULL || room[0] == '\0') {
+        return 0;
+    }
+    const char *owner = (default_owner != NULL) ? default_owner : "";
+    sqlite3_stmt *stmt = NULL;
+    const char *sql_ins =
+        "INSERT OR IGNORE INTO room_meta (room, owner, topic, pinned_text) "
+        "VALUES (?1, ?2, '', '');";
+    if (sqlite3_prepare_v2(g_db, sql_ins, -1, &stmt, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    sqlite3_bind_text(stmt, 1, room, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, owner, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+
+    if (owner[0] != '\0') {
+        const char *sql_upd =
+            "UPDATE room_meta SET owner = ?1 WHERE room = ?2 AND owner = '';";
+        if (sqlite3_prepare_v2(g_db, sql_upd, -1, &stmt, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(stmt, 1, owner, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 2, room, -1, SQLITE_TRANSIENT);
+            sqlite3_step(stmt);
+            sqlite3_finalize(stmt);
+        }
+    }
+    return (rc == SQLITE_DONE) ? 0 : -1;
+}
+
+int db_room_get_meta(const char *room, struct db_room_meta *out) {
+    if (out != NULL) {
+        memset(out, 0, sizeof(*out));
+    }
+    if (g_db == NULL || room == NULL || room[0] == '\0' || out == NULL) {
+        return -1;
+    }
+    const char *sql = "SELECT owner, topic, pinned_text FROM room_meta WHERE room = ?1;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    sqlite3_bind_text(stmt, 1, room, -1, SQLITE_TRANSIENT);
+    int found = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *o = (const char *)sqlite3_column_text(stmt, 0);
+        const char *t = (const char *)sqlite3_column_text(stmt, 1);
+        const char *p = (const char *)sqlite3_column_text(stmt, 2);
+        if (o != NULL) {
+            snprintf(out->owner, sizeof(out->owner), "%.*s", MAX_NAME - 1, o);
+        }
+        if (t != NULL) {
+            copy_utf8_safe(out->topic, sizeof(out->topic), t);
+        }
+        if (p != NULL) {
+            copy_utf8_safe(out->pinned_text, sizeof(out->pinned_text), p);
+        }
+        found = 1;
+    }
+    sqlite3_finalize(stmt);
+    return found ? 0 : -1;
+}
+
+int db_room_set_topic(const char *room, const char *topic) {
+    if (g_db == NULL || room == NULL || room[0] == '\0') {
+        return -1;
+    }
+    db_room_ensure_meta(room, "");
+    const char *sql = "UPDATE room_meta SET topic = ?1 WHERE room = ?2;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    sqlite3_bind_text(stmt, 1, topic != NULL ? topic : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, room, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_DONE) ? 0 : -1;
+}
+
+int db_room_set_pin(const char *room, const char *pinned_text) {
+    if (g_db == NULL || room == NULL || room[0] == '\0') {
+        return -1;
+    }
+    db_room_ensure_meta(room, "");
+    const char *sql = "UPDATE room_meta SET pinned_text = ?1 WHERE room = ?2;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    sqlite3_bind_text(stmt, 1, pinned_text != NULL ? pinned_text : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, room, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_DONE) ? 0 : -1;
+}
+
+int db_room_load_members(const char *room, char members_out[][MAX_NAME], int max_members) {
+    if (g_db == NULL || room == NULL || room[0] == '\0' || members_out == NULL || max_members <= 0) {
+        return 0;
+    }
+    const char *sql = "SELECT username FROM room_members WHERE room = ?1 ORDER BY username ASC;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        return 0;
+    }
+    sqlite3_bind_text(stmt, 1, room, -1, SQLITE_TRANSIENT);
+    int count = 0;
+    while (count < max_members && sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *u = (const char *)sqlite3_column_text(stmt, 0);
+        if (u != NULL && u[0] != '\0') {
+            snprintf(members_out[count], MAX_NAME, "%.*s", MAX_NAME - 1, u);
+            count++;
+        }
+    }
+    sqlite3_finalize(stmt);
+    return count;
 }

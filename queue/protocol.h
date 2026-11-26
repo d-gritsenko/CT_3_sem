@@ -62,7 +62,11 @@ enum msg_cmd {
     CMD_FILE_GET = 23,
     CMD_TYPING = 24,
     CMD_MSG_EDIT = 25,
-    CMD_MSG_DELETE = 26
+    CMD_MSG_DELETE = 26,
+    CMD_ROOM_INFO = 27,
+    CMD_ROOM_KICK = 28,
+    CMD_ROOM_PIN = 29,
+    CMD_ROOM_TOPIC = 30
 };
 
 struct qmsg {
