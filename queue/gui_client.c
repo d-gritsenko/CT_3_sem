@@ -213,6 +213,8 @@ static int g_font_size = 11;
 
 static int g_manual_font_size = 0;
 
+static int g_chat_col_margin = 140;
+
 static time_t g_last_typing_sent = 0;
 static char g_last_typing_peer[MAX_NAME] = "";
 static int g_last_typing_is_room = 0;
@@ -514,6 +516,13 @@ static void apply_buffer_theme(GtkTextBuffer *buf) {
     if ((tag = gtk_text_tag_table_lookup(table, "search_cur")) != NULL) {
         g_object_set(tag, "background", t->accent, "foreground", t->btn_fg, NULL);
     }
+
+    if ((tag = gtk_text_tag_table_lookup(table, "msg_in")) != NULL) {
+        g_object_set(tag, "right-margin", g_chat_col_margin, NULL);
+    }
+    if ((tag = gtk_text_tag_table_lookup(table, "msg_out")) != NULL) {
+        g_object_set(tag, "left-margin", g_chat_col_margin, NULL);
+    }
 }
 
 static GtkTextBuffer *create_chat_buffer(void) {
@@ -532,6 +541,21 @@ static GtkTextBuffer *create_chat_buffer(void) {
 
     gtk_text_buffer_create_tag(buf, "search_hit", "background", t->row_sel_bg, "foreground", t->row_sel_fg, NULL);
     gtk_text_buffer_create_tag(buf, "search_cur", "background", t->accent, "foreground", t->btn_fg, "weight", PANGO_WEIGHT_BOLD, NULL);
+
+    gtk_text_buffer_create_tag(buf, "msg_in",
+                               "justification", GTK_JUSTIFY_LEFT,
+                               "left-margin", 4,
+                               "right-margin", g_chat_col_margin,
+                               "pixels-above-lines", 2,
+                               "pixels-below-lines", 2,
+                               NULL);
+    gtk_text_buffer_create_tag(buf, "msg_out",
+                               "justification", GTK_JUSTIFY_RIGHT,
+                               "left-margin", g_chat_col_margin,
+                               "right-margin", 4,
+                               "pixels-above-lines", 2,
+                               "pixels-below-lines", 2,
+                               NULL);
     return buf;
 }
 
@@ -1223,6 +1247,18 @@ static void ui_apply_msg_edit(struct dialog_entry *d, long msg_id, const char *n
             gtk_text_buffer_insert(d->buf, &s, display_body, -1);
             gtk_text_buffer_insert_with_tags_by_name(d->buf, &s, " (edited)", -1, "edited", NULL);
             gtk_text_buffer_move_mark(d->buf, slot->body_end, &s);
+
+
+            GtkTextIter ls_it;
+
+            GtkTextIter le_it;
+
+            gtk_text_buffer_get_iter_at_mark(d->buf, &ls_it, slot->line_start);
+
+            gtk_text_buffer_get_iter_at_mark(d->buf, &le_it, slot->line_end);
+
+            gtk_text_buffer_apply_tag_by_name(d->buf, slot->is_outgoing ? "msg_out" : "msg_in", &ls_it, &le_it);
+
             return;
         }
     }
@@ -1310,6 +1346,10 @@ static void ui_append_dialog_msg_ts(struct dialog_entry *d, long msg_id, time_t 
     gtk_text_buffer_get_end_iter(d->buf, &end);
     GtkTextMark *le = gtk_text_buffer_create_mark(d->buf, NULL, &end, TRUE);
 
+    GtkTextIter ls_it;
+    gtk_text_buffer_get_iter_at_mark(d->buf, &ls_it, ls);
+    gtk_text_buffer_apply_tag_by_name(d->buf, is_outgoing ? "msg_out" : "msg_in", &ls_it, &end);
+
     ui_record_msg_slot(d, msg_id, is_outgoing, is_file, sender_name, body, ls, bs, be, le);
     ui_scroll_if_active(d->buf);
 }
@@ -1380,6 +1420,10 @@ static void ui_append_outgoing_to(struct dialog_entry *d, long msg_id, const cha
 
     gtk_text_buffer_get_end_iter(d->buf, &end);
     GtkTextMark *le = gtk_text_buffer_create_mark(d->buf, NULL, &end, TRUE);
+
+    GtkTextIter ls_it;
+    gtk_text_buffer_get_iter_at_mark(d->buf, &ls_it, ls);
+    gtk_text_buffer_apply_tag_by_name(d->buf, "msg_out", &ls_it, &end);
 
     char cur_name[MAX_NAME];
     pthread_mutex_lock(&g_mtx);
@@ -3741,6 +3785,7 @@ static void do_auth(int is_login) {
             msgsnd(g_msqid, &hreq, MSG_SIZE, IPC_NOWAIT);
         }
 
+
     } else {
         ui_stop_auth_lock_timer();
         int wait_sec = 0;
@@ -3758,12 +3803,9 @@ static void do_auth(int is_login) {
         }
         gtk_entry_set_text(GTK_ENTRY(w_auth_pass), "");
         gtk_widget_grab_focus(w_auth_pass);
-            char info[MAX_TEXT + 32];
-            snprintf(info, sizeof(info), "%s", rep.text[0] != '\0' ? rep.text : "Auth failed");
-            gtk_label_set_text(GTK_LABEL(w_auth_err), info);
-        }
     }
 
+}
 static void on_login_clicked(GtkWidget *widget, gpointer data) {
     (void)widget;
     (void)data;
@@ -4185,31 +4227,47 @@ static void on_attach_clicked(GtkWidget *widget, gpointer data) {
 
 
 
+
+static void update_chat_column_margins(int win_w) {
+    int sb_w = 210 + (g_font_size > 11 ? (g_font_size - 11) * 16 : 0);
+    int chat_w = win_w - sb_w - 40;
+    int margin = (chat_w * 30) / 100;
+    if (margin < 80) {
+        margin = 80;
+    } else if (margin > 500) {
+        margin = 500;
+    }
+    if (margin - g_chat_col_margin >= 12 || g_chat_col_margin - margin >= 12) {
+        g_chat_col_margin = margin;
+        for (int i = 0; i < MAX_DIALOGS; i++) {
+            if (g_dialogs[i].used && g_dialogs[i].buf != NULL) {
+                apply_buffer_theme(g_dialogs[i].buf);
+            }
+        }
+    }
+}
+
 static gboolean on_window_configure(GtkWidget *widget, GdkEventConfigure *event, gpointer data) {
 
     (void)data;
-
-    if (g_manual_font_size > 0 || widget == NULL || event == NULL) {
-
+    if (widget == NULL || event == NULL) {
         return FALSE;
-
     }
-
     if (event->window != gtk_widget_get_window(widget)) {
-
         return FALSE;
-
     }
-
     int w = 0;
-
     int h = 0;
     gtk_window_get_size(GTK_WINDOW(widget), &w, &h);
     if (w <= 0 || h <= 0) {
         return FALSE;
     }
-    apply_font_size(compute_auto_font_size(w, h));
+    if (g_manual_font_size <= 0) {
+        apply_font_size(compute_auto_font_size(w, h));
+    }
+    update_chat_column_margins(w);
     return FALSE;
+
 }
 
 static void on_window_destroy(GtkWidget *widget, gpointer data) {
