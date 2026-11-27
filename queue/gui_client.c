@@ -1530,6 +1530,8 @@ static void ui_update_chat_header(void) {
 static gboolean ui_typing_tick(gpointer data) {
     (void)data;
     if (!g_running) {
+
+        g_typing_timer_id = 0;
         return G_SOURCE_REMOVE;
     }
     time_t now = time(NULL);
@@ -3611,10 +3613,14 @@ static void *heartbeat_worker(void *arg) {
 }
 
 static void ui_stop_auth_lock_timer(void) {
+
     if (g_auth_lock_timer_id > 0) {
-        g_source_remove(g_auth_lock_timer_id);
+        if (g_main_context_find_source_by_id(NULL, g_auth_lock_timer_id) != NULL) {
+            g_source_remove(g_auth_lock_timer_id);
+        }
         g_auth_lock_timer_id = 0;
     }
+
     g_auth_lock_secs = 0;
 }
 
@@ -3658,8 +3664,12 @@ static void do_auth(int is_login) {
         return;
     }
     if (pass == NULL || pass[0] == '\0' || strlen(pass) >= MAX_PASS) {
-        gtk_label_set_text(GTK_LABEL(w_auth_err), "Enter password.");
-        gtk_widget_grab_focus(w_auth_pass);
+
+        if (g_auth_lock_secs <= 0) {
+            gtk_label_set_text(GTK_LABEL(w_auth_err), "Enter password.");
+
+            gtk_widget_grab_focus(w_auth_pass);
+        }
         return;
     }
 
@@ -3740,12 +3750,18 @@ static void do_auth(int is_login) {
             snprintf(info, sizeof(info), "too many attempts, wait %ds", g_auth_lock_secs);
             gtk_label_set_text(GTK_LABEL(w_auth_err), info);
             g_auth_lock_timer_id = g_timeout_add(1000, ui_auth_lock_tick, NULL);
+
         } else {
             char info[MAX_TEXT + 32];
             snprintf(info, sizeof(info), "%s", rep.text[0] != '\0' ? rep.text : "Auth failed");
             gtk_label_set_text(GTK_LABEL(w_auth_err), info);
         }
-    }
+        gtk_entry_set_text(GTK_ENTRY(w_auth_pass), "");
+        gtk_widget_grab_focus(w_auth_pass);
+            char info[MAX_TEXT + 32];
+            snprintf(info, sizeof(info), "%s", rep.text[0] != '\0' ? rep.text : "Auth failed");
+            gtk_label_set_text(GTK_LABEL(w_auth_err), info);
+        }
     }
 
 static void on_login_clicked(GtkWidget *widget, gpointer data) {
@@ -4247,7 +4263,10 @@ static void on_window_destroy(GtkWidget *widget, gpointer data) {
     w_sidebar = NULL;
 
     if (g_typing_timer_id > 0) {
-        g_source_remove(g_typing_timer_id);
+
+        if (g_main_context_find_source_by_id(NULL, g_typing_timer_id) != NULL) {
+            g_source_remove(g_typing_timer_id);
+        }
         g_typing_timer_id = 0;
     }
 
