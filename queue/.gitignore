@@ -16,3 +16,4 @@ users.db-wal
 users.db-shm
 uploads/
 downloads/arbiter.log
+*.jpg

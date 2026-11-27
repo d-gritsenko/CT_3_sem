@@ -37,6 +37,9 @@ int db_register_user(const char *username, const char *password, char *err_buf, 
 int db_verify_user(const char *username, const char *password, int *out_theme_id, char *err_buf, size_t err_size);
 int db_set_theme(const char *username, int theme_id);
 
+int db_set_pubkey(const char *username, const char *pubkey_hex);
+int db_get_pubkey(const char *username, char *out_hex, size_t out_size);
+
 
 long db_save_dm(const char *sender, const char *receiver, const char *text, time_t ts);
 int db_load_dm_history(const char *username, const char *peer_filter,

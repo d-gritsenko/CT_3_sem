@@ -25,10 +25,10 @@
 
 #define MAX_NAME 32
 #define MAX_PASS 64
-#define MAX_TEXT 255
 #define MAX_CLIENTS 64
 #define MAX_PENDING 128
 #define MAX_ROOMS 16
+#define MAX_TEXT 1024
 
 #define ARBITER_TYPE 1L
 #define REPLY_BASE 100000L
@@ -67,7 +67,9 @@ enum msg_cmd {
     CMD_ROOM_INFO = 27,
     CMD_ROOM_KICK = 28,
     CMD_ROOM_PIN = 29,
-    CMD_ROOM_TOPIC = 30
+    CMD_ROOM_TOPIC = 30,
+    CMD_PUBKEY_SET = 31,
+    CMD_PUBKEY_GET = 32
 };
 
 struct qmsg {

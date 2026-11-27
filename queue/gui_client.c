@@ -22,6 +22,8 @@
 
 #include "protocol.h"
 
+#include "crypto.h"
+
 #define MAX_DIALOGS (MAX_CLIENTS + MAX_ROOMS + 8)
 #define MAX_PENDING_ACKS 128
 
@@ -106,6 +108,9 @@ struct dialog_entry {
     char owner[MAX_NAME];
     char topic[MAX_TEXT];
     char pinned[MAX_TEXT];
+
+    int has_peer_pk;
+    unsigned char peer_pk[E2E_PK_BYTES];
 };
 
 struct room_list_item {
@@ -202,6 +207,10 @@ static long g_reply_type = 0;
 static long g_who_reply_type = 0;
 static long g_next_msg_id = 1;
 static char g_my_name[MAX_NAME];
+
+static int g_e2e_ready = 0;
+static unsigned char g_my_pk[E2E_PK_BYTES];
+static unsigned char g_my_sk[E2E_SK_BYTES];
 static pthread_mutex_t g_mtx = PTHREAD_MUTEX_INITIALIZER;
 
 static int g_suppress_select = 0;
@@ -266,6 +275,8 @@ static GtkWidget *w_chat_menu_btn = NULL;
 static GtkWidget *w_chat_menu = NULL;
 
 
+
+static GtkWidget *w_mi_enc_info = NULL;
 static GtkWidget *w_mi_search = NULL;
 static GtkWidget *w_mi_room_info = NULL;
 static GtkWidget *w_mi_leave = NULL;
@@ -353,6 +364,10 @@ static void send_logout(void) {
     g_my_id = 0;
     g_is_debug = 0;
     g_my_name[0] = '\0';
+
+    g_e2e_ready = 0;
+    e2e_zero(g_my_pk, sizeof(g_my_pk));
+    e2e_zero(g_my_sk, sizeof(g_my_sk));
     pthread_mutex_unlock(&g_mtx);
 
     if (my_id > 0 && g_msqid >= 0) {
@@ -463,6 +478,125 @@ static void send_typing(void) {
     snprintf(req.name, sizeof(req.name), "%.*s", MAX_NAME - 1, g_active_peer);
     msgsnd(g_msqid, &req, MSG_SIZE, IPC_NOWAIT);
 }
+
+static int fetch_peer_pubkey(const char *peer, unsigned char out_pk[E2E_PK_BYTES]) {
+    if (peer == NULL || peer[0] == '\0' || g_msqid < 0) {
+        return 0;
+    }
+    if (strncasecmp(peer, "user", 4) == 0) {
+        return 0;
+    }
+
+    pthread_mutex_lock(&g_mtx);
+    long cur_id = g_my_id;
+    uint64_t cur_tok = g_session_token;
+    int is_dbg = g_is_debug;
+    pthread_mutex_unlock(&g_mtx);
+
+    if (cur_id <= 0 || is_dbg) {
+        return 0;
+    }
+
+    drain_type(g_msqid, g_reply_type);
+
+    struct qmsg req;
+    memset(&req, 0, sizeof(req));
+    req.mtype = ARBITER_TYPE;
+    req.cmd = CMD_PUBKEY_GET;
+    req.sender_id = cur_id;
+    req.session_token = cur_tok;
+    req.reply_type = g_reply_type;
+    snprintf(req.name, sizeof(req.name), "%.*s", MAX_NAME - 1, peer);
+
+    if (msgsnd(g_msqid, &req, MSG_SIZE, IPC_NOWAIT) < 0) {
+        return 0;
+    }
+
+    struct qmsg rep;
+    if (wait_reply(g_msqid, g_reply_type, &rep, 100) < 0) {
+        return 0;
+    }
+    rep.text[MAX_TEXT - 1] = '\0';
+    return (rep.target_id > 0 && e2e_hex_to_pk(rep.text, out_pk) == 0) ? 1 : 0;
+}
+
+static int ensure_dialog_peer_pk(struct dialog_entry *d, int force_refresh) {
+    if (d == NULL || d->is_room) {
+        return 0;
+    }
+
+    pthread_mutex_lock(&g_mtx);
+    int ready = g_e2e_ready;
+    pthread_mutex_unlock(&g_mtx);
+
+    if (!ready) {
+        d->has_peer_pk = 0;
+        return 0;
+    }
+    if (d->has_peer_pk && !force_refresh) {
+        return 1;
+    }
+
+    unsigned char pk[E2E_PK_BYTES];
+    if (fetch_peer_pubkey(d->peer, pk)) {
+        memcpy(d->peer_pk, pk, E2E_PK_BYTES);
+        d->has_peer_pk = 1;
+        return 1;
+    }
+    if (force_refresh) {
+        d->has_peer_pk = 0;
+    }
+    return 0;
+}
+
+static void decrypt_dm_for_dialog(struct dialog_entry *d, const char *raw_text,
+                                  char *out, size_t out_size) {
+    if (raw_text == NULL || out == NULL || out_size == 0) {
+        return;
+    }
+    if (!e2e_is_encrypted(raw_text)) {
+        copy_utf8_safe(out, out_size, raw_text);
+        return;
+    }
+
+    unsigned char my_sk[E2E_SK_BYTES];
+    int ready = 0;
+    pthread_mutex_lock(&g_mtx);
+    ready = g_e2e_ready;
+    if (ready) {
+        memcpy(my_sk, g_my_sk, E2E_SK_BYTES);
+    }
+    pthread_mutex_unlock(&g_mtx);
+
+    if (!ready || d == NULL || d->is_room) {
+        e2e_zero(my_sk, sizeof(my_sk));
+        snprintf(out, out_size, "[🔒 Decryption failed]");
+        return;
+    }
+
+    if (ensure_dialog_peer_pk(d, 0) &&
+        e2e_decrypt_dm(raw_text, d->peer_pk, my_sk, out, out_size) == 0) {
+        e2e_zero(my_sk, sizeof(my_sk));
+        return;
+    }
+
+    unsigned char prev_pk[E2E_PK_BYTES];
+    int had_prev = d->has_peer_pk;
+    if (had_prev) {
+        memcpy(prev_pk, d->peer_pk, E2E_PK_BYTES);
+    }
+
+    if (ensure_dialog_peer_pk(d, 1) &&
+        (!had_prev || memcmp(prev_pk, d->peer_pk, E2E_PK_BYTES) != 0) &&
+        e2e_decrypt_dm(raw_text, d->peer_pk, my_sk, out, out_size) == 0) {
+        e2e_zero(my_sk, sizeof(my_sk));
+        return;
+    }
+
+    e2e_zero(my_sk, sizeof(my_sk));
+    snprintf(out, out_size, "[🔒 Decryption failed]");
+}
+
 
 static void on_msg_entry_changed(GtkEditable *editable, gpointer data) {
     (void)data;
@@ -1556,10 +1690,15 @@ static void ui_update_chat_header(void) {
         char header[MAX_NAME * 2 + 96];
         struct dialog_entry *d = find_dialog(g_active_peer, 0);
         int online = is_user_online(g_active_peer);
+
+        pthread_mutex_lock(&g_mtx);
+        int e2e_on = g_e2e_ready;
+        pthread_mutex_unlock(&g_mtx);
+        const char *lock = (e2e_on && d != NULL && d->has_peer_pk) ? "🔒 " : "";
         if (d != NULL && d->typing_until > now) {
-            snprintf(header, sizeof(header), "Chat with %s — typing...", g_active_peer);
+            snprintf(header, sizeof(header), "%sChat with %s — typing...", lock, g_active_peer);
         } else {
-            snprintf(header, sizeof(header), "Chat with %s (%s)", g_active_peer, online ? "online" : "offline");
+            snprintf(header, sizeof(header), "%sChat with %s (%s)", lock, g_active_peer, online ? "online" : "offline");
         }
         gtk_label_set_text(GTK_LABEL(w_chat_header), header);
         if (w_pin_bar != NULL) {
@@ -2180,6 +2319,10 @@ static void ui_switch_dialog(const char *peer, int is_room, int set_target) {
     d->unread = 0;
     flush_dialog_acks(d);
     send_mark_read(d->peer, is_room);
+
+    if (!is_room && !d->has_peer_pk) {
+        ensure_dialog_peer_pk(d, 0);
+    }
 
     gtk_text_view_set_buffer(GTK_TEXT_VIEW(w_chat_view), d->buf);
     ui_attach_dialog_widgets(d);
@@ -2980,19 +3123,78 @@ static void on_chat_menu_clicked(GtkWidget *widget, gpointer data) {
     if (w_mi_room_info != NULL) {
         gtk_widget_set_visible(w_mi_room_info, g_active_is_room ? TRUE : FALSE);
     }
+
+    if (w_mi_enc_info != NULL) {
+        struct dialog_entry *dm = g_active_is_room ? NULL : find_dialog(g_active_peer, 0);
+        pthread_mutex_lock(&g_mtx);
+        int e2e_on = g_e2e_ready;
+        pthread_mutex_unlock(&g_mtx);
+        gtk_widget_set_visible(w_mi_enc_info, (dm != NULL && dm->has_peer_pk && e2e_on) ? TRUE : FALSE);
+    }
     gtk_widget_show(w_mi_delete);
 
     if (w_mi_search != NULL) {
         gtk_widget_show(w_mi_search);
     }
+
     gtk_menu_popup_at_widget(
+
         GTK_MENU(w_chat_menu),
+
         widget,
+
         GDK_GRAVITY_SOUTH_EAST,
+
         GDK_GRAVITY_NORTH_EAST,
+
         NULL
+
     );
 }
+
+static void on_enc_info_activate(GtkMenuItem *item, gpointer data) {
+    (void)item;
+    (void)data;
+    if (g_active_is_room || g_active_peer[0] == '\0') {
+        return;
+    }
+    struct dialog_entry *d = find_dialog(g_active_peer, 0);
+    if (d == NULL || !ensure_dialog_peer_pk(d, 0)) {
+        return;
+    }
+
+    unsigned char my_pk[E2E_PK_BYTES];
+    int ready = 0;
+    pthread_mutex_lock(&g_mtx);
+    ready = g_e2e_ready;
+    if (ready) {
+        memcpy(my_pk, g_my_pk, E2E_PK_BYTES);
+    }
+    pthread_mutex_unlock(&g_mtx);
+    if (!ready) {
+        return;
+    }
+
+    char fp[32];
+    e2e_fingerprint(my_pk, d->peer_pk, fp, sizeof(fp));
+
+    GtkWidget *dlg = gtk_message_dialog_new(
+        GTK_WINDOW(w_window),
+        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+        GTK_MESSAGE_INFO,
+        GTK_BUTTONS_OK,
+        "End-to-End Encryption with %s",
+        d->peer
+    );
+    gtk_message_dialog_format_secondary_text(
+        GTK_MESSAGE_DIALOG(dlg),
+        "Algorithm: X25519 + XSalsa20-Poly1305\nShared key fingerprint:\n\n%s",
+        fp
+    );
+    gtk_dialog_run(GTK_DIALOG(dlg));
+    gtk_widget_destroy(dlg);
+}
+
 
 static void on_new_chat_clicked(GtkWidget *widget, gpointer data) {
     (void)widget;
@@ -3199,7 +3401,9 @@ static gboolean ui_handle_event(gpointer user_data) {
             snprintf(prefix, sizeof(prefix), "%s: ", ev->sender);
 
 
-            ui_append_dialog_msg_ts(d, ev->msg_id, (time_t)ev->timestamp, 0, 0, "incoming", ev->sender, prefix, ev->text);
+            char plain[MAX_TEXT];
+            decrypt_dm_for_dialog(d, ev->text, plain, sizeof(plain));
+            ui_append_dialog_msg_ts(d, ev->msg_id, (time_t)ev->timestamp, 0, 0, "incoming", ev->sender, prefix, plain);
 
             if (d->typing_until > 0 && strcmp(d->typing_user, ev->sender) == 0) {
                 d->typing_until = 0;
@@ -3212,6 +3416,8 @@ static gboolean ui_handle_event(gpointer user_data) {
             if (!g_active_is_room && strcmp(g_active_peer, d->peer) == 0) {
                 send_read_ack(ev->msg_id, ev->sender);
 
+
+                ui_update_chat_header();
                 send_mark_read(d->peer, 0);
             } else {
                 d->unread++;
@@ -3227,14 +3433,22 @@ static gboolean ui_handle_event(gpointer user_data) {
                 d->joined = 1;
             }
 
+            char plain[MAX_TEXT];
+            if (!ev->is_room) {
+                decrypt_dm_for_dialog(d, ev->text, plain, sizeof(plain));
+            } else {
+                copy_utf8_safe(plain, sizeof(plain), ev->text);
+            }
             if (ev->is_outgoing) {
                 ui_append_dialog_msg_ts(d, ev->msg_id, (time_t)ev->timestamp, 1, ev->is_edited,
-                                        "outgoing", ev->sender, "you: ", ev->text);
+
+                                        "outgoing", ev->sender, "you: ", plain);
             } else {
                 char prefix[MAX_NAME + 8];
                 snprintf(prefix, sizeof(prefix), "%s: ", ev->sender);
                 ui_append_dialog_msg_ts(d, ev->msg_id, (time_t)ev->timestamp, 0, ev->is_edited,
-                                        "incoming", ev->sender, prefix, ev->text);
+
+                                        "incoming", ev->sender, prefix, plain);
 
 
 
@@ -3314,8 +3528,17 @@ static gboolean ui_handle_event(gpointer user_data) {
         }
 
     } else if (ev->kind == EV_MSG_EDIT) {
+
         struct dialog_entry *d = find_dialog(ev->room, ev->is_room);
-        ui_apply_msg_edit(d, ev->msg_id, ev->text);
+        if (d != NULL) {
+            char plain[MAX_TEXT];
+            if (!ev->is_room) {
+                decrypt_dm_for_dialog(d, ev->text, plain, sizeof(plain));
+            } else {
+                copy_utf8_safe(plain, sizeof(plain), ev->text);
+            }
+            ui_apply_msg_edit(d, ev->msg_id, plain);
+        }
     } else if (ev->kind == EV_MSG_DELETE) {
         struct dialog_entry *d = find_dialog(ev->room, ev->is_room);
 
@@ -3358,6 +3581,10 @@ static gboolean ui_handle_event(gpointer user_data) {
 
         g_my_name[0] = '\0';
         g_session_token = 0;
+
+        g_e2e_ready = 0;
+        e2e_zero(g_my_pk, sizeof(g_my_pk));
+        e2e_zero(g_my_sk, sizeof(g_my_sk));
         pthread_mutex_unlock(&g_mtx);
         ui_set_connected_state(0, "", 0, 0);
         gtk_widget_set_sensitive(w_auth_user, FALSE);
@@ -3774,6 +4001,30 @@ static void do_auth(int is_login) {
         ui_append_sys("sys", info);
 
         if (!is_dbg) {
+            unsigned char pk[E2E_PK_BYTES];
+            unsigned char sk[E2E_SK_BYTES];
+            if (e2e_load_or_create_keypair(name, pk, sk, NULL) == 0) {
+                pthread_mutex_lock(&g_mtx);
+                memcpy(g_my_pk, pk, E2E_PK_BYTES);
+                memcpy(g_my_sk, sk, E2E_SK_BYTES);
+                g_e2e_ready = 1;
+                pthread_mutex_unlock(&g_mtx);
+
+                struct qmsg pkreq;
+                memset(&pkreq, 0, sizeof(pkreq));
+                pkreq.mtype = ARBITER_TYPE;
+                pkreq.cmd = CMD_PUBKEY_SET;
+                pkreq.sender_id = rep.target_id;
+                pkreq.session_token = rep.session_token;
+                pkreq.reply_type = 0;
+                e2e_pk_to_hex(pk, pkreq.text);
+                msgsnd(g_msqid, &pkreq, MSG_SIZE, IPC_NOWAIT);
+            }
+            e2e_zero(pk, sizeof(pk));
+            e2e_zero(sk, sizeof(sk));
+        }
+
+        if (!is_dbg) {
             struct qmsg hreq;
             memset(&hreq, 0, sizeof(hreq));
             hreq.mtype = ARBITER_TYPE;
@@ -3890,7 +4141,30 @@ static void on_send_clicked(GtkWidget *widget, gpointer data) {
         req.target_id = g_active_is_room ? 1 : 0;
         req.msg_id = g_edit_msg_id;
         snprintf(req.name, sizeof(req.name), "%.*s", MAX_NAME - 1, g_active_peer);
-        copy_utf8_safe(req.text, sizeof(req.text), final_text);
+
+        if (!g_active_is_room) {
+            struct dialog_entry *ed = find_dialog(g_active_peer, 0);
+            unsigned char my_sk[E2E_SK_BYTES];
+            int ready = 0;
+            pthread_mutex_lock(&g_mtx);
+            ready = g_e2e_ready;
+            if (ready) {
+                memcpy(my_sk, g_my_sk, E2E_SK_BYTES);
+            }
+            pthread_mutex_unlock(&g_mtx);
+            if (ready && ed != NULL && ensure_dialog_peer_pk(ed, 0)) {
+                if (e2e_encrypt_dm(final_text, ed->peer_pk, my_sk, req.text, sizeof(req.text)) != 0) {
+                    e2e_zero(my_sk, sizeof(my_sk));
+                    ui_append_error("Message too long for encryption.");
+                    return;
+                }
+            } else {
+                copy_utf8_safe(req.text, sizeof(req.text), final_text);
+            }
+            e2e_zero(my_sk, sizeof(my_sk));
+        } else {
+            copy_utf8_safe(req.text, sizeof(req.text), final_text);
+        }
 
         if (msgsnd(g_msqid, &req, MSG_SIZE, IPC_NOWAIT) < 0) {
             ui_append_error("Failed to send edit.");
@@ -4005,7 +4279,34 @@ static void on_send_clicked(GtkWidget *widget, gpointer data) {
     snprintf(chat.name, sizeof(chat.name), "%.*s", MAX_NAME - 1, target);
     snprintf(chat.sender_name, sizeof(chat.sender_name), "%.*s", MAX_NAME - 1, cur_name);
 
-    copy_utf8_safe(chat.text, sizeof(chat.text), payload);
+
+    struct dialog_entry *d = get_or_create_dialog(target, 0);
+    if (d == NULL) {
+        return;
+    }
+
+    char wire_text[MAX_TEXT];
+    unsigned char my_sk[E2E_SK_BYTES];
+    int ready = 0;
+    pthread_mutex_lock(&g_mtx);
+    ready = g_e2e_ready;
+    if (ready) {
+        memcpy(my_sk, g_my_sk, E2E_SK_BYTES);
+    }
+    pthread_mutex_unlock(&g_mtx);
+
+    if (ready && ensure_dialog_peer_pk(d, 0)) {
+        if (e2e_encrypt_dm(payload, d->peer_pk, my_sk, wire_text, sizeof(wire_text)) != 0) {
+            e2e_zero(my_sk, sizeof(my_sk));
+            ui_append_error("Message too long for encryption.");
+            return;
+        }
+    } else {
+        copy_utf8_safe(wire_text, sizeof(wire_text), payload);
+    }
+    e2e_zero(my_sk, sizeof(my_sk));
+
+    copy_utf8_safe(chat.text, sizeof(chat.text), wire_text);
 
     if (msgsnd(g_msqid, &chat, MSG_SIZE, IPC_NOWAIT) < 0) {
         ui_append_error(errno == EAGAIN
@@ -4028,10 +4329,6 @@ static void on_send_clicked(GtkWidget *widget, gpointer data) {
         return;
     }
 
-    struct dialog_entry *d = get_or_create_dialog(target, 0);
-    if (d == NULL) {
-        return;
-    }
     d->online = (rep.target_id > 0);
 
     if (g_active_is_room || strcmp(g_active_peer, d->peer) != 0) {
@@ -4286,6 +4583,8 @@ static void on_window_destroy(GtkWidget *widget, gpointer data) {
 
 
     w_mi_search = NULL;
+
+    w_mi_enc_info = NULL;
     w_mi_room_info = NULL;
     w_pin_bar = NULL;
     w_pin_lbl = NULL;
@@ -4507,6 +4806,10 @@ static void build_ui(void) {
 
     w_mi_search = gtk_menu_item_new_with_label("🔍  Search");
     g_signal_connect(w_mi_search, "activate", G_CALLBACK(on_search_menu_activate), NULL);
+
+    w_mi_enc_info = gtk_menu_item_new_with_label("🔒  Encryption Info");
+    g_signal_connect(w_mi_enc_info, "activate", G_CALLBACK(on_enc_info_activate), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(w_chat_menu), w_mi_enc_info);
 
     w_mi_room_info = gtk_menu_item_new_with_label("👥  Members & Info");
     g_signal_connect(w_mi_room_info, "activate", G_CALLBACK(on_room_info_activate), NULL);
@@ -4743,6 +5046,11 @@ static void build_ui(void) {
 
 int main(int argc, char *argv[]) {
     gtk_init(&argc, &argv);
+
+    if (e2e_init() != 0) {
+        fprintf(stderr, "Failed to initialize libsodium.\n");
+        return 1;
+    }
 
     key_t key = ftok(QUEUE_KEY_PATH, QUEUE_KEY_PROJ);
     if (key == (key_t)-1) {

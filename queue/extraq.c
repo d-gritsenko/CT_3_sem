@@ -21,6 +21,8 @@
 #include <unistd.h>
 
 #include "db.h"
+
+#include "crypto.h"
 #include "protocol.h"
 
 #define BACKLOG_FILE "chat_backlog.dat"
@@ -108,6 +110,10 @@ static uint64_t g_session_token = 0;
 static long g_reply_type = 0;
 static long g_next_msg_id = 1;
 static char g_my_name[MAX_NAME];
+
+static int g_e2e_ready = 0;
+static unsigned char g_my_pk[E2E_PK_BYTES];
+static unsigned char g_my_sk[E2E_SK_BYTES];
 static pthread_mutex_t g_mtx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_io_mtx = PTHREAD_MUTEX_INITIALIZER;
 
@@ -1204,6 +1210,52 @@ static int run_arbiter(int msqid) {
                 }
             }
 
+
+        } else if (msg.cmd == CMD_PUBKEY_SET) {
+            msg.text[MAX_TEXT - 1] = '\0';
+            int cidx = find_authed_client(clients, msg.sender_id, msg.session_token, msg.cmd);
+            if (cidx < 0 || !clients[cidx].active) {
+                if (msg.reply_type > 0) {
+                    send_reply(msqid, msg.reply_type, -1, "not logged in");
+                }
+            } else if (clients[cidx].is_debug) {
+                if (msg.reply_type > 0) {
+                    send_reply(msqid, msg.reply_type, -1, "debug account");
+                }
+            } else {
+                unsigned char tmp_pk[E2E_PK_BYTES];
+                if (e2e_hex_to_pk(msg.text, tmp_pk) != 0) {
+                    if (msg.reply_type > 0) {
+                        send_reply(msqid, msg.reply_type, -1, "invalid pubkey");
+                    }
+                } else {
+                    clients[cidx].last_seen = time(NULL);
+                    db_set_pubkey(clients[cidx].name, msg.text);
+                    if (msg.reply_type > 0) {
+                        send_reply(msqid, msg.reply_type, 1, "ok");
+                    }
+                }
+            }
+        } else if (msg.cmd == CMD_PUBKEY_GET) {
+            msg.name[MAX_NAME - 1] = '\0';
+            int cidx = find_authed_client(clients, msg.sender_id, msg.session_token, msg.cmd);
+            if (cidx < 0 || !clients[cidx].active) {
+                if (msg.reply_type > 0) {
+                    send_reply(msqid, msg.reply_type, -1, "not logged in");
+                }
+            } else {
+                clients[cidx].last_seen = time(NULL);
+                char pk_hex[E2E_PK_HEX_SIZE];
+                if (msg.name[0] != '\0' && db_get_pubkey(msg.name, pk_hex, sizeof(pk_hex)) == 0) {
+                    if (msg.reply_type > 0) {
+                        send_reply(msqid, msg.reply_type, 1, pk_hex);
+                    }
+                } else {
+                    if (msg.reply_type > 0) {
+                        send_reply(msqid, msg.reply_type, 0, "");
+                    }
+                }
+            }
         } else if (msg.cmd == CMD_MARK_READ) {
             msg.name[MAX_NAME - 1] = '\0';
 
@@ -2095,6 +2147,43 @@ static int run_arbiter(int msqid) {
 }
 
 
+
+static int cli_fetch_peer_pk(int msqid, long cur_id, uint64_t cur_tok, long reply_type,
+                             const char *peer, unsigned char out_pk[E2E_PK_BYTES]) {
+    if (msqid < 0 || cur_id <= 0 || peer == NULL || peer[0] == '\0' || db_is_debug_name(peer)) {
+        return 0;
+    }
+    drain_type(msqid, reply_type);
+    struct qmsg req;
+    memset(&req, 0, sizeof(req));
+    req.mtype = ARBITER_TYPE;
+    req.cmd = CMD_PUBKEY_GET;
+    req.sender_id = cur_id;
+    req.session_token = cur_tok;
+    req.reply_type = reply_type;
+    snprintf(req.name, sizeof(req.name), "%.*s", MAX_NAME - 1, peer);
+    if (msgsnd(msqid, &req, MSG_SIZE, IPC_NOWAIT) < 0) {
+        return 0;
+    }
+    struct qmsg rep;
+    for (int i = 0; i < 100; i++) {
+        ssize_t n = msgrcv(msqid, &rep, MSG_SIZE, reply_type, IPC_NOWAIT);
+        if (n >= 0) {
+            rep.text[MAX_TEXT - 1] = '\0';
+            return (rep.target_id > 0 && e2e_hex_to_pk(rep.text, out_pk) == 0) ? 1 : 0;
+        }
+        if (errno == ENOMSG) {
+            usleep(10000);
+            continue;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        return 0;
+    }
+    return 0;
+}
+
 static void format_cli_body(const char *text, char *out, size_t out_size) {
     char stored[96];
     char orig[96];
@@ -2149,8 +2238,32 @@ static void *recv_worker(void *arg) {
                 msg.text[MAX_TEXT - 1] = '\0';
                 pthread_mutex_lock(&g_io_mtx);
 
+                char dec_buf[MAX_TEXT];
+                const char *show_text = msg.text;
+                if (e2e_is_encrypted(msg.text)) {
+                    int ready = 0;
+                    unsigned char my_sk[E2E_SK_BYTES];
+                    pthread_mutex_lock(&g_mtx);
+                    ready = g_e2e_ready;
+                    if (ready) {
+                        memcpy(my_sk, g_my_sk, E2E_SK_BYTES);
+                    }
+                    pthread_mutex_unlock(&g_mtx);
+                    unsigned char peer_pk[E2E_PK_BYTES];
+                    if (ready &&
+                        cli_fetch_peer_pk(g_msqid, my_id, my_tok, g_reply_type + 1L, msg.sender_name, peer_pk) &&
+                        e2e_decrypt_dm(msg.text, peer_pk, my_sk, dec_buf, sizeof(dec_buf)) == 0) {
+                        show_text = dec_buf;
+                    } else {
+                        snprintf(dec_buf, sizeof(dec_buf), "[Decryption failed]");
+                        show_text = dec_buf;
+                    }
+                    e2e_zero(my_sk, sizeof(my_sk));
+                }
+
                 char body[MAX_TEXT + 64];
-                format_cli_body(msg.text, body, sizeof(body));
+
+                format_cli_body(show_text, body, sizeof(body));
                 printf("\r\033[K" CLR_DIM "[%s] " CLR_RESET CLR_BOLD CLR_CYAN "%s" CLR_RESET ": %s\n",
 
                        ts, msg.sender_name, body);
@@ -2176,10 +2289,34 @@ static void *recv_worker(void *arg) {
                 msg.text[MAX_TEXT - 1] = '\0';
                 pthread_mutex_lock(&g_io_mtx);
 
+                char dec_buf[MAX_TEXT];
+                const char *show_text = msg.text;
+                if (msg.target_id == 0 && e2e_is_encrypted(msg.text)) {
+                    int ready = 0;
+                    unsigned char my_sk[E2E_SK_BYTES];
+                    pthread_mutex_lock(&g_mtx);
+                    ready = g_e2e_ready;
+                    if (ready) {
+                        memcpy(my_sk, g_my_sk, E2E_SK_BYTES);
+                    }
+                    pthread_mutex_unlock(&g_mtx);
+                    unsigned char peer_pk[E2E_PK_BYTES];
+                    if (ready &&
+                        cli_fetch_peer_pk(g_msqid, my_id, my_tok, g_reply_type + 1L, msg.name, peer_pk) &&
+                        e2e_decrypt_dm(msg.text, peer_pk, my_sk, dec_buf, sizeof(dec_buf)) == 0) {
+                        show_text = dec_buf;
+                    } else {
+                        snprintf(dec_buf, sizeof(dec_buf), "[Decryption failed]");
+                        show_text = dec_buf;
+                    }
+                    e2e_zero(my_sk, sizeof(my_sk));
+                }
+
                 int is_out = (msg.sender_id & 1) != 0;
                 const char *ed = ((msg.sender_id & 4) != 0) ? " (edited)" : "";
                 char body[MAX_TEXT + 64];
-                format_cli_body(msg.text, body, sizeof(body));
+
+                format_cli_body(show_text, body, sizeof(body));
                 if (msg.target_id != 0) {
                     printf("\r\033[K" CLR_DIM "[%s] " CLR_RESET CLR_YELLOW "[#%s] " CLR_CYAN "%s" CLR_RESET ": %s%s\n",
                            ts, msg.name, is_out ? "you" : msg.sender_name, body, ed);
@@ -2313,6 +2450,10 @@ static void send_logout(void) {
     g_session_token = 0;
     g_my_id = 0;
     g_my_name[0] = '\0';
+
+    g_e2e_ready = 0;
+    e2e_zero(g_my_pk, sizeof(g_my_pk));
+    e2e_zero(g_my_sk, sizeof(g_my_sk));
     pthread_mutex_unlock(&g_mtx);
 
     if (my_id > 0) {
@@ -2931,6 +3072,30 @@ static int run_client(int msqid) {
                 g_session_token = rep.session_token;
                 pthread_mutex_unlock(&g_mtx);
 
+                if (rep.sender_id == 0) {
+                    unsigned char pk[E2E_PK_BYTES];
+                    unsigned char sk[E2E_SK_BYTES];
+                    if (e2e_load_or_create_keypair(name, pk, sk, NULL) == 0) {
+                        pthread_mutex_lock(&g_mtx);
+                        memcpy(g_my_pk, pk, E2E_PK_BYTES);
+                        memcpy(g_my_sk, sk, E2E_SK_BYTES);
+                        g_e2e_ready = 1;
+                        pthread_mutex_unlock(&g_mtx);
+
+                        struct qmsg pkreq;
+                        memset(&pkreq, 0, sizeof(pkreq));
+                        pkreq.mtype = ARBITER_TYPE;
+                        pkreq.cmd = CMD_PUBKEY_SET;
+                        pkreq.sender_id = rep.target_id;
+                        pkreq.session_token = rep.session_token;
+                        pkreq.reply_type = 0;
+                        e2e_pk_to_hex(pk, pkreq.text);
+                        msgsnd(msqid, &pkreq, MSG_SIZE, IPC_NOWAIT);
+                    }
+                    e2e_zero(pk, sizeof(pk));
+                    e2e_zero(sk, sizeof(sk));
+                }
+
                 pthread_mutex_lock(&g_io_mtx);
                 printf(CLR_GREEN "* %s as %s%s (id=%ld)\n" CLR_RESET,
                        is_login ? "Logged in" : "Registered",
@@ -3000,7 +3165,25 @@ static int run_client(int msqid) {
             chat.session_token = cur_tok;
             snprintf(chat.name, sizeof(chat.name), "%.*s", MAX_NAME - 1, target_name);
             snprintf(chat.sender_name, sizeof(chat.sender_name), "%.*s", MAX_NAME - 1, cur_name);
-            copy_utf8_safe(chat.text, sizeof(chat.text), text);
+
+            int e2e_ok = 0;
+            unsigned char my_sk[E2E_SK_BYTES];
+            pthread_mutex_lock(&g_mtx);
+            e2e_ok = g_e2e_ready;
+            if (e2e_ok) {
+                memcpy(my_sk, g_my_sk, E2E_SK_BYTES);
+            }
+            pthread_mutex_unlock(&g_mtx);
+
+            unsigned char peer_pk[E2E_PK_BYTES];
+            if (e2e_ok &&
+                cli_fetch_peer_pk(msqid, cur_id, cur_tok, g_reply_type, target_name, peer_pk) &&
+                e2e_encrypt_dm(text, peer_pk, my_sk, chat.text, sizeof(chat.text)) == 0) {
+                e2e_zero(my_sk, sizeof(my_sk));
+            } else {
+                e2e_zero(my_sk, sizeof(my_sk));
+                copy_utf8_safe(chat.text, sizeof(chat.text), text);
+            }
 
             if (msgsnd(msqid, &chat, MSG_SIZE, 0) < 0) {
                 perror("msgsnd");
@@ -3251,6 +3434,12 @@ int main(int argc, char *argv[]) {
     }
     if (strcasecmp(argv[1], "stop") == 0) {
         return cmd_stop();
+    }
+
+
+    if (e2e_init() != 0) {
+        fprintf(stderr, "Failed to initialize libsodium.\n");
+        return 1;
     }
 
     int is_arbiter = (strcasecmp(argv[1], "arbiter") == 0);

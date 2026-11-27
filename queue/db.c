@@ -149,7 +149,9 @@ int db_init(const char *path) {
         "  username TEXT UNIQUE NOT NULL,"
         "  salt TEXT NOT NULL,"
         "  pass_hash TEXT NOT NULL,"
+
         "  theme_id INTEGER NOT NULL DEFAULT 0,"
+        "  pubkey TEXT NOT NULL DEFAULT '',"
         "  created_at INTEGER NOT NULL"
         ");"
         "CREATE TABLE IF NOT EXISTS messages ("
@@ -220,6 +222,8 @@ int db_init(const char *path) {
 
     sqlite3_exec(g_db, "ALTER TABLE messages ADD COLUMN is_edited INTEGER NOT NULL DEFAULT 0;", NULL, NULL, NULL);
     sqlite3_exec(g_db, "ALTER TABLE room_messages ADD COLUMN is_edited INTEGER NOT NULL DEFAULT 0;", NULL, NULL, NULL);
+
+    sqlite3_exec(g_db, "ALTER TABLE users ADD COLUMN pubkey TEXT NOT NULL DEFAULT '';", NULL, NULL, NULL);
 
     seed_default_users_if_empty();
     return 0;
@@ -353,6 +357,52 @@ int db_set_theme(const char *username, int theme_id) {
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     return (rc == SQLITE_DONE) ? 0 : -1;
+}
+
+
+int db_set_pubkey(const char *username, const char *pubkey_hex) {
+    if (g_db == NULL || username == NULL || pubkey_hex == NULL || db_is_debug_name(username)) {
+        return 0;
+    }
+
+    const char *sql = "UPDATE users SET pubkey = ?1 WHERE username = ?2;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        return -1;
+    }
+
+    sqlite3_bind_text(stmt, 1, pubkey_hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, username, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_DONE) ? 0 : -1;
+}
+
+int db_get_pubkey(const char *username, char *out_hex, size_t out_size) {
+    if (out_hex != NULL && out_size > 0) {
+        out_hex[0] = '\0';
+    }
+    if (g_db == NULL || username == NULL || out_hex == NULL || out_size == 0 || db_is_debug_name(username)) {
+        return -1;
+    }
+
+    const char *sql = "SELECT pubkey FROM users WHERE username = ?1;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        return -1;
+    }
+
+    sqlite3_bind_text(stmt, 1, username, -1, SQLITE_TRANSIENT);
+    int found = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *pk = (const char *)sqlite3_column_text(stmt, 0);
+        if (pk != NULL && pk[0] != '\0') {
+            snprintf(out_hex, out_size, "%s", pk);
+            found = 1;
+        }
+    }
+    sqlite3_finalize(stmt);
+    return found ? 0 : -1;
 }
 
 
